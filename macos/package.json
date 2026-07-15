@@ -10,7 +10,8 @@
     "prebuild": "./build-backend.sh",
     "build": "electron-builder --mac --dir",
     "predist": "./build-backend.sh",
-    "dist": "electron-builder --mac"
+    "dist": "electron-builder --mac",
+    "verify": "./verify-build.sh"
   },
   "devDependencies": {
     "electron": "^43.1.1",
@@ -37,7 +38,8 @@
     },
     "files": [
       "main.js",
-      "preload.js"
+      "preload.js",
+      "assets/app-icon.png"
     ],
     "extraResources": [
       {

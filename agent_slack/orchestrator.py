@@ -10,12 +10,12 @@ from typing import Any
 class CliOrchestrator:
     SUPPORTED_BACKENDS = ("codex", "claude")
 
-    def __init__(self, workspace_name: str, project_root: Path):
+    def __init__(self, workspace_name: str, project_root: Path, backend_preference: str = "auto"):
         self.workspace_name = workspace_name
         self.project_root = project_root
         self.timeout_seconds = int(os.environ.get("AGENT_SLACK_CLI_TIMEOUT", "180"))
         self.backend, self.executable = self._resolve_backend(
-            os.environ.get("AGENT_SLACK_CLI", "auto").strip().lower()
+            os.environ.get("AGENT_SLACK_CLI", backend_preference).strip().lower()
         )
 
     @property

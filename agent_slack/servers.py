@@ -141,6 +141,12 @@ class AgentServerManager:
             return None
         return next((server for server in self.list_servers() if server["server_id"] == server_id), None)
 
+    def summary_for(self, server_id: str) -> dict[str, Any]:
+        summary = next((server for server in self.list_servers() if server["server_id"] == server_id), None)
+        if summary is None:
+            raise KeyError(f"Server not found: {server_id}")
+        return summary
+
     def _ensure_initial_server(self, project_root: Path) -> None:
         root = project_root.expanduser().resolve()
         if not root.is_dir():
@@ -180,7 +186,7 @@ class AgentServerManager:
                 data_root=server_data_root,
             )
         elif refresh:
-            self._apps[server_id].architecture = self._apps[server_id].architecture.load(root)
+            self._apps[server_id].reload_host_configuration()
             self._apps[server_id].refresh_agents()
         return self._apps[server_id]
 

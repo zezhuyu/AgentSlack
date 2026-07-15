@@ -11,14 +11,95 @@ from urllib.parse import urlparse
 from .servers import AgentServerManager
 
 
+API_VERSION = "1"
+
+
+def _api_document() -> dict:
+    return {
+        "service": "agent-slack",
+        "api_version": API_VERSION,
+        "status": "ready",
+        "base_path": "/api/v1",
+        "openapi_url": "/api/v1/openapi.json",
+        "server_selection": {
+            "header": "X-Agent-Slack-Server",
+            "description": "Optional server ID; otherwise the active server is used.",
+        },
+        "streaming": {
+            "content_type": "application/x-ndjson",
+            "endpoint": "/api/v1/chats/{chat_id}/run-stream",
+        },
+    }
+
+
+def _openapi_document() -> dict:
+    paths = {
+        "/health": {"get": {"summary": "Service health and active agent system"}},
+        "/servers": {
+            "get": {"summary": "List registered agent systems"},
+            "post": {"summary": "Register an agent-system folder"},
+        },
+        "/servers/{server_id}/activate": {"post": {"summary": "Activate an agent system"}},
+        "/agents": {"get": {"summary": "List agents in the selected system"}},
+        "/agents/discover": {"post": {"summary": "Refresh agent discovery"}},
+        "/chats": {
+            "get": {"summary": "List chats"},
+            "post": {"summary": "Create a direct or group chat"},
+        },
+        "/chats/{chat_id}": {"get": {"summary": "Get a chat and its messages"}},
+        "/chats/{chat_id}/messages": {"post": {"summary": "Post a user message"}},
+        "/chats/{chat_id}/run-stream": {
+            "post": {
+                "summary": "Run agents and stream NDJSON events",
+                "responses": {"200": {"description": "NDJSON event stream"}},
+            }
+        },
+        "/chats/{chat_id}/meeting": {"post": {"summary": "Run a manual agent meeting"}},
+        "/chats/{chat_id}/auto-meeting": {"post": {"summary": "Run an architecture-routed meeting"}},
+    }
+    return {
+        "openapi": "3.1.0",
+        "info": {"title": "Agent Slack API", "version": API_VERSION},
+        "servers": [{"url": "/api/v1"}],
+        "components": {
+            "parameters": {
+                "AgentServer": {
+                    "name": "X-Agent-Slack-Server",
+                    "in": "header",
+                    "required": False,
+                    "schema": {"type": "string"},
+                }
+            }
+        },
+        "paths": paths,
+    }
+
+
+def _versioned_path(path: str) -> str:
+    if path == "/api/v1":
+        return "/api"
+    if path.startswith("/api/v1/"):
+        return "/api/" + path.removeprefix("/api/v1/")
+    return path
+
+
 class _Handler(BaseHTTPRequestHandler):
     manager: AgentServerManager
 
     def do_GET(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
-        if parsed.path == "/api/health":
-            active = self.manager.active_summary()
-            architecture = self._active_app().architecture_summary() if active else None
+        path = _versioned_path(parsed.path)
+        if path == "/api":
+            return self._json(_api_document())
+        if path == "/api/openapi.json":
+            return self._json(_openapi_document())
+        if path == "/api/health":
+            requested_server_id = self.headers.get("X-Agent-Slack-Server", "").strip()
+            try:
+                active = self.manager.summary_for(requested_server_id) if requested_server_id else self.manager.active_summary()
+            except KeyError as exc:
+                return self._json({"error": str(exc).strip("'")}, status=404)
+            architecture = self._active_app().architecture_summary() if active and active["available"] else None
             return self._json(
                 {
                     "ok": True,
@@ -28,14 +109,14 @@ class _Handler(BaseHTTPRequestHandler):
                     "architecture": architecture,
                 }
             )
-        if parsed.path == "/api/servers":
+        if path == "/api/servers":
             return self._json(
                 {
                     "servers": self.manager.list_servers(),
                     "active_server_id": self.manager.active_server_id,
                 }
             )
-        match = re.fullmatch(r"/api/servers/([^/]+)/logo", parsed.path)
+        match = re.fullmatch(r"/api/servers/([^/]+)/logo", path)
         if match:
             try:
                 logo_path = self.manager.logo_path(match.group(1))
@@ -44,15 +125,21 @@ class _Handler(BaseHTTPRequestHandler):
             if logo_path is None:
                 return self._json({"error": "server logo not found"}, status=404)
             return self._serve_file(logo_path)
-        if parsed.path.startswith("/api/") and self.manager.active_server_id is None:
+        if path.startswith("/api/") and self.manager.active_server_id is None:
             return self._json({"error": "No agent server is configured"}, status=409)
-        if parsed.path == "/api/agents":
-            return self._json({"agents": self._active_app().list_agents()})
-        if parsed.path == "/api/chats":
-            return self._json({"chats": self._active_app().list_chats()})
-        match = re.fullmatch(r"/api/chats/([^/]+)", parsed.path)
+        try:
+            app = self._active_app()
+        except KeyError as exc:
+            return self._json({"error": str(exc).strip("'")}, status=404)
+        except (LookupError, ValueError) as exc:
+            return self._json({"error": str(exc)}, status=409)
+        if path == "/api/agents":
+            return self._json({"agents": app.list_agents()})
+        if path == "/api/chats":
+            return self._json({"chats": app.list_chats()})
+        match = re.fullmatch(r"/api/chats/([^/]+)", path)
         if match:
-            chat = self._active_app().get_chat(match.group(1))
+            chat = app.get_chat(match.group(1))
             if chat is None:
                 return self._json({"error": "chat not found"}, status=404)
             return self._json(chat)
@@ -60,8 +147,9 @@ class _Handler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
+        path = _versioned_path(parsed.path)
         payload = self._read_json_body()
-        if parsed.path == "/api/servers":
+        if path == "/api/servers":
             project_root = str(payload.get("project_root") or "").strip()
             if not project_root:
                 return self._json({"error": "project_root is required"}, status=400)
@@ -74,7 +162,7 @@ class _Handler(BaseHTTPRequestHandler):
             except ValueError as exc:
                 return self._json({"error": str(exc)}, status=400)
             return self._json(server, status=201)
-        match = re.fullmatch(r"/api/servers/([^/]+)/activate", parsed.path)
+        match = re.fullmatch(r"/api/servers/([^/]+)/activate", path)
         if match:
             try:
                 server = self.manager.activate(match.group(1))
@@ -83,25 +171,32 @@ class _Handler(BaseHTTPRequestHandler):
             except ValueError as exc:
                 return self._json({"error": str(exc)}, status=400)
             return self._json(server)
-        if parsed.path.startswith("/api/") and self.manager.active_server_id is None:
+        if path.startswith("/api/") and self.manager.active_server_id is None:
             return self._json({"error": "No agent server is configured"}, status=409)
-        if parsed.path == "/api/agents/discover":
-            return self._json({"agents": self._active_app().refresh_agents()})
-        if parsed.path == "/api/chats":
-            chat = self._active_app().create_chat(
+        try:
+            app = self._active_app()
+        except KeyError as exc:
+            return self._json({"error": str(exc).strip("'")}, status=404)
+        except (LookupError, ValueError) as exc:
+            return self._json({"error": str(exc)}, status=409)
+        if path == "/api/agents/discover":
+            app.reload_host_configuration()
+            return self._json({"agents": app.refresh_agents()})
+        if path == "/api/chats":
+            chat = app.create_chat(
                 title=str(payload.get("title") or "Untitled chat"),
                 member_ids=list(payload.get("member_ids") or []),
                 kind=str(payload.get("kind") or "group"),
             )
             return self._json(chat, status=201)
-        match = re.fullmatch(r"/api/chats/([^/]+)/messages", parsed.path)
+        match = re.fullmatch(r"/api/chats/([^/]+)/messages", path)
         if match:
-            chat = self._active_app().add_user_message(match.group(1), str(payload.get("body") or ""))
+            chat = app.add_user_message(match.group(1), str(payload.get("body") or ""))
             return self._json(chat, status=201)
-        match = re.fullmatch(r"/api/chats/([^/]+)/run-stream", parsed.path)
+        match = re.fullmatch(r"/api/chats/([^/]+)/run-stream", path)
         if match:
             try:
-                events = self._active_app().stream_run(
+                events = app.stream_run(
                     chat_id=match.group(1),
                     mode=str(payload.get("mode") or "respond"),
                     objective=payload.get("objective"),
@@ -112,21 +207,21 @@ class _Handler(BaseHTTPRequestHandler):
             except (KeyError, ValueError) as exc:
                 return self._json({"error": str(exc)}, status=400)
             return self._ndjson(events)
-        match = re.fullmatch(r"/api/chats/([^/]+)/respond", parsed.path)
+        match = re.fullmatch(r"/api/chats/([^/]+)/respond", path)
         if match:
-            chat = self._active_app().run_agents(
+            chat = app.run_agents(
                 match.group(1),
                 agent_ids=list(payload.get("agent_ids") or []),
                 objective=payload.get("objective"),
             )
             return self._json(chat)
-        match = re.fullmatch(r"/api/chats/([^/]+)/meeting", parsed.path)
+        match = re.fullmatch(r"/api/chats/([^/]+)/meeting", path)
         if match:
             lead_agent_id = str(payload.get("lead_agent_id") or "")
             objective = str(payload.get("objective") or "")
             if not lead_agent_id or not objective:
                 return self._json({"error": "lead_agent_id and objective are required"}, status=400)
-            chat = self._active_app().create_meeting(
+            chat = app.create_meeting(
                 chat_id=match.group(1),
                 lead_agent_id=lead_agent_id,
                 participant_ids=list(payload.get("participant_ids") or []),
@@ -134,20 +229,21 @@ class _Handler(BaseHTTPRequestHandler):
                 auto_run=bool(payload.get("auto_run", True)),
             )
             return self._json(chat)
-        match = re.fullmatch(r"/api/chats/([^/]+)/auto-meeting", parsed.path)
+        match = re.fullmatch(r"/api/chats/([^/]+)/auto-meeting", path)
         if match:
             lead_agent_id = str(payload.get("lead_agent_id") or "")
             objective = str(payload.get("objective") or "")
             if not lead_agent_id or not objective:
                 return self._json({"error": "lead_agent_id and objective are required"}, status=400)
-            chat = self._active_app().auto_meeting(match.group(1), lead_agent_id=lead_agent_id, objective=objective)
+            chat = app.auto_meeting(match.group(1), lead_agent_id=lead_agent_id, objective=objective)
             return self._json(chat)
         return self._json({"error": "not found"}, status=404)
 
     def do_PATCH(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
+        path = _versioned_path(parsed.path)
         payload = self._read_json_body()
-        match = re.fullmatch(r"/api/servers/([^/]+)", parsed.path)
+        match = re.fullmatch(r"/api/servers/([^/]+)", path)
         if not match:
             return self._json({"error": "not found"}, status=404)
         try:
@@ -161,6 +257,14 @@ class _Handler(BaseHTTPRequestHandler):
         except ValueError as exc:
             return self._json({"error": str(exc)}, status=400)
         return self._json(server)
+
+    def do_OPTIONS(self) -> None:  # noqa: N802
+        self.send_response(HTTPStatus.NO_CONTENT)
+        self.send_header("Allow", "GET, POST, PATCH, OPTIONS")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, PATCH, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, X-Agent-Slack-Server")
+        self.send_header("X-Agent-Slack-Api-Version", API_VERSION)
+        self.end_headers()
 
     def log_message(self, format: str, *args) -> None:  # noqa: A003
         return
@@ -186,6 +290,7 @@ class _Handler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(raw)))
+        self.send_header("X-Agent-Slack-Api-Version", API_VERSION)
         self.end_headers()
         self.wfile.write(raw)
 
@@ -195,6 +300,7 @@ class _Handler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-cache, no-transform")
         self.send_header("X-Accel-Buffering", "no")
         self.send_header("Connection", "close")
+        self.send_header("X-Agent-Slack-Api-Version", API_VERSION)
         self.end_headers()
         try:
             for event in events:
@@ -226,8 +332,14 @@ class _Handler(BaseHTTPRequestHandler):
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", mime or "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(content)))
+        self.send_header("X-Agent-Slack-Api-Version", API_VERSION)
         self.end_headers()
         self.wfile.write(content)
+
+
+class AgentSlackHTTPServer(ThreadingHTTPServer):
+    allow_reuse_address = True
+    daemon_threads = True
 
 
 def run_server(project_root: Path | None, host: str, port: int, data_root: Path | None = None) -> None:
@@ -238,7 +350,7 @@ def run_server(project_root: Path | None, host: str, port: int, data_root: Path 
         initial_project_root=project_root,
     )
     _Handler.manager = manager
-    server = ThreadingHTTPServer((host, port), _Handler)
+    server = AgentSlackHTTPServer((host, port), _Handler)
     print(f"Agent Slack running at http://{host}:{port}")
     try:
         server.serve_forever()

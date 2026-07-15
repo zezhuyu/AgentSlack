@@ -83,3 +83,13 @@ def test_reports_cli_failure_without_offline_api_message(tmp_path: Path, monkeyp
     reply = _reply(orchestrator)
 
     assert reply == "[CLI error] System Coordinator could not reply through codex: login required"
+
+
+def test_host_runner_preference_is_used_without_environment_override(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.delenv("AGENT_SLACK_CLI", raising=False)
+    monkeypatch.setattr("agent_slack.orchestrator.shutil.which", lambda name: f"/bin/{name}")
+
+    orchestrator = CliOrchestrator("ClaudeHost", tmp_path, backend_preference="claude")
+
+    assert orchestrator.backend == "claude"
+    assert orchestrator.executable == "/bin/claude"

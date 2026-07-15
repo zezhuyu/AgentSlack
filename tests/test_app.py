@@ -117,6 +117,31 @@ def test_manual_group_meeting_runs_all_members(tmp_path: Path, monkeypatch) -> N
     assert continued["messages"][-1]["author_id"] == "reviewer"
 
 
+def test_manual_meeting_adds_invited_agents_to_chat_and_memory(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("AGENT_SLACK_CLI", "offline")
+    project_root = tmp_path / "project"
+    app_root = tmp_path / "agent_slack"
+    project_root.mkdir()
+    app_root.mkdir()
+    _write_agent(project_root, "coordinator", "System Coordinator", "Leads specialist work.")
+    _write_agent(project_root, "reviewer", "Review Agent", "Reviews proposed work.")
+    app = AgentSlackApp(project_root=project_root, app_root=app_root)
+    direct = app.create_chat("Coordinator", ["coordinator"], kind="direct")
+
+    updated = app.create_meeting(
+        direct["chat_id"],
+        lead_agent_id="coordinator",
+        participant_ids=["reviewer"],
+        objective="Review this decision",
+        auto_run=True,
+    )
+
+    assert updated["kind"] == "group"
+    assert updated["member_ids"] == ["coordinator", "reviewer"]
+    assert updated["meetings"][-1]["participant_ids"] == ["reviewer", "coordinator"]
+    assert app.storage.get_memory_json("reviewer")["stats"]["chat_count"] == 1
+
+
 def test_group_run_agents_without_orchestrator_replies_from_all_members(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv("AGENT_SLACK_CLI", "offline")
     project_root = tmp_path / "project"

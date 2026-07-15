@@ -79,6 +79,7 @@ Create `<project-root>/.agent-slack.json`:
 ```json
 {
   "schema_version": 1,
+  "runner": "auto",
   "orchestrators": [
     {
       "agent_id": "system_coordinator",
@@ -100,6 +101,7 @@ Create `<project-root>/.agent-slack.json`:
 
 Manifest rules:
 
+- set `runner` to `auto`, `codex`, or `claude`; `AGENT_SLACK_CLI` remains an optional process-wide override;
 - reference only stable agent IDs;
 - keep keyword lists domain-specific but concise;
 - put always-required reviewers in `default_participants`;

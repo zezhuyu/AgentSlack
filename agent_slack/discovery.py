@@ -79,7 +79,7 @@ class AgentDiscovery:
         frontmatter, body = self._split_frontmatter(text)
         name = str(frontmatter.get("name") or path.stem).strip()
         summary = str(frontmatter.get("summary") or "").strip()
-        tools = list(frontmatter.get("tools") or [])
+        tools = self._normalize_list(frontmatter.get("tools"))
 
         title = self._extract_title(name, body)
         if not summary:
@@ -142,6 +142,17 @@ class AgentDiscovery:
             if line.strip() and not line.strip().startswith("#") and not line.strip().startswith("|")
         ]
         return paragraphs[0][:220] if paragraphs else "No summary available."
+
+    @staticmethod
+    def _normalize_list(value: Any) -> list[str]:
+        if isinstance(value, list):
+            return [str(item).strip() for item in value if str(item).strip()]
+        if not isinstance(value, str) or not value.strip():
+            return []
+        raw = value.strip()
+        if raw.startswith("[") and raw.endswith("]"):
+            raw = raw[1:-1]
+        return [item.strip().strip("'\"") for item in raw.split(",") if item.strip().strip("'\"")]
 
     def _extract_title(self, name: str, body: str) -> str:
         heading_match = re.search(r"^#\s+(.+)$", body, flags=re.MULTILINE)

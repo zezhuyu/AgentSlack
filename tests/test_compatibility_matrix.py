@@ -78,6 +78,7 @@ def test_compliant_host_boots_routes_meetings_and_persists(
     assert app.architecture_summary() == {
         "schema_version": 1,
         "manifest": ".agent-slack.json",
+        "runner": "auto",
         "orchestrator_ids": ["coordinator"],
     }
 

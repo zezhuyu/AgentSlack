@@ -57,6 +57,7 @@ The host may provide `.agent-slack.json` or `agent-slack.json` at its project ro
 ```json
 {
   "schema_version": 1,
+  "runner": "auto",
   "orchestrators": [
     {
       "agent_id": "coordinator",
@@ -78,6 +79,7 @@ The host may provide `.agent-slack.json` or `agent-slack.json` at its project ro
 
 Semantics:
 
+- `runner` selects this host's default local CLI: `auto`, `codex`, or `claude`; the `AGENT_SLACK_CLI` environment variable overrides it globally when set.
 - `schema_version` must currently be `1`.
 - `orchestrators[].agent_id` must match a discovered agent ID.
 - `default_participants` join every automatic meeting led by that orchestrator.
@@ -141,7 +143,14 @@ The host owns agent definitions, the architecture manifest, domain data, tools, 
 
 ## 7. Network Contract
 
-The service has no built-in authentication and binds to `127.0.0.1` by default. Bind to `0.0.0.0` only for a trusted LAN. Internet exposure requires an authenticated reverse proxy or private tunnel.
+The service has no built-in authentication and binds to `0.0.0.0:8899` by default. `AGENT_SLACK_IP` and `AGENT_SLACK_PORT` are the global bind overrides. The desktop menu can restrict the service to loopback and can register the app as a macOS login item. Internet exposure requires an authenticated reverse proxy or private tunnel.
+
+Mobile and external clients must use the versioned `/api/v1` surface. Existing
+`/api/*` paths remain compatibility aliases for the bundled web client. Clients
+select an agent-system server with `X-Agent-Slack-Server`; omitting the header
+uses the currently active server. Agent execution streams use NDJSON rather
+than WebSockets so native clients can consume incremental replies over ordinary
+HTTP.
 
 ## 8. Compatibility Acceptance Criteria
 

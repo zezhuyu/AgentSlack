@@ -19,11 +19,18 @@ class AgentSlackApp:
         self.data_root = data_root or self.app_root / "data"
         self.static_root = self.app_root / "static"
         self.discovery = AgentDiscovery(project_root)
-        self.architecture = AgentSystemArchitecture.load(project_root)
         self.storage = AgentSlackStorage(self.data_root)
         self.workspace_name = self.project_root.name
-        self.orchestrator = CliOrchestrator(self.workspace_name, self.project_root)
+        self.reload_host_configuration()
         self.bootstrap()
+
+    def reload_host_configuration(self) -> None:
+        self.architecture = AgentSystemArchitecture.load(self.project_root)
+        self.orchestrator = CliOrchestrator(
+            self.workspace_name,
+            self.project_root,
+            backend_preference=self.architecture.runner,
+        )
 
     def bootstrap(self) -> None:
         if not self.storage.load_agents():
@@ -155,7 +162,8 @@ class AgentSlackApp:
             if not lead_agent_id:
                 raise ValueError("lead_agent_id is required for a meeting")
             selected = list(participant_ids or chat.get("member_ids", []))
-            self.create_meeting(chat_id, lead_agent_id, selected, objective or "", auto_run=False)
+            chat = self.create_meeting(chat_id, lead_agent_id, selected, objective or "", auto_run=False)
+            selected = list(chat["meetings"][-1]["participant_ids"])
             meeting_created = True
         elif mode != "respond":
             raise ValueError(f"Unsupported stream mode: {mode}")
@@ -225,9 +233,21 @@ class AgentSlackApp:
         chat = self.storage.get_chat(chat_id)
         if chat is None:
             raise KeyError(f"Chat not found: {chat_id}")
+        if self.get_agent(lead_agent_id) is None:
+            raise ValueError(f"Agent not found: {lead_agent_id}")
+        available = {agent["agent_id"] for agent in self.list_agents()}
+        participants = [
+            agent_id
+            for agent_id in dict.fromkeys([*participant_ids, lead_agent_id])
+            if agent_id in available
+        ]
+        chat["member_ids"] = list(dict.fromkeys([*chat.get("member_ids", []), *participants]))
+        if len(chat["member_ids"]) > 1:
+            chat["kind"] = "group"
+        self.storage.save_chat(chat)
         meeting = {
             "lead_agent_id": lead_agent_id,
-            "participant_ids": participant_ids,
+            "participant_ids": participants,
             "objective": objective,
             "auto_run": auto_run,
             "status": "planned",
@@ -235,10 +255,10 @@ class AgentSlackApp:
         chat = self.storage.append_meeting(chat_id, meeting)
         self._append_system_message(
             chat_id,
-            f"Meeting scheduled by {lead_agent_id} with {', '.join(participant_ids)}. Objective: {objective}",
+            f"Meeting scheduled by {lead_agent_id} with {', '.join(participants)}. Objective: {objective}",
         )
         if auto_run:
-            ordered = [agent_id for agent_id in participant_ids if agent_id != lead_agent_id] + [lead_agent_id]
+            ordered = [agent_id for agent_id in participants if agent_id != lead_agent_id] + [lead_agent_id]
             chat = self.run_agents(chat_id, ordered, objective=objective)
             chat["meetings"][-1]["status"] = "completed"
             self.storage.save_chat(chat)

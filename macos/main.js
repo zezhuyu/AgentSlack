@@ -1,15 +1,21 @@
 'use strict';
 
-const { app, BrowserWindow, dialog, ipcMain, shell } = require('electron');
+const { app, BrowserWindow, Menu, Tray, clipboard, dialog, ipcMain, nativeImage, shell } = require('electron');
 const { spawn, execFileSync } = require('child_process');
 const fs = require('fs');
 const http = require('http');
-const net = require('net');
+const os = require('os');
 const path = require('path');
 
 let backend = null;
 let mainWindow = null;
 let backendPort = null;
+let tray = null;
+let settings = null;
+let isQuitting = false;
+
+const hasSingleInstanceLock = app.requestSingleInstanceLock();
+if (!hasSingleInstanceLock) app.quit();
 
 function backendRoot() {
   return app.isPackaged
@@ -67,27 +73,69 @@ function findPython() {
   throw new Error('Python 3 is required. Install Python 3 or set AGENT_SLACK_PYTHON.');
 }
 
-function allocatePort() {
-  return new Promise((resolve, reject) => {
-    const probe = net.createServer();
-    probe.unref();
-    probe.on('error', reject);
-    probe.listen(0, '127.0.0.1', () => {
-      const address = probe.address();
-      const port = address && typeof address === 'object' ? address.port : 0;
-      probe.close(() => resolve(port));
-    });
-  });
+function loadSettings() {
+  const defaults = { allowLan: true, launchAtLogin: false, port: 8899 };
+  try {
+    const saved = JSON.parse(fs.readFileSync(path.join(app.getPath('userData'), 'settings.json'), 'utf8'));
+    return {
+      allowLan: Boolean(saved.allowLan),
+      launchAtLogin: Boolean(saved.launchAtLogin),
+      port: Number.isInteger(saved.port) && saved.port > 0 && saved.port < 65536 ? saved.port : defaults.port,
+    };
+  } catch (_) {
+    return defaults;
+  }
+}
+
+function saveSettings() {
+  const pathname = path.join(app.getPath('userData'), 'settings.json');
+  fs.mkdirSync(path.dirname(pathname), { recursive: true });
+  fs.writeFileSync(pathname, `${JSON.stringify(settings, null, 2)}\n`);
+}
+
+function configuredPort() {
+  const override = Number.parseInt(process.env.AGENT_SLACK_PORT || '', 10);
+  return Number.isInteger(override) && override > 0 && override < 65536 ? override : settings.port;
+}
+
+function bindHost() {
+  if (process.env.AGENT_SLACK_IP) return process.env.AGENT_SLACK_IP;
+  if (process.env.AGENT_SLACK_HOST) return process.env.AGENT_SLACK_HOST;
+  return settings.allowLan ? '0.0.0.0' : '127.0.0.1';
+}
+
+function lanAddress() {
+  for (const addresses of Object.values(os.networkInterfaces())) {
+    for (const address of addresses || []) {
+      if (address.family === 'IPv4' && !address.internal) return address.address;
+    }
+  }
+  return '127.0.0.1';
+}
+
+function publicApiUrl() {
+  const configuredHost = bindHost();
+  const host = configuredHost === '0.0.0.0' ? lanAddress() : configuredHost;
+  return `http://${host}:${backendPort || configuredPort()}/api/v1`;
 }
 
 function waitForHealth(port, attempts = 80) {
   return new Promise((resolve, reject) => {
     let remaining = attempts;
     const poll = () => {
-      const request = http.get(`http://127.0.0.1:${port}/api/health`, { timeout: 1000 }, (response) => {
-        response.resume();
-        if (response.statusCode === 200) return resolve();
-        retry();
+      const request = http.get(`http://127.0.0.1:${port}/api/v1`, { timeout: 1000 }, (response) => {
+        let body = '';
+        response.setEncoding('utf8');
+        response.on('data', (chunk) => { body += chunk; });
+        response.on('end', () => {
+          try {
+            const payload = JSON.parse(body);
+            if (response.statusCode === 200 && payload.service === 'agent-slack') return resolve();
+          } catch (_) {
+            // A different service on the configured port is not a healthy backend.
+          }
+          retry();
+        });
       });
       request.on('error', retry);
       request.on('timeout', () => request.destroy());
@@ -102,7 +150,7 @@ function waitForHealth(port, attempts = 80) {
 }
 
 async function startBackend() {
-  const port = await allocatePort();
+  const port = configuredPort();
   const launch = backendLaunch();
   const dataRoot = path.join(app.getPath('userData'), 'data');
   const logRoot = path.join(app.getPath('userData'), 'logs');
@@ -117,7 +165,7 @@ async function startBackend() {
 
   backend = spawn(launch.command, [
     ...launch.args,
-    '--host', '127.0.0.1',
+    '--host', bindHost(),
     '--port', String(port),
     '--data-root', dataRoot,
   ], {
@@ -133,7 +181,28 @@ async function startBackend() {
   backend.once('exit', () => { backend = null; });
   await waitForHealth(port);
   backendPort = port;
+  refreshTrayMenu();
   return port;
+}
+
+function stopBackend() {
+  return new Promise((resolve) => {
+    if (!backend) return resolve();
+    const child = backend;
+    const timeout = setTimeout(() => child.kill('SIGKILL'), 3000);
+    child.once('exit', () => {
+      clearTimeout(timeout);
+      resolve();
+    });
+    child.kill('SIGTERM');
+  });
+}
+
+async function restartBackend() {
+  await stopBackend();
+  backendPort = null;
+  const port = await startBackend();
+  if (mainWindow) mainWindow.loadURL(`http://127.0.0.1:${port}`);
 }
 
 function createWindow(port) {
@@ -159,7 +228,83 @@ function createWindow(port) {
   mainWindow.webContents.on('will-navigate', (event, url) => {
     if (!url.startsWith(`http://127.0.0.1:${port}`)) event.preventDefault();
   });
+  mainWindow.on('close', (event) => {
+    if (!isQuitting) {
+      event.preventDefault();
+      mainWindow.hide();
+    }
+  });
   mainWindow.on('closed', () => { mainWindow = null; });
+}
+
+function showWindow() {
+  if (!mainWindow && backendPort) createWindow(backendPort);
+  if (mainWindow) {
+    mainWindow.show();
+    mainWindow.focus();
+  }
+}
+
+async function setLanAccess(enabled) {
+  const previous = settings.allowLan;
+  settings.allowLan = enabled;
+  saveSettings();
+  try {
+    await restartBackend();
+  } catch (error) {
+    settings.allowLan = previous;
+    saveSettings();
+    await restartBackend().catch(() => {});
+    dialog.showErrorBox('Could not change API access', error.message);
+  }
+  refreshTrayMenu();
+}
+
+function setLaunchAtLogin(enabled) {
+  settings.launchAtLogin = enabled;
+  saveSettings();
+  app.setLoginItemSettings({ openAtLogin: enabled });
+  refreshTrayMenu();
+}
+
+function refreshTrayMenu() {
+  if (!tray || !settings) return;
+  const apiUrl = publicApiUrl();
+  tray.setToolTip(`Agent Slack Server\n${apiUrl}`);
+  tray.setContextMenu(Menu.buildFromTemplate([
+    { label: 'Open Agent Slack', click: showWindow },
+    { label: `API: ${apiUrl}`, enabled: false },
+    { label: 'Copy API URL', click: () => clipboard.writeText(apiUrl) },
+    { type: 'separator' },
+    {
+      label: 'Allow Trusted LAN Access',
+      type: 'checkbox',
+      checked: settings.allowLan,
+      click: (item) => setLanAccess(item.checked),
+    },
+    {
+      label: 'Launch at Login',
+      type: 'checkbox',
+      checked: settings.launchAtLogin,
+      click: (item) => setLaunchAtLogin(item.checked),
+    },
+    { type: 'separator' },
+    {
+      label: 'Quit Agent Slack Server',
+      click: () => {
+        isQuitting = true;
+        app.quit();
+      },
+    },
+  ]));
+}
+
+function createTray() {
+  const iconPath = path.join(__dirname, 'assets', 'app-icon.png');
+  const icon = nativeImage.createFromPath(iconPath).resize({ width: 18, height: 18 });
+  tray = new Tray(icon);
+  tray.on('click', showWindow);
+  refreshTrayMenu();
 }
 
 ipcMain.handle('agent-slack:select-folder', async () => {
@@ -179,9 +324,18 @@ ipcMain.handle('agent-slack:select-image', async () => {
   return result.canceled ? null : result.filePaths[0];
 });
 
+ipcMain.handle('agent-slack:server-info', () => ({
+  apiUrl: publicApiUrl(),
+  allowLan: settings.allowLan,
+  port: backendPort || configuredPort(),
+}));
+
 app.whenReady().then(async () => {
   try {
+    settings = loadSettings();
+    if (settings.launchAtLogin) app.setLoginItemSettings({ openAtLogin: true });
     const port = await startBackend();
+    createTray();
     createWindow(port);
   } catch (error) {
     dialog.showErrorBox('Agent Slack could not start', error.message);
@@ -190,15 +344,15 @@ app.whenReady().then(async () => {
 });
 
 app.on('activate', () => {
-  if (mainWindow) mainWindow.show();
-  else if (backendPort) createWindow(backendPort);
+  showWindow();
 });
 
-app.on('window-all-closed', () => {
-  if (process.platform !== 'darwin') app.quit();
+app.on('second-instance', () => {
+  showWindow();
 });
 
 app.on('before-quit', () => {
+  isQuitting = true;
   if (backend) backend.kill('SIGTERM');
   backendPort = null;
 });

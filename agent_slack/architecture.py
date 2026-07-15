@@ -27,6 +27,7 @@ class OrchestratorConfig:
 class AgentSystemArchitecture:
     schema_version: int = 1
     manifest_path: Path | None = None
+    runner: str = "auto"
     orchestrators: dict[str, OrchestratorConfig] = field(default_factory=dict)
 
     MANIFEST_NAMES = (".agent-slack.json", "agent-slack.json")
@@ -72,9 +73,13 @@ class AgentSystemArchitecture:
                 default_participants=defaults,
                 routes=tuple(routes),
             )
+        runner = str(payload.get("runner") or "auto").strip().casefold()
+        if runner not in {"auto", "codex", "claude"}:
+            runner = "auto"
         return cls(
             schema_version=int(payload.get("schema_version") or 1),
             manifest_path=manifest_path,
+            runner=runner,
             orchestrators=orchestrators,
         )
 
@@ -102,5 +107,6 @@ class AgentSystemArchitecture:
         return {
             "schema_version": self.schema_version,
             "manifest": manifest,
+            "runner": self.runner,
             "orchestrator_ids": self.orchestrator_ids,
         }

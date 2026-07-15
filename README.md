@@ -32,7 +32,6 @@ From the repo root:
 source .venv/bin/activate
 python subsystems/agent_slack/run.py \
   --project-root "$PWD" \
-  --host 127.0.0.1 \
   --port 8899
 ```
 
@@ -42,7 +41,8 @@ Then open:
 http://127.0.0.1:8899
 ```
 
-The browser UI and API have no built-in token authentication. The default host is local-only.
+The browser UI and API have no built-in token authentication. The daemon binds
+to `0.0.0.0` by default so trusted LAN clients can connect.
 
 Omit `--project-root` to start with an empty server registry, then use the `+` button in the workspace rail and enter an agent-system folder. Use `--data-root <folder>` to move the server registry, chats, and memories out of the source tree.
 
@@ -61,9 +61,26 @@ python3 -m pip install -r requirements-build.txt
 npm run backend
 npm run build  # unpacked .app for local verification
 npm run dist   # arm64 + x64 DMGs
+npm run verify # frozen-backend smoke test, signatures, and DMG integrity
+```
+
+`npm run verify` boots the packaged backend against a temporary generic Codex
+agent system and verifies both top-level and nested agent discovery. Run the
+Python and Markdown regression suites from the repository root:
+
+```bash
+.venv/bin/python -m pytest -q subsystems/agent_slack/tests
+node --test subsystems/agent_slack/tests/test_markdown_renderer.js
 ```
 
 The desktop app uses a native folder chooser when adding a server. Runtime state is stored under `~/Library/Application Support/Agent Slack/data`, outside the read-only app bundle and outside connected agent-system folders.
+
+Closing the desktop window hides it while the Agent Slack backend continues to
+run. Use the menu-bar icon to reopen the window, copy the API URL, allow trusted
+LAN access, enable **Launch at Login**, or stop the server completely. The
+desktop API uses `0.0.0.0:8899` by default; `AGENT_SLACK_IP` and
+`AGENT_SLACK_PORT` override those values globally. `AGENT_SLACK_HOST` remains a
+backward-compatible alias for `AGENT_SLACK_IP`.
 
 ## Server behavior
 
@@ -94,9 +111,13 @@ The desktop app uses a native folder chooser when adding a server. Runtime state
 
 ## Outside access
 
-- LAN access: bind to `0.0.0.0` and open `http://<server-ip>:8899` from another device
+- local API: `http://127.0.0.1:8899/api/v1`
+- LAN access: enabled by default; use **Copy API URL** from the desktop menu-bar icon
 - internet access: put the daemon behind an authenticated reverse proxy or private tunnel; Agent Slack itself does not authenticate requests
 - same-origin browser app: the UI and JSON API are served from the same daemon, so no separate frontend build or CORS setup is required
+
+The stable mobile-client contract, endpoint list, server-selection header, and
+NDJSON streaming examples are documented in [MOBILE-API.md](./MOBILE-API.md).
 
 ## Data layout
 

@@ -9,6 +9,7 @@ from agent_slack.architecture import AgentSystemArchitecture
 def test_loads_generic_orchestrator_routes(tmp_path: Path) -> None:
     manifest = {
         "schema_version": 1,
+        "runner": "claude",
         "orchestrators": [
             {
                 "agent_id": "coordinator",
@@ -27,6 +28,7 @@ def test_loads_generic_orchestrator_routes(tmp_path: Path) -> None:
     architecture = AgentSystemArchitecture.load(tmp_path)
 
     assert architecture.orchestrator_ids == ["coordinator"]
+    assert architecture.runner == "claude"
     assert architecture.suggest_participants(
         "coordinator",
         "Run a security threat review",
@@ -58,3 +60,9 @@ def test_unknown_participants_are_filtered(tmp_path: Path) -> None:
     architecture = AgentSystemArchitecture.load(tmp_path)
 
     assert architecture.suggest_participants("lead", "Review", {"lead", "installed"}) == ["lead", "installed"]
+
+
+def test_unknown_runner_falls_back_to_auto(tmp_path: Path) -> None:
+    (tmp_path / ".agent-slack.json").write_text('{"runner":"custom"}', encoding="utf-8")
+
+    assert AgentSystemArchitecture.load(tmp_path).runner == "auto"

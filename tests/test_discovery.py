@@ -71,3 +71,16 @@ def test_discovers_top_level_and_nested_codex_agents(tmp_path: Path) -> None:
     assert {agent.agent_id for agent in agents} == {"coordinator", "critic"}
     assert all(agent.group == "codex" for agent in agents)
     assert all(agent.kind == "subagent" for agent in agents)
+
+
+def test_parses_inline_tool_list_used_by_agent_frontmatter(tmp_path: Path) -> None:
+    agent = tmp_path / ".codex" / "agents" / "researcher.md"
+    agent.parent.mkdir(parents=True)
+    agent.write_text(
+        "---\nname: researcher\nsummary: Collects evidence.\ntools: [Read, Bash]\n---\n# Researcher\n",
+        encoding="utf-8",
+    )
+
+    discovered = AgentDiscovery(tmp_path).discover()
+
+    assert discovered[0].tools == ["Read", "Bash"]
