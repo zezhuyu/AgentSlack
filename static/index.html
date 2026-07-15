@@ -1,0 +1,142 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Agent Slack</title>
+    <link rel="icon" type="image/png" href="/logo.png" />
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <div class="shell">
+      <aside class="workspace-rail">
+        <div class="workspace-badge"><img src="/logo.png" alt="Agent Slack" /></div>
+        <div id="serverList" class="workspace-stack server-stack"></div>
+        <button id="addServerBtn" class="rail-btn add-server-btn" title="Add agent system">+</button>
+      </aside>
+
+      <aside class="sidebar sidebar-primary">
+        <div class="workspace-header">
+          <div>
+            <h1 id="workspaceLabel">Workspace</h1>
+            <p>Local agent workspace</p>
+          </div>
+          <div class="workspace-tools">
+            <button id="serverSettingsBtn" class="icon-btn" title="Server Settings">&#9881;</button>
+            <button id="refreshAgentsBtn" class="icon-btn" title="Refresh Agents">&#8635;</button>
+            <button id="newChatBtnHeader" class="icon-btn" title="New Chat">+</button>
+          </div>
+        </div>
+        <section class="sidebar-section">
+          <div class="section-heading">
+            <h2>Direct Messages</h2>
+            <span id="chatCount" class="section-meta">0</span>
+          </div>
+          <div id="chatList" class="list"></div>
+        </section>
+        <section class="people-panel collapsed" id="peoplePanel">
+          <button id="peopleToggleBtn" class="people-toggle" type="button" aria-expanded="false">
+            <span class="people-toggle-left">
+              <span id="peopleChevron" class="people-chevron">&#9656;</span>
+              <span>People</span>
+            </span>
+            <span id="agentCount" class="section-meta">0</span>
+          </button>
+          <div id="agentListWrap" class="people-list-wrap" hidden>
+            <div id="agentList" class="list people-list"></div>
+          </div>
+        </section>
+      </aside>
+
+      <main class="main-pane">
+        <header class="chat-header">
+          <div class="chat-heading">
+            <h2 id="chatTitle">Select a chat</h2>
+            <p id="chatMembers" class="muted"></p>
+          </div>
+          <div class="chat-actions">
+            <button id="runAgentsBtn">Run Members</button>
+            <button id="autoMeetingBtn">Auto Meeting</button>
+            <button id="manualMeetingBtn">Manual Meeting</button>
+          </div>
+        </header>
+        <section id="messages" class="messages"></section>
+        <footer class="composer">
+          <textarea id="messageInput" rows="4" placeholder="Message Agent Slack"></textarea>
+          <div class="composer-actions">
+            <input id="objectiveInput" placeholder="Optional objective for next agent run / meeting" />
+            <button id="sendBtn">Send</button>
+          </div>
+        </footer>
+      </main>
+    </div>
+
+    <dialog id="chatDialog">
+      <form method="dialog" id="chatForm">
+        <h3>Create Chat</h3>
+        <label>Title <input id="chatFormTitle" required /></label>
+        <label>People</label>
+        <div class="agent-picker" id="chatPeoplePicker">
+          <div id="chatPeopleChips" class="agent-picker-chips"></div>
+          <input id="chatPeopleSearch" autocomplete="off" placeholder="Search people" />
+          <div id="chatPeopleMenu" class="agent-picker-menu" hidden></div>
+        </div>
+        <menu>
+          <button id="cancelChatBtn" type="button">Cancel</button>
+          <button value="submit">Create</button>
+        </menu>
+      </form>
+    </dialog>
+
+    <dialog id="serverDialog">
+      <form method="dialog" id="serverForm">
+        <h3 id="serverDialogTitle">Add Agent System</h3>
+        <p class="dialog-help">Choose the root folder containing the agent definitions for this server.</p>
+        <label>Server name <input id="serverName" placeholder="Optional; folder name is used by default" /></label>
+        <label id="serverPathLabel">Agent system folder</label>
+        <div id="serverPathPicker" class="folder-picker">
+          <input id="serverPath" required placeholder="/Users/you/projects/agent-system" />
+          <button id="browseServerPathBtn" type="button">Browse</button>
+        </div>
+        <label>Server logo <span class="label-note">optional</span></label>
+        <div class="folder-picker">
+          <input id="serverLogoPath" placeholder="PNG, JPEG, WebP, or GIF" />
+          <button id="browseServerLogoBtn" type="button">Browse</button>
+        </div>
+        <p id="serverFormError" class="form-error" hidden></p>
+        <menu>
+          <button id="cancelServerBtn" type="button">Cancel</button>
+          <button id="serverSubmitBtn" value="submit">Add Server</button>
+        </menu>
+      </form>
+    </dialog>
+
+    <dialog id="meetingDialog">
+      <form method="dialog" id="meetingForm">
+        <h3>Manual Meeting</h3>
+        <label>Lead Agent</label>
+        <div class="agent-picker" id="meetingLeadPicker">
+          <div id="meetingLeadChips" class="agent-picker-chips"></div>
+          <input id="meetingLeadSearch" autocomplete="off" placeholder="Search for a lead" />
+          <div id="meetingLeadMenu" class="agent-picker-menu" hidden></div>
+        </div>
+        <label>Participants</label>
+        <div class="agent-picker" id="meetingPeoplePicker">
+          <div id="meetingPeopleChips" class="agent-picker-chips"></div>
+          <input id="meetingPeopleSearch" autocomplete="off" placeholder="Search people" />
+          <div id="meetingPeopleMenu" class="agent-picker-menu" hidden></div>
+        </div>
+        <label>Objective <textarea id="meetingObjective" rows="4" required></textarea></label>
+        <menu>
+          <button id="cancelMeetingBtn" type="button">Cancel</button>
+          <button value="submit">Run Meeting</button>
+        </menu>
+      </form>
+    </dialog>
+
+    <div id="peopleTooltip" class="people-tooltip" hidden></div>
+
+    <script src="/markdown.js"></script>
+    <script src="/app.js"></script>
+  </body>
+</html>

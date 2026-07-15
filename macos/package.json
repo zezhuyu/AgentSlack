@@ -1,0 +1,52 @@
+{
+  "name": "agent-slack-desktop",
+  "version": "1.0.0",
+  "description": "Local multi-server desktop client for agent systems",
+  "author": "Agent Slack Contributors",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "backend": "./build-backend.sh",
+    "prebuild": "./build-backend.sh",
+    "build": "electron-builder --mac --dir",
+    "predist": "./build-backend.sh",
+    "dist": "electron-builder --mac"
+  },
+  "devDependencies": {
+    "electron": "^43.1.1",
+    "electron-builder": "^26.15.3"
+  },
+  "build": {
+    "appId": "com.agentslack.desktop",
+    "productName": "Agent Slack",
+    "copyright": "Agent Slack",
+    "asar": true,
+    "mac": {
+      "category": "public.app-category.productivity",
+      "icon": "assets/app-icon.png",
+      "identity": "-",
+      "signIgnore": [
+        "Resources/backend/agent-slack-backend$"
+      ],
+      "target": [
+        {
+          "target": "dmg",
+          "arch": ["arm64", "x64"]
+        }
+      ]
+    },
+    "files": [
+      "main.js",
+      "preload.js"
+    ],
+    "extraResources": [
+      {
+        "from": "backend/agent-slack-backend",
+        "to": "backend/agent-slack-backend"
+      }
+    ],
+    "directories": {
+      "output": "dist"
+    }
+  }
+}
