@@ -76,8 +76,11 @@ node --test subsystems/agent_slack/tests/test_markdown_renderer.js
 The desktop app uses a native folder chooser when adding a server. Runtime state is stored under `~/Library/Application Support/Agent Slack/data`, outside the read-only app bundle and outside connected agent-system folders.
 
 Closing the desktop window hides it while the Agent Slack backend continues to
-run. Use the menu-bar icon to reopen the window, copy the API URL, allow trusted
-LAN access, enable **Launch at Login**, or stop the server completely. The
+run and removes the app from the Dock. Login-item launches also start directly
+in this background state. Use the transparent-logo menu-bar icon to reopen the
+window, copy the API URL, allow trusted LAN access, enable **Launch at Login**,
+or choose **Quit Agent Slack Entirely**. While the window is open, the same full
+quit action is available from the app's Dock menu. The
 desktop API uses `0.0.0.0:8899` by default; `AGENT_SLACK_IP` and
 `AGENT_SLACK_PORT` override those values globally. `AGENT_SLACK_HOST` remains a
 backward-compatible alias for `AGENT_SLACK_IP`.

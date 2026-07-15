@@ -15,6 +15,13 @@ for path in "$BACKEND" "$ARM_APP" "$INTEL_APP" "$ARM_DMG" "$INTEL_DMG"; do
   fi
 done
 
+for app_path in "$ARM_APP" "$INTEL_APP"; do
+  if [ ! -f "$app_path/Contents/Resources/tray-logo.png" ]; then
+    printf 'Missing transparent menu-bar logo: %s\n' "$app_path" >&2
+    exit 1
+  fi
+done
+
 ARCHES=$(lipo -archs "$BACKEND")
 case " $ARCHES " in *" arm64 "*) ;; *) printf 'Backend is missing arm64\n' >&2; exit 1 ;; esac
 case " $ARCHES " in *" x86_64 "*) ;; *) printf 'Backend is missing x86_64\n' >&2; exit 1 ;; esac

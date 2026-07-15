@@ -45,6 +45,10 @@
       {
         "from": "backend/agent-slack-backend",
         "to": "backend/agent-slack-backend"
+      },
+      {
+        "from": "../static/logo.png",
+        "to": "tray-logo.png"
       }
     ],
     "directories": {

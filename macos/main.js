@@ -206,6 +206,7 @@ async function restartBackend() {
 }
 
 function createWindow(port) {
+  if (process.platform === 'darwin') app.dock.show();
   mainWindow = new BrowserWindow({
     width: 1440,
     height: 920,
@@ -232,17 +233,32 @@ function createWindow(port) {
     if (!isQuitting) {
       event.preventDefault();
       mainWindow.hide();
+      if (process.platform === 'darwin') app.dock.hide();
     }
   });
   mainWindow.on('closed', () => { mainWindow = null; });
 }
 
 function showWindow() {
+  if (process.platform === 'darwin') app.dock.show();
   if (!mainWindow && backendPort) createWindow(backendPort);
   if (mainWindow) {
     mainWindow.show();
     mainWindow.focus();
   }
+}
+
+function quitEntirely() {
+  isQuitting = true;
+  app.quit();
+}
+
+function configureDockMenu() {
+  if (process.platform !== 'darwin') return;
+  app.dock.setMenu(Menu.buildFromTemplate([
+    { label: 'Open Agent Slack', click: showWindow },
+    { label: 'Quit Agent Slack Entirely', click: quitEntirely },
+  ]));
 }
 
 async function setLanAccess(enabled) {
@@ -290,17 +306,16 @@ function refreshTrayMenu() {
     },
     { type: 'separator' },
     {
-      label: 'Quit Agent Slack Server',
-      click: () => {
-        isQuitting = true;
-        app.quit();
-      },
+      label: 'Quit Agent Slack Entirely',
+      click: quitEntirely,
     },
   ]));
 }
 
 function createTray() {
-  const iconPath = path.join(__dirname, 'assets', 'app-icon.png');
+  const iconPath = app.isPackaged
+    ? path.join(process.resourcesPath, 'tray-logo.png')
+    : path.resolve(__dirname, '..', 'static', 'logo.png');
   const icon = nativeImage.createFromPath(iconPath).resize({ width: 18, height: 18 });
   tray = new Tray(icon);
   tray.on('click', showWindow);
@@ -336,7 +351,10 @@ app.whenReady().then(async () => {
     if (settings.launchAtLogin) app.setLoginItemSettings({ openAtLogin: true });
     const port = await startBackend();
     createTray();
-    createWindow(port);
+    configureDockMenu();
+    const openedAtLogin = process.platform === 'darwin' && app.getLoginItemSettings().wasOpenedAtLogin;
+    if (openedAtLogin) app.dock.hide();
+    else createWindow(port);
   } catch (error) {
     dialog.showErrorBox('Agent Slack could not start', error.message);
     app.quit();
