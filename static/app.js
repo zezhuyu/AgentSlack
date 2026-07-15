@@ -154,6 +154,9 @@ function renderEmptyServerState() {
   $("chatCount").textContent = "0";
   $("agentCount").textContent = "0";
   setWorkspaceAvailable(false);
+  queueMicrotask(() => {
+    if (!state.activeServerId && !$("serverDialog").open) openServerDialog();
+  });
 }
 
 async function loadAgents() {

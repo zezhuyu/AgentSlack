@@ -63,6 +63,22 @@ def _running_server(tmp_path: Path):
         thread.join(timeout=2)
 
 
+@contextmanager
+def _running_empty_server(tmp_path: Path):
+    app_root = Path(__file__).resolve().parents[1]
+    manager = AgentServerManager(app_root, tmp_path / "empty-state")
+    _Handler.manager = manager
+    server = AgentSlackHTTPServer(("127.0.0.1", 0), _Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{server.server_port}"
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
 def _request(base_url: str, server_id: str, path: str, payload: dict | None = None):
     data = json.dumps(payload).encode() if payload is not None else None
     request = Request(
@@ -255,3 +271,28 @@ def test_api_responses_advertise_version_and_preflight_methods(tmp_path: Path, m
             assert response.status == 204
             assert "POST" in response.headers["Access-Control-Allow-Methods"]
             assert response.headers["X-Agent-Slack-Api-Version"] == API_VERSION
+
+
+def test_empty_registry_supports_client_bootstrap_and_returns_setup_action(tmp_path: Path) -> None:
+    with _running_empty_server(tmp_path) as base_url:
+        with urlopen(f"{base_url}/", timeout=5) as response:
+            root_page = response.read().decode()
+            assert response.headers.get_content_type() == "text/html"
+            assert "Agent Slack" in root_page
+        with urlopen(f"{base_url}/api/v1/agents", timeout=5) as response:
+            assert json.loads(response.read()) == {"agents": []}
+        with urlopen(f"{base_url}/api/v1/chats", timeout=5) as response:
+            assert json.loads(response.read()) == {"chats": []}
+
+        request = Request(
+            f"{base_url}/api/v1/chats",
+            data=json.dumps({"title": "Blocked"}).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with pytest.raises(HTTPError) as caught:
+            urlopen(request, timeout=5)
+        payload = json.loads(caught.value.read())
+        assert caught.value.code == 409
+        assert payload["code"] == "server_not_configured"
+        assert payload["setup"]["endpoint"] == "/api/v1/servers"

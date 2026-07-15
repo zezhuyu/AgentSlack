@@ -46,6 +46,11 @@ List registered servers and retain the selected `server_id`:
 curl http://127.0.0.1:8899/api/v1/servers
 ```
 
+On a fresh installation, `GET /api/v1/agents` and `GET /api/v1/chats`
+return empty collections. Server-scoped write endpoints return
+`code: server_not_configured` with the setup endpoint until an agent-system
+folder is registered.
+
 Send it on agent-system-scoped requests:
 
 ```text

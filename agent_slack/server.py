@@ -14,6 +14,18 @@ from .servers import AgentServerManager
 API_VERSION = "1"
 
 
+def _no_server_payload() -> dict:
+    return {
+        "error": "No agent server is configured",
+        "code": "server_not_configured",
+        "setup": {
+            "method": "POST",
+            "endpoint": "/api/v1/servers",
+            "required_fields": ["project_root"],
+        },
+    }
+
+
 def _api_document() -> dict:
     return {
         "service": "agent-slack",
@@ -125,8 +137,14 @@ class _Handler(BaseHTTPRequestHandler):
             if logo_path is None:
                 return self._json({"error": "server logo not found"}, status=404)
             return self._serve_file(logo_path)
+        if not path.startswith("/api/"):
+            return self._serve_static(parsed.path)
         if path.startswith("/api/") and self.manager.active_server_id is None:
-            return self._json({"error": "No agent server is configured"}, status=409)
+            if path == "/api/agents":
+                return self._json({"agents": []})
+            if path == "/api/chats":
+                return self._json({"chats": []})
+            return self._json(_no_server_payload(), status=409)
         try:
             app = self._active_app()
         except KeyError as exc:
@@ -172,7 +190,7 @@ class _Handler(BaseHTTPRequestHandler):
                 return self._json({"error": str(exc)}, status=400)
             return self._json(server)
         if path.startswith("/api/") and self.manager.active_server_id is None:
-            return self._json({"error": "No agent server is configured"}, status=409)
+            return self._json(_no_server_payload(), status=409)
         try:
             app = self._active_app()
         except KeyError as exc:

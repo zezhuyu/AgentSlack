@@ -57,8 +57,10 @@ AGENT_SLACK_CLI=offline "$BACKEND" \
   --project-root "$HOST_ROOT" >"$DATA_ROOT/backend.log" 2>&1 &
 BACKEND_PID=$!
 cleanup() {
-  kill "$BACKEND_PID" 2>/dev/null || true
-  wait "$BACKEND_PID" 2>/dev/null || true
+  if [ -n "${BACKEND_PID:-}" ]; then
+    kill "$BACKEND_PID" 2>/dev/null || true
+    wait "$BACKEND_PID" 2>/dev/null || true
+  fi
   rm -rf "$DATA_ROOT"
 }
 trap cleanup EXIT INT TERM
@@ -88,6 +90,30 @@ grep -q '"ok": true' "$DATA_ROOT/health.json"
 grep -q '"runner": "codex"' "$DATA_ROOT/health.json"
 grep -q '"agent_id": "coordinator"' "$DATA_ROOT/agents.json"
 grep -q '"agent_id": "researcher"' "$DATA_ROOT/agents.json"
+
+kill "$BACKEND_PID" 2>/dev/null || true
+wait "$BACKEND_PID" 2>/dev/null || true
+BACKEND_PID=""
+AGENT_SLACK_CLI=offline "$BACKEND" \
+  --host 127.0.0.1 \
+  --port "$PORT" \
+  --data-root "$DATA_ROOT/empty-runtime" >"$DATA_ROOT/empty-backend.log" 2>&1 &
+BACKEND_PID=$!
+EMPTY_READY=0
+for _attempt in 1 2 3 4 5 6 7 8 9 10; do
+  if curl -fsS "http://127.0.0.1:$PORT/" >"$DATA_ROOT/empty-index.html"; then
+    EMPTY_READY=1
+    break
+  fi
+  sleep 1
+done
+if [ "$EMPTY_READY" -ne 1 ]; then
+  cat "$DATA_ROOT/empty-backend.log" >&2
+  exit 1
+fi
+curl -fsS "http://127.0.0.1:$PORT/api/v1/agents" >"$DATA_ROOT/empty-agents.json"
+grep -q 'Agent Slack' "$DATA_ROOT/empty-index.html"
+grep -q '"agents": \[\]' "$DATA_ROOT/empty-agents.json"
 
 codesign --verify --deep --strict --verbose=2 "$ARM_APP"
 codesign --verify --deep --strict --verbose=2 "$INTEL_APP"
