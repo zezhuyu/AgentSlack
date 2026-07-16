@@ -4,7 +4,7 @@
   if (root) root.AgentSlackMarkdown = api;
 }(typeof window !== "undefined" ? window : globalThis, function createMarkdownRenderer() {
   function escapeHtml(value) {
-    return String(value || "")
+    return String(value ?? "")
       .replaceAll("&", "&amp;")
       .replaceAll("<", "&lt;")
       .replaceAll(">", "&gt;")
@@ -61,7 +61,58 @@
     return "left";
   }
 
+  function parseJsonDocument(value) {
+    let source = String(value ?? "").trim();
+    const fenced = source.match(/^```json\s*\n([\s\S]*?)\n```$/i);
+    if (fenced) source = fenced[1].trim();
+    if (!source || !/^[\[{]/.test(source)) return null;
+    try {
+      const parsed = JSON.parse(source);
+      return parsed && typeof parsed === "object" ? parsed : null;
+    } catch (_error) {
+      return null;
+    }
+  }
+
+  function jsonLabel(key) {
+    return String(key)
+      .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
+      .replace(/[_-]+/g, " ")
+      .replace(/\b\w/g, (letter) => letter.toUpperCase());
+  }
+
+  function renderJsonValue(value) {
+    if (value === null) return '<span class="json-empty">None</span>';
+    if (Array.isArray(value)) {
+      if (!value.length) return '<span class="json-empty">None</span>';
+      return `<ul class="json-list">${value.map((item) => `<li>${renderJsonValue(item)}</li>`).join("")}</ul>`;
+    }
+    if (typeof value === "object") {
+      if (!Object.keys(value).length) return '<span class="json-empty">No fields</span>';
+      return `<div class="json-nested">${Object.entries(value).map(([key, item]) => (
+        `<div><strong>${escapeHtml(jsonLabel(key))}</strong>${renderJsonValue(item)}</div>`
+      )).join("")}</div>`;
+    }
+    if (typeof value === "boolean") return `<span class="json-scalar">${value ? "Yes" : "No"}</span>`;
+    if (typeof value === "number") return `<span class="json-scalar">${escapeHtml(value)}</span>`;
+    return `<span>${renderInline(String(value))}</span>`;
+  }
+
+  function renderJsonDocument(document) {
+    const entries = Array.isArray(document)
+      ? [["items", document]]
+      : Object.entries(document).length ? Object.entries(document) : [["fields", null]];
+    return `<section class="json-card">${entries.map(([key, value]) => {
+      const classes = ["json-field"];
+      if (key === "summary") classes.push("json-summary");
+      if (key === "status") classes.push("json-status");
+      return `<div class="${classes.join(" ")}"><div class="json-label">${escapeHtml(jsonLabel(key))}</div><div class="json-value">${renderJsonValue(value)}</div></div>`;
+    }).join("")}</section>`;
+  }
+
   function render(markdown) {
+    const jsonDocument = parseJsonDocument(markdown);
+    if (jsonDocument) return renderJsonDocument(jsonDocument);
     const lines = String(markdown || "").replace(/\r\n?/g, "\n").split("\n");
     const html = [];
     let paragraph = [];
@@ -167,5 +218,10 @@
     return html.join("");
   }
 
-  return { escapeHtml, render, renderInline, safeUrl };
+  function appendStream(currentText, delta) {
+    const text = `${currentText || ""}${delta || ""}`;
+    return { text, html: render(text) };
+  }
+
+  return { appendStream, escapeHtml, parseJsonDocument, render, renderInline, renderJsonDocument, safeUrl };
 }));

@@ -26,6 +26,11 @@ html, body {
   overflow: hidden;
 }
 
+.mobile-only,
+.mobile-sidebar-backdrop {
+  display: none;
+}
+
 body {
   margin: 0;
   font-family: "Lato", "Helvetica Neue", Helvetica, Arial, sans-serif;
@@ -613,6 +618,15 @@ menu button:hover {
   background: #f8f8f8;
 }
 
+.chat-actions .danger-button {
+  border-color: #d72c3f;
+  color: #b7192d;
+}
+
+.chat-actions .danger-button:hover {
+  background: #fff1f3;
+}
+
 #sendBtn {
   border-color: var(--accent);
   background: var(--accent);
@@ -811,6 +825,92 @@ menu button:hover {
 
 .message.system .message-content {
   color: #5a4561;
+}
+
+.json-card {
+  display: grid;
+  gap: 0;
+  overflow: hidden;
+  margin-top: 8px;
+  border: 1px solid #d9d3da;
+  border-radius: 12px;
+  background: #fff;
+  box-shadow: 0 8px 24px rgba(40, 27, 42, 0.06);
+}
+
+.json-field {
+  display: grid;
+  grid-template-columns: minmax(110px, 0.25fr) minmax(0, 1fr);
+  gap: 16px;
+  padding: 11px 14px;
+  border-bottom: 1px solid #ebe7ec;
+}
+
+.json-field:last-child {
+  border-bottom: 0;
+}
+
+.json-label {
+  color: #685a69;
+  font-size: 11px;
+  font-weight: 900;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.json-value {
+  min-width: 0;
+}
+
+.json-summary {
+  grid-template-columns: 1fr;
+  padding: 16px;
+  background: #f7faf9;
+}
+
+.json-summary .json-value {
+  font-size: 16px;
+  font-weight: 700;
+  line-height: 1.5;
+}
+
+.json-status .json-value > span,
+.json-scalar {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: #e5f5ee;
+  color: #176345;
+  font-size: 13px;
+  font-weight: 800;
+}
+
+.json-list {
+  margin: 0;
+  padding-left: 20px;
+}
+
+.json-list li + li {
+  margin-top: 6px;
+}
+
+.json-nested {
+  display: grid;
+  gap: 8px;
+}
+
+.json-nested > div {
+  display: grid;
+  gap: 3px;
+}
+
+.json-empty {
+  color: var(--muted);
+  font-style: italic;
+}
+
+.message.failed .message-content {
+  color: #8b2635;
 }
 
 .message.streaming .message-avatar {
@@ -1033,11 +1133,111 @@ menu {
 }
 
 @media (max-width: 900px) {
-  html, body { overflow: auto; }
-  .shell { grid-template-columns: 1fr; height: auto; }
+  html, body { height: 100%; overflow: hidden; }
+
+  .shell {
+    grid-template-columns: 1fr;
+    height: 100vh;
+    height: 100dvh;
+  }
+
   .workspace-rail,
   .sidebar-primary { display: none; }
-  .main-pane { min-height: 100vh; }
+
+  .main-pane {
+    height: 100vh;
+    height: 100dvh;
+    min-height: 0;
+  }
+
+  .mobile-only {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .chat-actions > button:not(#mobilePeopleBtn):not(#deleteChatBtn) {
+    display: none;
+  }
+
+  #mobilePeopleBtn {
+    min-height: 40px;
+    border-color: #d3c1d6;
+    color: var(--accent);
+  }
+
+  .sidebar-primary.mobile-open {
+    position: fixed;
+    z-index: 1200;
+    inset: 0 auto 0 0;
+    display: flex;
+    width: min(86vw, 360px);
+    padding-top: env(safe-area-inset-top, 0);
+    box-shadow: 16px 0 42px rgba(24, 10, 27, 0.32);
+  }
+
+  .mobile-sidebar-backdrop.visible {
+    position: fixed;
+    z-index: 1100;
+    inset: 0;
+    display: block;
+    width: 100%;
+    height: 100%;
+    border: 0;
+    background: rgba(19, 13, 21, 0.46);
+  }
+
+  .chat-header {
+    flex: 0 0 auto;
+    padding: 12px 14px;
+  }
+
+  .chat-heading {
+    min-width: 0;
+  }
+
+  .chat-heading h2,
+  .chat-heading p {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .messages {
+    overscroll-behavior: contain;
+    padding-bottom: 8px;
+  }
+
+  .message {
+    grid-template-columns: 36px minmax(0, 1fr);
+    gap: 9px;
+    padding: 9px 14px;
+  }
+
+  .message-avatar {
+    width: 32px;
+    height: 32px;
+  }
+
+  .composer {
+    flex: 0 0 auto;
+    padding: 10px 12px max(10px, env(safe-area-inset-bottom, 0px));
+  }
+
+  .composer textarea {
+    min-height: 58px;
+    max-height: 120px;
+    resize: none;
+  }
+
+  .composer-actions input {
+    display: none;
+  }
+
+  #sendBtn {
+    flex: 1;
+    min-height: 44px;
+  }
 }
 
 @media (max-width: 620px) {

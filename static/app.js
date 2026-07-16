@@ -4,10 +4,14 @@ const state = {
   agents: [],
   chats: [],
   currentChatId: null,
+  currentChatUpdatedAt: null,
   orchestratorIds: [],
   peopleExpanded: false,
+  mobileSidebarOpen: false,
   openingDmAgentIds: new Set(),
   runInProgress: false,
+  syncInProgress: false,
+  chatListSignature: "",
   streamingRows: new Map(),
   serverDialogMode: "create",
   peoplePickers: {
@@ -19,6 +23,9 @@ const state = {
 
 const $ = (id) => document.getElementById(id);
 const renderMarkdown = (value) => window.AgentSlackMarkdown.render(value);
+const appendStreamMarkdown = (currentText, delta) => window.AgentSlackMarkdown.appendStream(currentText, delta);
+const chatSync = window.AgentSlackSync;
+const composerKeys = window.AgentSlackComposer;
 
 async function api(path, options = {}) {
   const headers = {
@@ -109,8 +116,10 @@ async function switchServer(serverId) {
   await api(`/api/servers/${serverId}/activate`, { method: "POST", body: "{}" });
   state.activeServerId = serverId;
   state.currentChatId = null;
+  state.currentChatUpdatedAt = null;
   state.agents = [];
   state.chats = [];
+  state.chatListSignature = "";
   await loadServers();
   await loadActiveServer();
 }
@@ -129,6 +138,7 @@ async function loadActiveServer() {
 function setWorkspaceAvailable(available) {
   ["serverSettingsBtn", "newChatBtnHeader", "refreshAgentsBtn", "runAgentsBtn", "autoMeetingBtn", "manualMeetingBtn", "sendBtn"]
     .forEach((id) => { $(id).disabled = !available; });
+  $("deleteChatBtn").disabled = !available || !state.currentChatId || state.runInProgress;
   $("messageInput").disabled = !available;
   $("objectiveInput").disabled = !available;
 }
@@ -137,6 +147,8 @@ function renderEmptyServerState() {
   state.agents = [];
   state.chats = [];
   state.currentChatId = null;
+  state.currentChatUpdatedAt = null;
+  state.chatListSignature = "";
   state.orchestratorIds = [];
   $("workspaceLabel").textContent = "Agent Slack";
   $("chatTitle").textContent = "Add an agent system";
@@ -167,22 +179,73 @@ async function loadAgents() {
   renderDialogs();
 }
 
-async function loadChats() {
-  const payload = await api("/api/chats");
-  state.chats = payload.chats || [];
+function applyChatList(chats) {
+  const signature = chatSync.chatListSignature(chats);
+  state.chats = chats;
   $("chatCount").textContent = String(state.chats.length);
-  renderChats();
-  if (!state.currentChatId && state.chats.length) {
-    await openChat(state.chats[0].chat_id);
+  if (signature !== state.chatListSignature) {
+    state.chatListSignature = signature;
+    renderChats();
+    renderAgents();
   }
+}
+
+async function loadChats({ openFirst = true } = {}) {
+  const payload = await api("/api/chats");
+  applyChatList(payload.chats || []);
+  if (openFirst && !state.currentChatId && state.chats.length) {
+    await openChat(state.chats[0].chat_id);
+  } else if (!state.chats.length) {
+    renderNoChatState();
+  }
+}
+
+function renderNoChatState() {
+  state.currentChatId = null;
+  state.currentChatUpdatedAt = null;
+  $("chatTitle").textContent = "Select a chat";
+  $("chatMembers").textContent = "";
+  $("messages").innerHTML = '<div class="empty-server"><strong>No chats yet</strong><p>Create a chat or open a person to begin.</p></div>';
+  $("deleteChatBtn").disabled = true;
 }
 
 async function openChat(chatId) {
   const chat = await api(`/api/chats/${chatId}`);
   state.currentChatId = chatId;
+  $("deleteChatBtn").disabled = state.runInProgress;
   renderChat(chat);
-  await loadChats();
+  await loadChats({ openFirst: false });
+  renderChats();
   renderAgents();
+  if (state.mobileSidebarOpen) setMobileSidebarOpen(false);
+}
+
+async function syncChatState() {
+  if (!state.activeServerId || state.runInProgress || state.syncInProgress || document.hidden) return;
+  const serverId = state.activeServerId;
+  state.syncInProgress = true;
+  try {
+    const payload = await api("/api/chats");
+    if (serverId !== state.activeServerId) return;
+    applyChatList(payload.chats || []);
+
+    if (!state.currentChatId) {
+      if (state.chats.length) await openChat(state.chats[0].chat_id);
+      return;
+    }
+    const summary = state.chats.find((chat) => chat.chat_id === state.currentChatId);
+    if (!chatSync.shouldRefreshChat(summary, state.currentChatUpdatedAt)) return;
+
+    const chatId = state.currentChatId;
+    const chat = await api(`/api/chats/${chatId}`);
+    if (serverId === state.activeServerId && chatId === state.currentChatId && !state.runInProgress) {
+      renderChat(chat);
+    }
+  } catch (error) {
+    console.warn("Agent Slack background sync failed", error);
+  } finally {
+    state.syncInProgress = false;
+  }
 }
 
 function renderChats() {
@@ -261,9 +324,13 @@ async function openAgentDm(agent) {
 }
 
 function renderChat(chat) {
+  const messages = $("messages");
+  const followLatest = messages.scrollHeight - messages.scrollTop - messages.clientHeight < 80;
+  const previousScrollTop = messages.scrollTop;
   $("chatTitle").textContent = chat.title;
   $("chatMembers").textContent = chat.member_ids.join(", ");
-  $("messages").innerHTML = "";
+  state.currentChatUpdatedAt = chat.updated_at || null;
+  messages.innerHTML = "";
   (chat.messages || []).forEach((message) => {
     const row = document.createElement("article");
     row.className = `message ${message.author_type}`;
@@ -277,8 +344,9 @@ function renderChat(chat) {
         <div class="message-content">${renderMarkdown(message.body || "")}</div>
       </div>
     `;
-    $("messages").appendChild(row);
+    messages.appendChild(row);
   });
+  messages.scrollTop = followLatest ? messages.scrollHeight : previousScrollTop;
 }
 
 function createStreamingRow(agentId, agentLabel) {
@@ -296,7 +364,12 @@ function createStreamingRow(agentId, agentLabel) {
   `;
   $("messages").appendChild(row);
   $("messages").scrollTop = $("messages").scrollHeight;
-  state.streamingRows.set(agentId, { row, body: row.querySelector(".message-content"), started: false });
+  state.streamingRows.set(agentId, {
+    row,
+    body: row.querySelector(".message-content"),
+    rawText: "",
+    started: false,
+  });
 }
 
 async function renderStreamEvent(event) {
@@ -306,17 +379,32 @@ async function renderStreamEvent(event) {
     const stream = state.streamingRows.get(event.agent_id);
     if (!stream) return;
     if (!stream.started) {
-      stream.body.textContent = "";
       stream.started = true;
     }
-    stream.body.textContent += event.text || "";
+    const rendered = appendStreamMarkdown(stream.rawText, event.text);
+    stream.rawText = rendered.text;
+    stream.body.innerHTML = rendered.html;
     $("messages").scrollTop = $("messages").scrollHeight;
     await new Promise((resolve) => setTimeout(resolve, 14));
   } else if (event.type === "agent_completed") {
     const stream = state.streamingRows.get(event.agent_id);
     if (stream) {
+      stream.body.innerHTML = renderMarkdown(stream.rawText);
       stream.row.classList.remove("streaming");
       stream.row.querySelector("time").textContent = "just now";
+      state.streamingRows.delete(event.agent_id);
+    }
+  } else if (event.type === "agent_failed") {
+    let stream = state.streamingRows.get(event.agent_id);
+    if (!stream) {
+      createStreamingRow(event.agent_id, event.agent_label || event.agent_id);
+      stream = state.streamingRows.get(event.agent_id);
+    }
+    if (stream) {
+      stream.body.innerHTML = renderMarkdown(event.message || "**Agent run failed.**");
+      stream.row.classList.remove("streaming");
+      stream.row.classList.add("failed");
+      stream.row.querySelector("time").textContent = "failed";
       state.streamingRows.delete(event.agent_id);
     }
   } else if (event.type === "error") {
@@ -328,6 +416,7 @@ async function runChatStream(payload, chatId = state.currentChatId) {
   if (!chatId || state.runInProgress) return;
   let resultChatId = chatId;
   state.runInProgress = true;
+  $("deleteChatBtn").disabled = true;
   $("sendBtn").disabled = true;
   $("sendBtn").textContent = "Working...";
   try {
@@ -347,6 +436,7 @@ async function runChatStream(payload, chatId = state.currentChatId) {
   } finally {
     state.runInProgress = false;
     state.streamingRows.clear();
+    $("deleteChatBtn").disabled = !state.currentChatId;
     $("sendBtn").disabled = false;
     $("sendBtn").textContent = "Send";
     if (state.currentChatId === chatId || state.currentChatId === resultChatId) {
@@ -538,6 +628,27 @@ async function sendMessage() {
   if (runPayload) await runChatStream(runPayload, state.currentChatId);
 }
 
+async function deleteCurrentChat() {
+  if (!state.currentChatId || state.runInProgress) return;
+  const chatId = state.currentChatId;
+  const chat = state.chats.find((item) => item.chat_id === chatId);
+  const title = chat?.title || "this chat";
+  if (!window.confirm(`Delete “${title}”? This permanently removes its messages.`)) return;
+
+  $("deleteChatBtn").disabled = true;
+  try {
+    await api(`/api/chats/${chatId}`, { method: "DELETE" });
+    state.currentChatId = null;
+    state.currentChatUpdatedAt = null;
+    state.streamingRows.clear();
+    await loadChats();
+  } catch (error) {
+    console.error(error);
+    alert(`Unable to delete chat: ${error.message}`);
+    $("deleteChatBtn").disabled = false;
+  }
+}
+
 async function runAgents() {
   if (!state.currentChatId) return;
   const objective = $("objectiveInput").value.trim();
@@ -598,6 +709,16 @@ function setPeopleExpanded(expanded) {
   }
 }
 
+function setMobileSidebarOpen(open) {
+  const enabled = Boolean(open) && window.matchMedia("(max-width: 900px)").matches;
+  state.mobileSidebarOpen = enabled;
+  $("mobilePeopleBtn").setAttribute("aria-expanded", String(enabled));
+  $("mobileSidebarBackdrop").hidden = !enabled;
+  $("mobileSidebarBackdrop").classList.toggle("visible", enabled);
+  $("peoplePanel").closest(".sidebar-primary").classList.toggle("mobile-open", enabled);
+  if (enabled) setPeopleExpanded(true);
+}
+
 function showPeopleTooltip(target) {
   const tooltip = $("peopleTooltip");
   const description = target?.dataset.description?.trim();
@@ -653,8 +774,14 @@ function formatTime(value) {
 }
 
 $("sendBtn").onclick = sendMessage;
+$("messageInput").addEventListener("keydown", (event) => {
+  if (!composerKeys.shouldSendOnKeydown(event)) return;
+  event.preventDefault();
+  sendMessage();
+});
 $("runAgentsBtn").onclick = runAgents;
 $("autoMeetingBtn").onclick = autoMeeting;
+$("deleteChatBtn").onclick = deleteCurrentChat;
 $("refreshAgentsBtn").onclick = async () => {
   await api("/api/agents/discover", { method: "POST", body: "{}" });
   await loadAgents();
@@ -676,6 +803,8 @@ $("manualMeetingBtn").onclick = () => {
   $("meetingDialog").showModal();
 };
 $("peopleToggleBtn").onclick = () => setPeopleExpanded(!state.peopleExpanded);
+$("mobilePeopleBtn").onclick = () => setMobileSidebarOpen(!state.mobileSidebarOpen);
+$("mobileSidebarBackdrop").onclick = () => setMobileSidebarOpen(false);
 $("chatForm").addEventListener("submit", (event) => {
   event.preventDefault();
   submitNewChat();
@@ -702,6 +831,14 @@ document.addEventListener("click", (event) => {
     if (!menu.parentElement.contains(event.target)) menu.hidden = true;
   });
 });
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden) syncChatState();
+});
+window.addEventListener("focus", syncChatState);
+window.addEventListener("resize", () => {
+  if (!window.matchMedia("(max-width: 900px)").matches) setMobileSidebarOpen(false);
+});
+window.setInterval(syncChatState, 2000);
 
 loadServers().then(loadActiveServer).catch((error) => {
   console.error(error);

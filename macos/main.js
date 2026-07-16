@@ -229,12 +229,8 @@ function createWindow(port) {
   mainWindow.webContents.on('will-navigate', (event, url) => {
     if (!url.startsWith(`http://127.0.0.1:${port}`)) event.preventDefault();
   });
-  mainWindow.on('close', (event) => {
-    if (!isQuitting) {
-      event.preventDefault();
-      mainWindow.hide();
-      if (process.platform === 'darwin') app.dock.hide();
-    }
+  mainWindow.on('close', () => {
+    if (!isQuitting && process.platform === 'darwin') app.dock.hide();
   });
   mainWindow.on('closed', () => { mainWindow = null; });
 }
@@ -259,6 +255,30 @@ function configureDockMenu() {
     { label: 'Open Agent Slack', click: showWindow },
     { label: 'Quit Agent Slack Entirely', click: quitEntirely },
   ]));
+}
+
+function configureApplicationMenu() {
+  const template = [];
+  if (process.platform === 'darwin') {
+    template.push({
+      label: app.name,
+      submenu: [
+        { role: 'about' },
+        { type: 'separator' },
+        { role: 'hide' },
+        { role: 'hideOthers' },
+        { role: 'unhide' },
+        { type: 'separator' },
+        {
+          label: 'Quit Agent Slack Entirely',
+          accelerator: 'CommandOrControl+Q',
+          click: quitEntirely,
+        },
+      ],
+    });
+  }
+  template.push({ role: 'fileMenu' }, { role: 'editMenu' }, { role: 'windowMenu' });
+  Menu.setApplicationMenu(Menu.buildFromTemplate(template));
 }
 
 async function setLanAccess(enabled) {
@@ -352,6 +372,7 @@ app.whenReady().then(async () => {
     const port = await startBackend();
     createTray();
     configureDockMenu();
+    configureApplicationMenu();
     const openedAtLogin = process.platform === 'darwin' && app.getLoginItemSettings().wasOpenedAtLogin;
     if (openedAtLogin) app.dock.hide();
     else createWindow(port);
@@ -367,6 +388,12 @@ app.on('activate', () => {
 
 app.on('second-instance', () => {
   showWindow();
+});
+
+app.on('window-all-closed', () => {
+  // Closing the UI must not stop the background API server. The tray or a
+  // second app launch can create a new window; only explicit quit stops it.
+  if (process.platform === 'darwin') app.dock.hide();
 });
 
 app.on('before-quit', () => {

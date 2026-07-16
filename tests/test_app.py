@@ -1,248 +1,156 @@
 from __future__ import annotations
 
-import json
 from pathlib import Path
 
 from agent_slack.app import AgentSlackApp
 
 
-def _write_agent(project_root: Path, agent_id: str, title: str, summary: str) -> None:
-    agent_path = project_root / ".claude" / "agents" / f"{agent_id}.md"
-    agent_path.parent.mkdir(parents=True, exist_ok=True)
-    agent_path.write_text(
-        f"---\nname: {agent_id}\nsummary: {summary}\ntools:\n  - Read\n---\n# {title}\n\n{summary}\n",
+def _write_agent(project_root: Path, agent_id: str, title: str) -> None:
+    path = project_root / ".claude" / "agents" / f"{agent_id}.md"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        f"---\nname: {agent_id}\nsummary: {title} responsibility.\ntools:\n  - Read\n---\n"
+        f"# {title}\n\nPerform host-defined work.\n",
         encoding="utf-8",
     )
 
 
-def _write_architecture(project_root: Path, orchestrator: str, routes: list[dict]) -> None:
-    (project_root / ".agent-slack.json").write_text(
-        json.dumps(
-            {
-                "schema_version": 1,
-                "orchestrators": [
-                    {"agent_id": orchestrator, "default_participants": [], "routes": routes}
-                ],
-            }
-        ),
-        encoding="utf-8",
-    )
-
-
-def test_auto_meeting_expands_participants_and_completes(tmp_path: Path, monkeypatch) -> None:
-    monkeypatch.setenv("AGENT_SLACK_CLI", "offline")
-    project_root = tmp_path / "SampleProject"
-    app_root = tmp_path / "agent_slack"
-    project_root.mkdir()
-    app_root.mkdir()
-
-    _write_agent(project_root, "coordinator", "System Coordinator", "Leads specialist work.")
-    _write_agent(project_root, "reviewer", "Review Agent", "Reviews proposed work.")
-    _write_agent(project_root, "implementer", "Implementation Agent", "Implements approved work.")
-    _write_architecture(
-        project_root,
-        "coordinator",
-        [
-            {
-                "keywords": ["release", "review"],
-                "participants": ["reviewer", "implementer"],
-            }
-        ],
-    )
-
-    app = AgentSlackApp(project_root=project_root, app_root=app_root)
-    chat = app.create_chat("Coordinator DM", ["coordinator"], kind="direct")
-    app.add_user_message(chat["chat_id"], "Review this release and propose next steps")
-
-    updated = app.auto_meeting(chat["chat_id"], lead_agent_id="coordinator", objective="release review")
-
-    assert updated["chat_id"] != chat["chat_id"]
-    assert updated["kind"] == "group"
-    assert "release review" in updated["title"]
-    assert updated["member_ids"]
-    assert "coordinator" in updated["member_ids"]
-    assert "reviewer" in updated["member_ids"]
-    assert "implementer" in updated["member_ids"]
-    assert updated["meetings"][-1]["status"] == "completed"
-    agent_messages = [msg for msg in updated["messages"] if msg.get("author_type") == "agent"]
-    assert agent_messages
-    assert any(msg.get("author_id") == "coordinator" for msg in agent_messages)
-    summaries = app.list_chats()
-    assert {item["chat_id"] for item in summaries} == {chat["chat_id"], updated["chat_id"]}
-    assert next(item for item in summaries if item["chat_id"] == updated["chat_id"])["kind"] == "group"
-    source = app.get_chat(chat["chat_id"])
-    assert source["kind"] == "direct"
-    assert source["member_ids"] == ["coordinator"]
-    assert any("Meeting created:" in message["body"] for message in source["messages"])
-
-    followed_up = app.add_user_message(updated["chat_id"], "Please explain the final recommendation")
-    assert followed_up["messages"][-1]["body"] == "Please explain the final recommendation"
-
-
-def test_manual_group_meeting_runs_all_members(tmp_path: Path, monkeypatch) -> None:
-    monkeypatch.setenv("AGENT_SLACK_CLI", "offline")
-    project_root = tmp_path / "SampleProject"
-    app_root = tmp_path / "agent_slack"
-    project_root.mkdir()
-    app_root.mkdir()
-
-    _write_agent(project_root, "coordinator", "System Coordinator", "Leads specialist work.")
-    _write_agent(project_root, "reviewer", "Review Agent", "Reviews proposed work.")
-    _write_agent(project_root, "implementer", "Implementation Agent", "Implements approved work.")
-
-    app = AgentSlackApp(project_root=project_root, app_root=app_root)
-    chat = app.create_chat("Project group", ["coordinator", "reviewer", "implementer"], kind="group")
-    app.add_user_message(chat["chat_id"], "Review this release together")
-
-    updated = app.create_meeting(
-        chat_id=chat["chat_id"],
-        lead_agent_id="coordinator",
-        participant_ids=["coordinator", "reviewer", "implementer"],
-        objective="Review this release together",
-        auto_run=True,
-    )
-
-    assert updated["meetings"][-1]["status"] == "completed"
-    agent_ids = [msg.get("author_id") for msg in updated["messages"] if msg.get("author_type") == "agent"]
-    assert "coordinator" in agent_ids
-    assert "reviewer" in agent_ids
-    assert "implementer" in agent_ids
-    summary = next(item for item in app.list_chats() if item["chat_id"] == chat["chat_id"])
-    assert summary["kind"] == "group"
-    assert summary["member_ids"] == ["coordinator", "reviewer", "implementer"]
-
-    app.add_user_message(chat["chat_id"], "What should we do next?")
-    continued = app.run_agents(chat["chat_id"], ["reviewer"], objective="Answer the follow-up")
-    assert continued["messages"][-2]["body"] == "What should we do next?"
-    assert continued["messages"][-1]["author_id"] == "reviewer"
-
-
-def test_manual_meeting_adds_invited_agents_to_chat_and_memory(tmp_path: Path, monkeypatch) -> None:
+def _app(tmp_path: Path, monkeypatch) -> AgentSlackApp:
     monkeypatch.setenv("AGENT_SLACK_CLI", "offline")
     project_root = tmp_path / "project"
-    app_root = tmp_path / "agent_slack"
+    app_root = tmp_path / "agent-slack"
     project_root.mkdir()
     app_root.mkdir()
-    _write_agent(project_root, "coordinator", "System Coordinator", "Leads specialist work.")
-    _write_agent(project_root, "reviewer", "Review Agent", "Reviews proposed work.")
-    app = AgentSlackApp(project_root=project_root, app_root=app_root)
+    _write_agent(project_root, "coordinator", "System Coordinator")
+    _write_agent(project_root, "reviewer", "Review Agent")
+    return AgentSlackApp(project_root, app_root)
+
+
+def test_direct_response_runs_one_connected_agent_session(tmp_path: Path, monkeypatch) -> None:
+    app = _app(tmp_path, monkeypatch)
+    calls = []
+
+    def stream(**kwargs):
+        calls.append(kwargs)
+        yield {"type": "agent_started", "agent_id": "coordinator", "agent_label": "System Coordinator"}
+        yield {"type": "delta", "agent_id": "coordinator", "text": "Final host answer."}
+        yield {"type": "agent_completed", "agent_id": "coordinator"}
+
+    app.orchestrator.stream_agent_reply = stream
+    chat = app.create_chat("Coordinator", ["coordinator"], kind="direct")
+    app.add_user_message(chat["chat_id"], "Review this")
+
+    events = list(app.stream_run(chat["chat_id"], mode="respond", objective="Review this"))
+
+    assert len(calls) == 1
+    assert calls[0]["agent"]["agent_id"] == "coordinator"
+    assert events[0]["lead_agent_id"] == "coordinator"
+    assert app.get_chat(chat["chat_id"])["messages"][-1]["body"] == "Final host answer."
+
+
+def test_delete_chat_removes_chat_and_refreshes_agent_memory(tmp_path: Path, monkeypatch) -> None:
+    app = _app(tmp_path, monkeypatch)
+    chat = app.create_chat("Temporary Chat", ["coordinator"], kind="direct")
+    app.add_user_message(chat["chat_id"], "temporary message")
+
+    deleted = app.delete_chat(chat["chat_id"])
+
+    assert deleted == {"deleted": True, "chat_id": chat["chat_id"]}
+    assert app.get_chat(chat["chat_id"]) is None
+    memory = app.storage.get_memory_json("coordinator")
+    assert "Temporary Chat" not in memory.get("recent_channels", [])
+    assert memory["stats"]["chat_count"] == 0
+
+
+def test_native_subagent_results_are_streamed_and_saved_before_final_answer(
+    tmp_path: Path, monkeypatch
+) -> None:
+    app = _app(tmp_path, monkeypatch)
+
+    def stream(**_kwargs):
+        yield {
+            "type": "agent_started",
+            "agent_id": "reviewer",
+            "agent_label": "Review the release evidence",
+        }
+        yield {"type": "delta", "agent_id": "reviewer", "text": "Independent review result."}
+        yield {"type": "agent_completed", "agent_id": "reviewer"}
+        yield {"type": "agent_started", "agent_id": "coordinator", "agent_label": "System Coordinator"}
+        yield {"type": "delta", "agent_id": "coordinator", "text": "Final synthesis."}
+        yield {"type": "agent_completed", "agent_id": "coordinator"}
+
+    app.orchestrator.stream_agent_reply = stream
     direct = app.create_chat("Coordinator", ["coordinator"], kind="direct")
-
-    updated = app.create_meeting(
+    events = list(app.stream_run(
         direct["chat_id"],
+        mode="auto_meeting",
         lead_agent_id="coordinator",
-        participant_ids=["reviewer"],
-        objective="Review this decision",
-        auto_run=True,
-    )
+        objective="Review the release",
+    ))
 
-    assert updated["kind"] == "group"
-    assert updated["member_ids"] == ["coordinator", "reviewer"]
-    assert updated["meetings"][-1]["participant_ids"] == ["reviewer", "coordinator"]
-    assert app.storage.get_memory_json("reviewer")["stats"]["chat_count"] == 1
-
-
-def test_group_run_agents_without_orchestrator_replies_from_all_members(tmp_path: Path, monkeypatch) -> None:
-    monkeypatch.setenv("AGENT_SLACK_CLI", "offline")
-    project_root = tmp_path / "project"
-    app_root = tmp_path / "agent_slack"
-    project_root.mkdir()
-    app_root.mkdir()
-
-    _write_agent(project_root, "reviewer", "Review Agent", "Reviews proposed work.")
-    _write_agent(project_root, "implementer", "Implementation Agent", "Implements approved work.")
-
-    app = AgentSlackApp(project_root=project_root, app_root=app_root)
-    chat = app.create_chat("Two-agent group", ["reviewer", "implementer"], kind="group")
-    app.add_user_message(chat["chat_id"], "Review and implement this")
-
-    updated = app.run_agents(chat["chat_id"], ["reviewer", "implementer"], objective="Review and implement this")
-
-    agent_ids = [msg.get("author_id") for msg in updated["messages"] if msg.get("author_type") == "agent"]
-    assert agent_ids == ["reviewer", "implementer"]
-
-
-def test_stream_run_emits_progress_and_persists_reply(tmp_path: Path, monkeypatch) -> None:
-    monkeypatch.setenv("AGENT_SLACK_CLI", "offline")
-    project_root = tmp_path / "project"
-    app_root = tmp_path / "agent_slack"
-    project_root.mkdir()
-    app_root.mkdir()
-    _write_agent(project_root, "researcher", "Research Agent", "Analyzes the requested topic.")
-    app = AgentSlackApp(project_root=project_root, app_root=app_root)
-    app.orchestrator.generate_agent_reply = lambda **_kwargs: "Analysis completed with actual findings."
-    chat = app.create_chat("Research", ["researcher"], kind="direct")
-    app.add_user_message(chat["chat_id"], "Analyze the current status")
-
-    events = list(
-        app.stream_run(
-            chat["chat_id"],
-            mode="respond",
-            agent_ids=["researcher"],
-            objective="Analyze the current status",
-        )
-    )
-
-    assert [event["type"] for event in events] == [
-        "run_started",
-        "agent_started",
-        "delta",
-        "delta",
-        "agent_completed",
-        "run_completed",
+    created = events[0]
+    assert created["agent_ids"] == ["coordinator"]
+    saved = app.get_chat(created["chat_id"])
+    agent_messages = [message for message in saved["messages"] if message["author_type"] == "agent"]
+    assert [message["author_id"] for message in agent_messages] == ["reviewer", "coordinator"]
+    assert [message["body"] for message in agent_messages] == [
+        "Independent review result.",
+        "Final synthesis.",
     ]
-    assert "".join(event["text"] for event in events if event["type"] == "delta") == (
-        "Analysis completed with actual findings."
+    assert [message["author_label"] for message in agent_messages] == [
+        "Review Agent",
+        "System Coordinator",
+    ]
+    reviewer_started = next(
+        event for event in events
+        if event["type"] == "agent_started" and event["agent_id"] == "reviewer"
     )
-    saved = app.get_chat(chat["chat_id"])
-    assert saved["messages"][-1]["body"] == "Analysis completed with actual findings."
-
-
-def test_stream_auto_meeting_runs_lead_last(tmp_path: Path, monkeypatch) -> None:
-    monkeypatch.setenv("AGENT_SLACK_CLI", "offline")
-    project_root = tmp_path / "SampleProject"
-    app_root = tmp_path / "agent_slack"
-    project_root.mkdir()
-    app_root.mkdir()
-    _write_agent(project_root, "coordinator", "System Coordinator", "Leads the meeting.")
-    _write_agent(project_root, "reviewer", "Review Agent", "Checks the proposal.")
-    app = AgentSlackApp(project_root=project_root, app_root=app_root)
-    app.orchestrator.generate_agent_reply = lambda agent, **_kwargs: f"Reply from {agent['name']}"
-    app.suggest_participants = lambda _lead, _objective: ["coordinator", "reviewer"]
-    chat = app.create_chat("Coordinator DM", ["coordinator"], kind="direct")
-
-    events = list(
-        app.stream_run(
-            chat["chat_id"],
-            mode="auto_meeting",
-            lead_agent_id="coordinator",
-            objective="Review release quality",
-        )
-    )
-
-    started = [event["agent_id"] for event in events if event["type"] == "agent_started"]
-    assert started == ["reviewer", "coordinator"]
-    meeting_event = events[0]
-    assert meeting_event["type"] == "meeting_created"
-    assert meeting_event["source_chat_id"] == chat["chat_id"]
-    assert meeting_event["chat_id"] != chat["chat_id"]
-    assert events[-1] == {"type": "run_completed", "chat_id": meeting_event["chat_id"]}
-    saved = app.get_chat(meeting_event["chat_id"])
-    assert saved["kind"] == "group"
-    assert saved["member_ids"] == ["coordinator", "reviewer"]
+    assert reviewer_started["agent_label"] == "Review Agent"
     assert saved["meetings"][-1]["status"] == "completed"
 
-    app.add_user_message(saved["chat_id"], "Can the group clarify the risks?")
-    follow_up_events = list(
-        app.stream_run(
-            saved["chat_id"],
-            mode="meeting",
-            lead_agent_id="coordinator",
-            participant_ids=saved["member_ids"],
-            objective="Clarify the risks",
-        )
+
+def test_manual_invites_are_context_not_frontend_execution_policy(tmp_path: Path, monkeypatch) -> None:
+    app = _app(tmp_path, monkeypatch)
+    called_agents = []
+
+    def stream(**kwargs):
+        called_agents.append(kwargs["agent"]["agent_id"])
+        yield {"type": "agent_started", "agent_id": "coordinator", "agent_label": "System Coordinator"}
+        yield {"type": "delta", "agent_id": "coordinator", "text": "Host-owned result."}
+        yield {"type": "agent_completed", "agent_id": "coordinator"}
+
+    app.orchestrator.stream_agent_reply = stream
+    chat = app.create_chat("Group", ["coordinator", "reviewer"], kind="group")
+    updated = app.create_meeting(
+        chat["chat_id"],
+        lead_agent_id="coordinator",
+        participant_ids=["reviewer"],
+        objective="Review together",
+        auto_run=True,
     )
-    assert [event["agent_id"] for event in follow_up_events if event["type"] == "agent_started"] == [
-        "reviewer",
-        "coordinator",
-    ]
+
+    assert called_agents == ["coordinator"]
+    assert updated["member_ids"] == ["coordinator", "reviewer"]
+    assert updated["meetings"][-1]["participant_ids"] == ["reviewer", "coordinator"]
+
+
+def test_native_failure_is_persisted_and_marks_meeting(tmp_path: Path, monkeypatch) -> None:
+    app = _app(tmp_path, monkeypatch)
+
+    def stream(**_kwargs):
+        yield {
+            "type": "agent_failed",
+            "agent_id": "coordinator",
+            "agent_label": "System Coordinator",
+            "message": "Claude session failed.",
+        }
+
+    app.orchestrator.stream_agent_reply = stream
+    chat = app.create_chat("Coordinator", ["coordinator"], kind="direct")
+    updated = app.create_meeting(
+        chat["chat_id"], "coordinator", [], "Review", auto_run=True
+    )
+
+    assert updated["meetings"][-1]["status"] == "completed_with_errors"
+    assert updated["meetings"][-1]["failed_agent_ids"] == ["coordinator"]
+    assert updated["messages"][-1]["metadata"]["source"] == "native_agent_error"

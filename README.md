@@ -2,7 +2,7 @@
 
 `Agent Slack` is a standalone local desktop/web app that connects to Codex/Claude-style multi-agent projects. Each registered project folder appears as a Slack-style server.
 
-It does not modify the host project's codepath. It discovers agent definitions from the workspace, builds agent profiles, stores per-agent memory files, persists direct/group chat history, and can run multi-agent meetings where a lead agent coordinates several subagents before returning a synthesized answer.
+It does not modify the host project's codepath. It discovers agent definitions, builds profiles, stores per-agent memory, persists chat history, and relays one native CLI session. A host lead coordinates its own subagents; Agent Slack displays each native result and the final synthesis.
 
 ## What it does
 
@@ -75,12 +75,15 @@ node --test subsystems/agent_slack/tests/test_markdown_renderer.js
 
 The desktop app uses a native folder chooser when adding a server. Runtime state is stored under `~/Library/Application Support/Agent Slack/data`, outside the read-only app bundle and outside connected agent-system folders.
 
-Closing the desktop window hides it while the Agent Slack backend continues to
-run and removes the app from the Dock. Login-item launches also start directly
-in this background state. Use the transparent-logo menu-bar icon to reopen the
-window, copy the API URL, allow trusted LAN access, enable **Launch at Login**,
-or choose **Quit Agent Slack Entirely**. While the window is open, the same full
-quit action is available from the app's Dock menu. The
+Closing the desktop window destroys that window while the Agent Slack backend
+continues to run from the menu bar, keeps the HTTP API available, and removes
+the app from the Dock. Closing the last window never quits the background
+service. Login-item
+launches also start directly in this background state. Use the transparent-logo
+menu-bar icon to create a new window, copy the API URL, allow trusted LAN access,
+enable **Launch at Login**, or choose **Quit Agent Slack Entirely**. While the
+window is open, `Cmd+Q`, the application menu, and the Dock menu all expose the
+same full quit action. The
 desktop API uses `0.0.0.0:8899` by default; `AGENT_SLACK_IP` and
 `AGENT_SLACK_PORT` override those values globally. `AGENT_SLACK_HOST` remains a
 backward-compatible alias for `AGENT_SLACK_IP`.
@@ -107,10 +110,15 @@ backward-compatible alias for `AGENT_SLACK_IP`.
 - In a direct message to an orchestrator declared in `.agent-slack.json`, `Send` automatically selects matching subagents and runs the orchestrator last for synthesis
 - In a **group chat**:
   - if a configured orchestrator is a member, `Send` triggers an orchestrator-led meeting across the current chat members
-  - otherwise, `Send` runs the current chat members sequentially so each can reply into the thread
+  - otherwise, `Send` starts one selected host-agent session; that host agent owns any native subagent delegation
 - `Run Members`, `Auto Meeting`, and `Manual Meeting` remain available when you want to force or shape orchestration explicitly
 - Agent CLIs run with project tools enabled so substantive requests must produce findings, not a promise to investigate
+- Agent replies are requested as Slack-ready Markdown rather than JSON envelopes; the shared, server-agnostic renderer displays structured JSON from any connected agent system as readable cards, including nested objects and arrays
+- Native agent sessions continue in the backend if the initiating browser disconnects, and emitted subagent/final results persist in the meeting thread
 - Messages render safe ChatGPT-style Markdown, including headings, lists, links, code blocks, blockquotes, and tables
+- Open chats and the sidebar synchronize every two seconds across desktop, web, and future mobile clients; focus changes trigger an immediate refresh
+- In the message composer, `Return` sends and `Shift+Return` inserts a newline; IME composition is never submitted prematurely
+- On mobile, Send stays above the device safe area and People opens the same dynamically discovered agent list in a drawer
 
 ## Outside access
 

@@ -4,11 +4,11 @@ Use this document as the implementation directive for an agent building or adapt
 
 ## Objective
 
-Build a host-owned agent system that Agent Slack can register as a server, discover, and execute without adding project-specific conditions to `subsystems/agent_slack`. All domain names, routing decisions, tools, policies, and participant graphs must live in the host project.
+Build a host-owned agent system that Agent Slack can register, discover, and execute without adding project-specific conditions or scheduling policy to `subsystems/agent_slack`. All routing, delegation, dependencies, tools, and policies live in the host's native agent definitions.
 
 ## Non-Negotiable Boundary
 
-Do not edit Slack runtime code to recognize a particular coordinator, domain, workflow, or keyword. Configure orchestration in `<project-root>/.agent-slack.json`. A reusable Slack subsystem must produce the same behavior for any host that satisfies this contract.
+Do not edit Slack runtime code to recognize a coordinator, domain, workflow, keyword, participant graph, or dependency. The manifest only connects a runner and lead ID; configure orchestration in the host lead prompt and native agent system.
 
 ## Required Build Sequence
 
@@ -57,20 +57,22 @@ Complete evidence requests using available project tools and files.
 - performing another agent's responsibility
 ```
 
-Every `name` must be unique and stable because chats, memory, meetings, and manifest routes reference it.
+Every `name` must be unique and stable because chats, memory, meetings, and native Task events reference it.
 
 ### 2. Choose Orchestrators Deliberately
 
 An orchestrator is an ordinary discovered agent whose ID is declared in the manifest. Its prompt must require it to:
 
 - classify the objective;
-- use specialist findings already present in the meeting transcript;
+- spawn appropriate native subagents;
+- run independent work in parallel and dependent work after prerequisites;
+- collect specialist Task results;
 - reconcile contradictions;
 - identify unresolved blockers;
 - synthesize the final response;
 - avoid duplicating specialist work unless verification is necessary.
 
-Do not infer orchestrators from filenames or titles. Declaration in the manifest is the only automatic-meeting authority.
+Do not infer orchestrators from filenames or titles. Declaration in the manifest exposes a lead to the UI; the lead prompt owns the workflow.
 
 ### 3. Create the Architecture Manifest
 
@@ -82,18 +84,7 @@ Create `<project-root>/.agent-slack.json`:
   "runner": "auto",
   "orchestrators": [
     {
-      "agent_id": "system_coordinator",
-      "default_participants": ["intake_agent"],
-      "routes": [
-        {
-          "keywords": ["quality", "regression", "test"],
-          "participants": ["test_engineer", "critic"]
-        },
-        {
-          "keywords": ["architecture", "migration"],
-          "participants": ["architect", "dependency_reviewer"]
-        }
-      ]
+      "agent_id": "system_coordinator"
     }
   ]
 }
@@ -103,12 +94,9 @@ Manifest rules:
 
 - set `runner` to `auto`, `codex`, or `claude`; `AGENT_SLACK_CLI` remains an optional process-wide override;
 - reference only stable agent IDs;
-- keep keyword lists domain-specific but concise;
-- put always-required reviewers in `default_participants`;
-- put conditional specialists in routes;
-- do not include the orchestrator in participant lists; it is inserted automatically;
-- allow multiple routes to match when work spans specialties;
-- use multiple orchestrator entries only when the host genuinely has separate coordination authorities.
+- prefer `claude` when the host lead uses Claude Code native Task delegation;
+- keep routing, participant selection, dependency ordering, and concurrency out of this file;
+- use multiple orchestrator entries only when the host genuinely exposes separate lead agents.
 
 ### 4. Make Agents Executable
 
@@ -121,7 +109,7 @@ If the host needs a custom runtime rather than Codex/Claude, implement a generic
 Host project owns:
 
 - definitions and system prompts;
-- orchestration manifest;
+- native orchestration prompts and workflows;
 - domain tools and data;
 - policy and approval rules;
 - generated domain artifacts.
@@ -155,10 +143,9 @@ Acceptance checklist:
 - agent titles and summaries are meaningful;
 - health reports the configured orchestrator IDs;
 - regular DMs run only the selected agent;
-- orchestrator DMs select the expected route participants;
-- specialists appear before the orchestrator in meeting output;
-- groups without orchestrators still work;
-- unknown participant IDs are ignored safely;
+- an orchestrator DM starts one CLI process using `--agent <lead-id>`;
+- native Task results appear as separate messages before the lead's final answer;
+- group members remain context and do not cause frontend-managed execution;
 - replies stream and persist after reload;
 - no host-specific ID appears in Slack runtime source.
 

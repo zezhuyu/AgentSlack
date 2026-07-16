@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import re
 from collections import Counter
 from collections.abc import Iterator
 from pathlib import Path
@@ -76,6 +75,25 @@ class AgentSlackApp:
     def get_chat(self, chat_id: str) -> dict[str, Any] | None:
         return self.storage.get_chat(chat_id)
 
+    def delete_chat(self, chat_id: str) -> dict[str, Any]:
+        chat = self.storage.get_chat(chat_id)
+        if chat is None:
+            raise KeyError(f"Chat not found: {chat_id}")
+        agent_ids = set(chat.get("member_ids", []))
+        agent_ids.update(
+            message.get("author_id")
+            for message in chat.get("messages", [])
+            if message.get("author_type") == "agent"
+        )
+        self.storage.delete_chat(chat_id)
+        for agent_id in filter(None, agent_ids):
+            if self.get_agent(str(agent_id)):
+                try:
+                    self.update_agent_memory(str(agent_id))
+                except Exception:
+                    pass
+        return {"deleted": True, "chat_id": chat_id}
+
     def create_chat(self, title: str, member_ids: list[str], kind: str = "group") -> dict[str, Any]:
         chat = self.storage.create_chat(title=title, member_ids=member_ids, kind=kind)
         self._append_system_message(chat["chat_id"], f"Chat created for: {', '.join(member_ids)}")
@@ -102,30 +120,17 @@ class AgentSlackApp:
             raise KeyError(f"Chat not found: {chat_id}")
 
         selected = agent_ids or chat.get("member_ids", [])
-        for agent_id in selected:
-            agent = self.get_agent(agent_id)
-            if agent is None:
-                continue
-            memory = self.storage.get_memory_json(agent_id)
-            reply = self.orchestrator.generate_agent_reply(
-                agent=agent,
-                chat=chat,
-                transcript=chat.get("messages", []),
-                memory=memory,
-                objective=objective,
-            )
-            chat = self.storage.append_message(
-                chat_id,
-                {
-                    "author_type": "agent",
-                    "author_id": agent_id,
-                    "author_label": agent["title"],
-                    "body": reply,
-                    "metadata": {"objective": objective, "source": "agent_reply"},
-                },
-            )
-            self.update_agent_memory(agent_id)
-        return chat
+        lead_agent_id = next(iter(selected), None)
+        if not lead_agent_id:
+            raise ValueError("A lead agent is required to run the connected agent system")
+        list(self.stream_run(
+            chat_id,
+            mode="respond",
+            objective=objective,
+            agent_ids=list(selected),
+            lead_agent_id=lead_agent_id,
+        ))
+        return self.storage.get_chat(chat_id) or chat
 
     def stream_run(
         self,
@@ -168,59 +173,90 @@ class AgentSlackApp:
         elif mode != "respond":
             raise ValueError(f"Unsupported stream mode: {mode}")
 
-        if lead_agent_id:
-            selected = [agent_id for agent_id in selected if agent_id != lead_agent_id] + [lead_agent_id]
+        if meeting_created:
+            self._update_latest_meeting(run_chat_id, status="running", failed_agent_ids=[])
 
-        yield {"type": "run_started", "mode": mode, "agent_ids": selected}
-        for agent_id in selected:
-            agent = self.get_agent(agent_id)
-            if agent is None:
-                continue
-            chat = self.storage.get_chat(run_chat_id) or chat
-            yield {
-                "type": "agent_started",
-                "agent_id": agent_id,
-                "agent_label": agent["title"],
-            }
-            reply = self.orchestrator.generate_agent_reply(
-                agent=agent,
-                chat=chat,
-                transcript=chat.get("messages", []),
-                memory=self.storage.get_memory_json(agent_id),
-                objective=objective,
-            )
-            for chunk in self._reply_chunks(reply):
-                yield {"type": "delta", "agent_id": agent_id, "text": chunk}
-            chat = self.storage.append_message(
-                run_chat_id,
-                {
-                    "author_type": "agent",
-                    "author_id": agent_id,
-                    "author_label": agent["title"],
-                    "body": reply,
-                    "metadata": {"objective": objective, "source": "agent_reply"},
-                },
-            )
-            self.update_agent_memory(agent_id)
-            yield {"type": "agent_completed", "agent_id": agent_id}
+        run_agent_id = lead_agent_id or next(iter(selected), None)
+        if not run_agent_id:
+            raise ValueError("A lead agent is required to run the connected agent system")
+        run_agent = self.get_agent(run_agent_id)
+        if run_agent is None:
+            raise ValueError(f"Agent not found: {run_agent_id}")
+
+        yield {
+            "type": "run_started",
+            "mode": mode,
+            "agent_ids": selected,
+            "lead_agent_id": run_agent_id,
+        }
+        failed_agent_ids: list[str] = []
+        buffers: dict[str, str] = {}
+        labels: dict[str, str] = {}
+        native_events = self.orchestrator.stream_agent_reply(
+            agent=run_agent,
+            chat=chat,
+            transcript=list(chat.get("messages", [])),
+            memory=self.storage.get_memory_json(run_agent_id),
+            objective=objective,
+        )
+        for event in native_events:
+            agent_id = str(event.get("agent_id") or run_agent_id)
+            registered_agent = self.get_agent(agent_id)
+            registered_label = str((registered_agent or {}).get("title") or "")
+            if event["type"] == "agent_started":
+                labels[agent_id] = registered_label or str(event.get("agent_label") or agent_id)
+                event = {**event, "agent_label": labels[agent_id]}
+                buffers.setdefault(agent_id, "")
+            elif event["type"] == "delta":
+                buffers[agent_id] = buffers.get(agent_id, "") + str(event.get("text") or "")
+            elif event["type"] in {"agent_completed", "agent_failed"}:
+                failed = event["type"] == "agent_failed"
+                body = str(event.get("message") or buffers.get(agent_id) or "").strip()
+                label = (
+                    registered_label
+                    or labels.get(agent_id)
+                    or str(event.get("agent_label") or agent_id)
+                )
+                if event["type"] == "agent_failed":
+                    event = {**event, "agent_label": label}
+                if failed:
+                    failed_agent_ids.append(agent_id)
+                if body:
+                    chat = self.storage.append_message(
+                        run_chat_id,
+                        {
+                            "author_type": "agent",
+                            "author_id": agent_id,
+                            "author_label": label,
+                            "body": body,
+                            "metadata": {
+                                "objective": objective,
+                                "source": "native_agent_error" if failed else "native_agent_reply",
+                                "status": "failed" if failed else "completed",
+                                "runner": self.orchestrator.backend,
+                            },
+                        },
+                    )
+                    if self.get_agent(agent_id):
+                        try:
+                            self.update_agent_memory(agent_id)
+                        except Exception:
+                            pass
+            yield event
 
         if meeting_created:
-            chat = self.storage.get_chat(run_chat_id) or chat
-            if chat.get("meetings"):
-                chat["meetings"][-1]["status"] = "completed"
-                self.storage.save_chat(chat)
+            self._update_latest_meeting(
+                run_chat_id,
+                status="completed_with_errors" if failed_agent_ids else "completed",
+                failed_agent_ids=failed_agent_ids,
+            )
         yield {"type": "run_completed", "chat_id": run_chat_id}
 
-    @staticmethod
-    def _reply_chunks(reply: str, target_size: int = 28) -> Iterator[str]:
-        chunk = ""
-        for token in re.findall(r"\S+\s*|\s+", reply):
-            chunk += token
-            if len(chunk) >= target_size:
-                yield chunk
-                chunk = ""
-        if chunk:
-            yield chunk
+    def _update_latest_meeting(self, chat_id: str, **updates: Any) -> None:
+        chat = self.storage.get_chat(chat_id)
+        if chat and chat.get("meetings"):
+            chat["meetings"][-1].update(updates)
+            self.storage.save_chat(chat)
 
     def create_meeting(
         self,
@@ -258,10 +294,21 @@ class AgentSlackApp:
             f"Meeting scheduled by {lead_agent_id} with {', '.join(participants)}. Objective: {objective}",
         )
         if auto_run:
-            ordered = [agent_id for agent_id in participants if agent_id != lead_agent_id] + [lead_agent_id]
-            chat = self.run_agents(chat_id, ordered, objective=objective)
-            chat["meetings"][-1]["status"] = "completed"
-            self.storage.save_chat(chat)
+            self._update_latest_meeting(chat_id, status="running", failed_agent_ids=[])
+            events = list(self.stream_run(
+                chat_id,
+                mode="respond",
+                objective=objective,
+                agent_ids=[lead_agent_id],
+                lead_agent_id=lead_agent_id,
+            ))
+            failed = [event["agent_id"] for event in events if event["type"] == "agent_failed"]
+            self._update_latest_meeting(
+                chat_id,
+                status="completed_with_errors" if failed else "completed",
+                failed_agent_ids=failed,
+            )
+            chat = self.storage.get_chat(chat_id) or chat
         return chat
 
     def auto_meeting(self, chat_id: str, lead_agent_id: str, objective: str) -> dict[str, Any]:
@@ -282,8 +329,7 @@ class AgentSlackApp:
         if lead is None:
             raise ValueError(f"Agent not found: {lead_agent_id}")
 
-        suggested = self.suggest_participants(lead_agent_id, objective)
-        participants = sorted(set(source_chat.get("member_ids", []) + suggested + [lead_agent_id]))
+        participants = list(dict.fromkeys([*source_chat.get("member_ids", []), lead_agent_id]))
         title_objective = " ".join(objective.split()) or "New discussion"
         if len(title_objective) > 72:
             title_objective = f"{title_objective[:69].rstrip()}..."

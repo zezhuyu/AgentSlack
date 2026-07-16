@@ -62,7 +62,7 @@ def _write_host(root: Path, layout: str, label: str = "Host") -> None:
 
 
 @pytest.mark.parametrize("layout", ["claude", "codex", "mixed"])
-def test_compliant_host_boots_routes_meetings_and_persists(
+def test_compliant_host_boots_relays_one_lead_session_and_persists(
     tmp_path: Path,
     monkeypatch,
     layout: str,
@@ -94,10 +94,8 @@ def test_compliant_host_boots_routes_meetings_and_persists(
     )
     created = events[0]
     assert created["type"] == "meeting_created"
-    assert created["agent_ids"] == ["coordinator", "researcher", "reviewer"]
+    assert created["agent_ids"] == ["coordinator"]
     assert [event["agent_id"] for event in events if event["type"] == "agent_started"] == [
-        "researcher",
-        "reviewer",
         "coordinator",
     ]
 

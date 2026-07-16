@@ -78,10 +78,12 @@ if [ "$READY" -ne 1 ]; then
   exit 1
 fi
 curl -fsS "http://127.0.0.1:$PORT/" >"$DATA_ROOT/index.html"
+curl -fsS "http://127.0.0.1:$PORT/sync.js" >"$DATA_ROOT/sync.js"
 curl -fsS -D "$DATA_ROOT/headers.txt" "http://127.0.0.1:$PORT/api/v1/health" >"$DATA_ROOT/health.json"
 curl -fsS "http://127.0.0.1:$PORT/api/v1/openapi.json" >"$DATA_ROOT/openapi.json"
 curl -fsS "http://127.0.0.1:$PORT/api/agents" >"$DATA_ROOT/agents.json"
 grep -q 'Agent Slack' "$DATA_ROOT/index.html"
+grep -q 'AgentSlackSync' "$DATA_ROOT/sync.js"
 grep -q '"service": "agent-slack"' "$DATA_ROOT/api.json"
 grep -q '"api_version": "1"' "$DATA_ROOT/api.json"
 grep -q '"openapi": "3.1.0"' "$DATA_ROOT/openapi.json"

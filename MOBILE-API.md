@@ -101,9 +101,10 @@ curl -N -X POST http://127.0.0.1:8899/api/v1/chats/<chat-id>/run-stream \
 ```
 
 The stream emits one JSON object per line, including `run_started`,
-`agent_started`, `delta`, `agent_completed`, and `run_completed` events. A
-mobile client should process complete lines as bytes arrive and then reload the
-chat after `run_completed`.
+`agent_started`, `delta`, `agent_completed`, `agent_failed`, and `run_completed`
+events. A mobile client should process complete lines as bytes arrive and then
+reload the chat after `run_completed`. Closing the stream does not cancel the
+backend run; persisted results remain available through the chat endpoint.
 
 ## Security Boundary
 

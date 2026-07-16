@@ -61,6 +61,13 @@ class AgentSlackStorage:
             return None
         return self._read_json(path, default={})
 
+    def delete_chat(self, chat_id: str) -> bool:
+        path = self.chats_dir / f"{chat_id}.json"
+        if not path.exists():
+            return False
+        path.unlink()
+        return True
+
     def append_message(self, chat_id: str, message: dict[str, Any]) -> dict[str, Any]:
         chat = self.get_chat(chat_id)
         if chat is None:

@@ -31,3 +31,12 @@ def test_write_memory_files(tmp_path: Path) -> None:
     storage.write_memory("coordinator", {"summary": "test"}, "# Memory\n")
     assert (tmp_path / "data" / "memories" / "coordinator.json").exists()
     assert (tmp_path / "data" / "memories" / "coordinator.md").exists()
+
+
+def test_delete_chat_removes_persisted_record(tmp_path: Path) -> None:
+    storage = AgentSlackStorage(tmp_path / "data")
+    chat = storage.create_chat("Temporary Chat", ["coordinator"])
+
+    assert storage.delete_chat(chat["chat_id"]) is True
+    assert storage.get_chat(chat["chat_id"]) is None
+    assert storage.delete_chat(chat["chat_id"]) is False

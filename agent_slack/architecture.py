@@ -7,20 +7,8 @@ from typing import Any
 
 
 @dataclass(frozen=True)
-class RoutingRule:
-    keywords: tuple[str, ...]
-    participants: tuple[str, ...]
-
-    def matches(self, objective: str) -> bool:
-        normalized = objective.casefold()
-        return any(keyword.casefold() in normalized for keyword in self.keywords)
-
-
-@dataclass(frozen=True)
 class OrchestratorConfig:
     agent_id: str
-    default_participants: tuple[str, ...] = ()
-    routes: tuple[RoutingRule, ...] = ()
 
 
 @dataclass
@@ -55,24 +43,7 @@ class AgentSystemArchitecture:
             agent_id = str(item.get("agent_id") or "").strip()
             if not agent_id:
                 continue
-            routes = []
-            for route in item.get("routes") or []:
-                if not isinstance(route, dict):
-                    continue
-                keywords = tuple(str(value).strip() for value in route.get("keywords") or [] if str(value).strip())
-                participants = tuple(
-                    str(value).strip() for value in route.get("participants") or [] if str(value).strip()
-                )
-                if keywords and participants:
-                    routes.append(RoutingRule(keywords=keywords, participants=participants))
-            defaults = tuple(
-                str(value).strip() for value in item.get("default_participants") or [] if str(value).strip()
-            )
-            orchestrators[agent_id] = OrchestratorConfig(
-                agent_id=agent_id,
-                default_participants=defaults,
-                routes=tuple(routes),
-            )
+            orchestrators[agent_id] = OrchestratorConfig(agent_id=agent_id)
         runner = str(payload.get("runner") or "auto").strip().casefold()
         if runner not in {"auto", "codex", "claude"}:
             runner = "auto"
@@ -88,14 +59,8 @@ class AgentSystemArchitecture:
         return list(self.orchestrators)
 
     def suggest_participants(self, lead_agent_id: str, objective: str, available: set[str]) -> list[str]:
-        config = self.orchestrators.get(lead_agent_id)
-        picks = [lead_agent_id]
-        if config:
-            picks.extend(config.default_participants)
-            for route in config.routes:
-                if route.matches(objective):
-                    picks.extend(route.participants)
-        return [agent_id for agent_id in dict.fromkeys(picks) if agent_id in available]
+        del objective
+        return [lead_agent_id] if lead_agent_id in available else []
 
     def summary(self, project_root: Path) -> dict[str, Any]:
         manifest = None

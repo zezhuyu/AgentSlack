@@ -58,7 +58,10 @@ def _openapi_document() -> dict:
             "get": {"summary": "List chats"},
             "post": {"summary": "Create a direct or group chat"},
         },
-        "/chats/{chat_id}": {"get": {"summary": "Get a chat and its messages"}},
+        "/chats/{chat_id}": {
+            "get": {"summary": "Get a chat and its messages"},
+            "delete": {"summary": "Delete a chat and its stored messages"},
+        },
         "/chats/{chat_id}/messages": {"post": {"summary": "Post a user message"}},
         "/chats/{chat_id}/run-stream": {
             "post": {
@@ -276,10 +279,26 @@ class _Handler(BaseHTTPRequestHandler):
             return self._json({"error": str(exc)}, status=400)
         return self._json(server)
 
+    def do_DELETE(self) -> None:  # noqa: N802
+        parsed = urlparse(self.path)
+        path = _versioned_path(parsed.path)
+        if path.startswith("/api/") and self.manager.active_server_id is None:
+            return self._json(_no_server_payload(), status=409)
+        match = re.fullmatch(r"/api/chats/([^/]+)", path)
+        if not match:
+            return self._json({"error": "not found"}, status=404)
+        try:
+            result = self._active_app().delete_chat(match.group(1))
+        except KeyError as exc:
+            return self._json({"error": str(exc).strip("'")}, status=404)
+        except (LookupError, ValueError) as exc:
+            return self._json({"error": str(exc)}, status=409)
+        return self._json(result)
+
     def do_OPTIONS(self) -> None:  # noqa: N802
         self.send_response(HTTPStatus.NO_CONTENT)
-        self.send_header("Allow", "GET, POST, PATCH, OPTIONS")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, PATCH, OPTIONS")
+        self.send_header("Allow", "GET, POST, PATCH, DELETE, OPTIONS")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, PATCH, DELETE, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Content-Type, X-Agent-Slack-Server")
         self.send_header("X-Agent-Slack-Api-Version", API_VERSION)
         self.end_headers()
@@ -320,20 +339,27 @@ class _Handler(BaseHTTPRequestHandler):
         self.send_header("Connection", "close")
         self.send_header("X-Agent-Slack-Api-Version", API_VERSION)
         self.end_headers()
+        connected = True
         try:
             for event in events:
+                if not connected:
+                    continue
                 raw = (json.dumps(event, ensure_ascii=False) + "\n").encode("utf-8")
-                self.wfile.write(raw)
-                self.wfile.flush()
-        except (BrokenPipeError, ConnectionResetError):
-            pass
+                try:
+                    self.wfile.write(raw)
+                    self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError):
+                    # Agent runs are backend jobs. Finish consuming the generator so
+                    # replies persist even when the initiating client disconnects.
+                    connected = False
         except Exception as exc:
             error = {"type": "error", "message": str(exc)}
-            try:
-                self.wfile.write((json.dumps(error) + "\n").encode("utf-8"))
-                self.wfile.flush()
-            except (BrokenPipeError, ConnectionResetError):
-                pass
+            if connected:
+                try:
+                    self.wfile.write((json.dumps(error) + "\n").encode("utf-8"))
+                    self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
         finally:
             self.close_connection = True
 

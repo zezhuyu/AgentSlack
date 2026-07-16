@@ -6,63 +6,57 @@ from pathlib import Path
 from agent_slack.architecture import AgentSystemArchitecture
 
 
-def test_loads_generic_orchestrator_routes(tmp_path: Path) -> None:
-    manifest = {
-        "schema_version": 1,
-        "runner": "claude",
-        "orchestrators": [
+def test_manifest_selects_runner_and_host_lead_without_routing_policy(tmp_path: Path) -> None:
+    (tmp_path / ".agent-slack.json").write_text(
+        json.dumps(
             {
-                "agent_id": "coordinator",
-                "default_participants": ["intake"],
-                "routes": [
-                    {
-                        "keywords": ["security", "threat"],
-                        "participants": ["security_reviewer", "critic"],
-                    }
-                ],
+                "schema_version": 1,
+                "runner": "claude",
+                "orchestrators": [{"agent_id": "coordinator"}],
             }
-        ],
-    }
-    (tmp_path / ".agent-slack.json").write_text(json.dumps(manifest), encoding="utf-8")
+        ),
+        encoding="utf-8",
+    )
 
     architecture = AgentSystemArchitecture.load(tmp_path)
 
-    assert architecture.orchestrator_ids == ["coordinator"]
     assert architecture.runner == "claude"
+    assert architecture.orchestrator_ids == ["coordinator"]
     assert architecture.suggest_participants(
-        "coordinator",
-        "Run a security threat review",
-        {"coordinator", "intake", "security_reviewer", "critic"},
-    ) == ["coordinator", "intake", "security_reviewer", "critic"]
+        "coordinator", "Any host-defined objective", {"coordinator", "reviewer"}
+    ) == ["coordinator"]
 
 
-def test_missing_manifest_keeps_manual_agent_system_usable(tmp_path: Path) -> None:
-    architecture = AgentSystemArchitecture.load(tmp_path)
-
-    assert architecture.orchestrator_ids == []
-    assert architecture.suggest_participants("team_lead", "Any objective", {"team_lead", "worker"}) == [
-        "team_lead"
-    ]
-
-
-def test_unknown_participants_are_filtered(tmp_path: Path) -> None:
-    manifest = {
-        "orchestrators": [
+def test_legacy_routes_and_dependency_graphs_are_ignored(tmp_path: Path) -> None:
+    (tmp_path / ".agent-slack.json").write_text(
+        json.dumps(
             {
-                "agent_id": "lead",
-                "default_participants": ["installed", "missing"],
-                "routes": [],
+                "orchestrators": [
+                    {
+                        "agent_id": "lead",
+                        "default_participants": ["reviewer"],
+                        "fallback_participants": ["generalist"],
+                        "routes": [{"keywords": ["review"], "participants": ["reviewer"]}],
+                        "participant_dependencies": {"reviewer": ["researcher"]},
+                        "max_parallel_agents": 8,
+                    }
+                ]
             }
-        ]
-    }
-    (tmp_path / "agent-slack.json").write_text(json.dumps(manifest), encoding="utf-8")
+        ),
+        encoding="utf-8",
+    )
 
     architecture = AgentSystemArchitecture.load(tmp_path)
 
-    assert architecture.suggest_participants("lead", "Review", {"lead", "installed"}) == ["lead", "installed"]
+    assert architecture.suggest_participants(
+        "lead", "review", {"lead", "reviewer", "generalist", "researcher"}
+    ) == ["lead"]
+    assert not hasattr(architecture, "execution_waves")
 
 
-def test_unknown_runner_falls_back_to_auto(tmp_path: Path) -> None:
-    (tmp_path / ".agent-slack.json").write_text('{"runner":"custom"}', encoding="utf-8")
-
-    assert AgentSystemArchitecture.load(tmp_path).runner == "auto"
+def test_missing_or_invalid_manifest_falls_back_safely(tmp_path: Path) -> None:
+    assert AgentSystemArchitecture.load(tmp_path).orchestrator_ids == []
+    (tmp_path / "agent-slack.json").write_text("{not json", encoding="utf-8")
+    architecture = AgentSystemArchitecture.load(tmp_path)
+    assert architecture.orchestrator_ids == []
+    assert architecture.manifest_path == tmp_path / "agent-slack.json"

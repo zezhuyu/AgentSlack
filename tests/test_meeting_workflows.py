@@ -79,7 +79,13 @@ def _running_empty_server(tmp_path: Path):
         thread.join(timeout=2)
 
 
-def _request(base_url: str, server_id: str, path: str, payload: dict | None = None):
+def _request(
+    base_url: str,
+    server_id: str,
+    path: str,
+    payload: dict | None = None,
+    method: str | None = None,
+):
     data = json.dumps(payload).encode() if payload is not None else None
     request = Request(
         f"{base_url}{path}",
@@ -88,13 +94,35 @@ def _request(base_url: str, server_id: str, path: str, payload: dict | None = No
             "Content-Type": "application/json",
             "X-Agent-Slack-Server": server_id,
         },
-        method="POST" if payload is not None else "GET",
+        method=method or ("POST" if payload is not None else "GET"),
     )
     with urlopen(request, timeout=5) as response:
         body = response.read().decode()
         if response.headers.get_content_type() == "application/x-ndjson":
             return [json.loads(line) for line in body.splitlines() if line]
         return json.loads(body)
+
+
+def test_chat_can_be_deleted_through_versioned_api(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("AGENT_SLACK_CLI", "offline")
+    with _running_server(tmp_path) as (base_url, server_id):
+        chat = _request(
+            base_url,
+            server_id,
+            "/api/chats",
+            {"title": "Delete Me", "member_ids": ["coordinator"], "kind": "direct"},
+        )
+
+        result = _request(
+            base_url,
+            server_id,
+            f"/api/v1/chats/{chat['chat_id']}",
+            method="DELETE",
+        )
+
+        assert result == {"deleted": True, "chat_id": chat["chat_id"]}
+        listed = _request(base_url, server_id, "/api/v1/chats")["chats"]
+        assert chat["chat_id"] not in {item["chat_id"] for item in listed}
 
 
 def test_manual_group_meeting_is_listed_and_accepts_follow_up(tmp_path: Path, monkeypatch) -> None:
@@ -124,8 +152,6 @@ def test_manual_group_meeting_is_listed_and_accepts_follow_up(tmp_path: Path, mo
         )
 
         assert [event["agent_id"] for event in events if event["type"] == "agent_started"] == [
-            "reviewer",
-            "implementer",
             "coordinator",
         ]
         listed = _request(base_url, server_id, "/api/chats")["chats"]
@@ -168,7 +194,7 @@ def test_auto_meeting_creates_sidebar_group_and_accepts_follow_up(tmp_path: Path
         created = events[0]
         assert created["type"] == "meeting_created"
         assert created["chat_id"] != direct["chat_id"]
-        assert created["agent_ids"] == ["coordinator", "implementer", "reviewer"]
+        assert created["agent_ids"] == ["coordinator"]
         listed = _request(base_url, server_id, "/api/chats")["chats"]
         meeting_summary = next(item for item in listed if item["chat_id"] == created["chat_id"])
         assert meeting_summary["kind"] == "group"
@@ -296,3 +322,29 @@ def test_empty_registry_supports_client_bootstrap_and_returns_setup_action(tmp_p
         assert caught.value.code == 409
         assert payload["code"] == "server_not_configured"
         assert payload["setup"]["endpoint"] == "/api/v1/servers"
+
+
+def test_disconnected_stream_still_consumes_backend_job() -> None:
+    consumed = []
+
+    def events():
+        for index in range(3):
+            consumed.append(index)
+            yield {"type": "progress", "index": index}
+
+    class DisconnectedWriter:
+        def write(self, _payload):
+            raise BrokenPipeError
+
+        def flush(self):
+            pass
+
+    handler = _Handler.__new__(_Handler)
+    handler.wfile = DisconnectedWriter()
+    handler.send_response = lambda _status: None
+    handler.send_header = lambda _key, _value: None
+    handler.end_headers = lambda: None
+
+    handler._ndjson(events())
+
+    assert consumed == [0, 1, 2]
