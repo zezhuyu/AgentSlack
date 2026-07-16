@@ -69,6 +69,12 @@ def _openapi_document() -> dict:
                 "responses": {"200": {"description": "NDJSON event stream"}},
             }
         },
+        "/runs/{run_id}/cancel": {
+            "post": {"summary": "Stop an active agent-system run"},
+        },
+        "/runs/{run_id}/tasks/{task_id}/cancel": {
+            "post": {"summary": "Stop one native task without stopping sibling tasks"},
+        },
         "/chats/{chat_id}/meeting": {"post": {"summary": "Run a manual agent meeting"}},
         "/chats/{chat_id}/auto-meeting": {"post": {"summary": "Run an architecture-routed meeting"}},
     }
@@ -228,6 +234,20 @@ class _Handler(BaseHTTPRequestHandler):
             except (KeyError, ValueError) as exc:
                 return self._json({"error": str(exc)}, status=400)
             return self._ndjson(events)
+        match = re.fullmatch(r"/api/runs/([^/]+)/cancel", path)
+        if match:
+            try:
+                result = app.cancel_run(match.group(1))
+            except KeyError as exc:
+                return self._json({"error": str(exc).strip("'")}, status=404)
+            return self._json(result, status=202)
+        match = re.fullmatch(r"/api/runs/([^/]+)/tasks/([^/]+)/cancel", path)
+        if match:
+            try:
+                result = app.cancel_task(match.group(1), match.group(2))
+            except KeyError as exc:
+                return self._json({"error": str(exc).strip("'")}, status=404)
+            return self._json(result, status=202)
         match = re.fullmatch(r"/api/chats/([^/]+)/respond", path)
         if match:
             chat = app.run_agents(

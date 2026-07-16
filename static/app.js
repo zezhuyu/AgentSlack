@@ -10,6 +10,8 @@ const state = {
   mobileSidebarOpen: false,
   openingDmAgentIds: new Set(),
   runInProgress: false,
+  currentRunId: null,
+  stoppingTaskIds: new Set(),
   syncInProgress: false,
   chatListSignature: "",
   streamingRows: new Map(),
@@ -26,6 +28,7 @@ const renderMarkdown = (value) => window.AgentSlackMarkdown.render(value);
 const appendStreamMarkdown = (currentText, delta) => window.AgentSlackMarkdown.appendStream(currentText, delta);
 const chatSync = window.AgentSlackSync;
 const composerKeys = window.AgentSlackComposer;
+const mentionHelpers = window.AgentSlackMentions;
 
 async function api(path, options = {}) {
   const headers = {
@@ -349,7 +352,7 @@ function renderChat(chat) {
   messages.scrollTop = followLatest ? messages.scrollHeight : previousScrollTop;
 }
 
-function createStreamingRow(agentId, agentLabel) {
+function createStreamingRow(taskId, agentId, agentLabel) {
   const row = document.createElement("article");
   row.className = "message agent streaming";
   row.innerHTML = `
@@ -358,25 +361,36 @@ function createStreamingRow(agentId, agentLabel) {
       <header>
         <strong>${escapeHtml(agentLabel)}</strong>
         <time>working now</time>
+        <button class="agent-stop-button" type="button">Stop</button>
       </header>
       <div class="message-content"><span class="typing-dots"><i></i><i></i><i></i></span></div>
     </div>
   `;
   $("messages").appendChild(row);
   $("messages").scrollTop = $("messages").scrollHeight;
-  state.streamingRows.set(agentId, {
+  const stopButton = row.querySelector(".agent-stop-button");
+  stopButton.onclick = () => stopAgentTask(taskId);
+  state.streamingRows.set(taskId, {
     row,
     body: row.querySelector(".message-content"),
+    stopButton,
+    agentId,
     rawText: "",
     started: false,
   });
 }
 
 async function renderStreamEvent(event) {
-  if (event.type === "agent_started") {
-    createStreamingRow(event.agent_id, event.agent_label);
+  const taskId = event.task_id || event.agent_id;
+  if (event.type === "run_started") {
+    state.currentRunId = event.run_id;
+    $("stopRunBtn").hidden = false;
+    $("stopRunBtn").disabled = false;
+    $("stopRunBtn").textContent = "Stop Run";
+  } else if (event.type === "agent_started") {
+    createStreamingRow(taskId, event.agent_id, event.agent_label);
   } else if (event.type === "delta") {
-    const stream = state.streamingRows.get(event.agent_id);
+    const stream = state.streamingRows.get(taskId);
     if (!stream) return;
     if (!stream.started) {
       stream.started = true;
@@ -387,28 +401,89 @@ async function renderStreamEvent(event) {
     $("messages").scrollTop = $("messages").scrollHeight;
     await new Promise((resolve) => setTimeout(resolve, 14));
   } else if (event.type === "agent_completed") {
-    const stream = state.streamingRows.get(event.agent_id);
+    const stream = state.streamingRows.get(taskId);
     if (stream) {
       stream.body.innerHTML = renderMarkdown(stream.rawText);
       stream.row.classList.remove("streaming");
       stream.row.querySelector("time").textContent = "just now";
-      state.streamingRows.delete(event.agent_id);
+      stream.stopButton.remove();
+      state.streamingRows.delete(taskId);
     }
   } else if (event.type === "agent_failed") {
-    let stream = state.streamingRows.get(event.agent_id);
+    let stream = state.streamingRows.get(taskId);
     if (!stream) {
-      createStreamingRow(event.agent_id, event.agent_label || event.agent_id);
-      stream = state.streamingRows.get(event.agent_id);
+      createStreamingRow(taskId, event.agent_id, event.agent_label || event.agent_id);
+      stream = state.streamingRows.get(taskId);
     }
     if (stream) {
       stream.body.innerHTML = renderMarkdown(event.message || "**Agent run failed.**");
       stream.row.classList.remove("streaming");
       stream.row.classList.add("failed");
       stream.row.querySelector("time").textContent = "failed";
-      state.streamingRows.delete(event.agent_id);
+      stream.stopButton.remove();
+      state.streamingRows.delete(taskId);
     }
+  } else if (event.type === "agent_cancelled") {
+    let stream = state.streamingRows.get(taskId);
+    if (!stream) {
+      createStreamingRow(taskId, event.agent_id, event.agent_label || event.agent_id);
+      stream = state.streamingRows.get(taskId);
+    }
+    if (stream) {
+      const stopped = event.message || "Stopped by user.";
+      const content = stream.rawText ? `${stream.rawText}\n\n_${stopped}_` : `_${stopped}_`;
+      stream.body.innerHTML = renderMarkdown(content);
+      stream.row.classList.remove("streaming");
+      stream.row.classList.add("cancelled");
+      stream.row.querySelector("time").textContent = "stopped";
+      stream.stopButton.remove();
+      state.streamingRows.delete(taskId);
+      state.stoppingTaskIds.delete(taskId);
+    }
+  } else if (event.type === "run_cancelled") {
+    $("stopRunBtn").disabled = true;
+    $("stopRunBtn").textContent = "Stopped";
   } else if (event.type === "error") {
     throw new Error(event.message || "Agent run failed");
+  }
+}
+
+async function stopAgentTask(taskId) {
+  if (!state.currentRunId || state.stoppingTaskIds.has(taskId)) return;
+  const stream = state.streamingRows.get(taskId);
+  state.stoppingTaskIds.add(taskId);
+  if (stream) {
+    stream.stopButton.disabled = true;
+    stream.stopButton.textContent = "Stopping...";
+  }
+  try {
+    await api(
+      `/api/runs/${encodeURIComponent(state.currentRunId)}/tasks/${encodeURIComponent(taskId)}/cancel`,
+      { method: "POST", body: "{}" },
+    );
+  } catch (error) {
+    state.stoppingTaskIds.delete(taskId);
+    if (stream) {
+      stream.stopButton.disabled = false;
+      stream.stopButton.textContent = "Stop";
+    }
+    alert(`Unable to stop agent: ${error.message}`);
+  }
+}
+
+async function stopCurrentRun() {
+  if (!state.currentRunId || !state.runInProgress) return;
+  $("stopRunBtn").disabled = true;
+  $("stopRunBtn").textContent = "Stopping...";
+  try {
+    await api(`/api/runs/${encodeURIComponent(state.currentRunId)}/cancel`, {
+      method: "POST",
+      body: "{}",
+    });
+  } catch (error) {
+    $("stopRunBtn").disabled = false;
+    $("stopRunBtn").textContent = "Stop Run";
+    alert(`Unable to stop run: ${error.message}`);
   }
 }
 
@@ -435,7 +510,10 @@ async function runChatStream(payload, chatId = state.currentChatId) {
     alert(`Agent run failed: ${error.message}`);
   } finally {
     state.runInProgress = false;
+    state.currentRunId = null;
+    state.stoppingTaskIds.clear();
     state.streamingRows.clear();
+    $("stopRunBtn").hidden = true;
     $("deleteChatBtn").disabled = !state.currentChatId;
     $("sendBtn").disabled = false;
     $("sendBtn").textContent = "Send";
@@ -609,9 +687,18 @@ async function sendMessage() {
   $("messageInput").value = "";
   await openChat(state.currentChatId);
   const memberIds = currentChat?.member_ids || [];
+  const mentionedAgentIds = mentionHelpers.resolveAgentIds(body, state.agents);
   const leadAgentId = state.orchestratorIds.find((agentId) => memberIds.includes(agentId));
   let runPayload = null;
-  if (currentChat?.kind === "direct" && memberIds.length === 1) {
+  if (currentChat?.kind !== "direct" && mentionedAgentIds.length > 0) {
+    const targetAgentId = mentionedAgentIds[0];
+    runPayload = {
+      mode: "respond",
+      agent_ids: [targetAgentId],
+      lead_agent_id: targetAgentId,
+      objective: body,
+    };
+  } else if (currentChat?.kind === "direct" && memberIds.length === 1) {
     const directAgentId = memberIds[0];
     if (state.orchestratorIds.includes(directAgentId)) {
       runPayload = { mode: "auto_meeting", lead_agent_id: directAgentId, objective: body };
@@ -626,6 +713,48 @@ async function sendMessage() {
     }
   }
   if (runPayload) await runChatStream(runPayload, state.currentChatId);
+}
+
+function hideMentionMenu() {
+  $("mentionMenu").hidden = true;
+  $("mentionMenu").innerHTML = "";
+}
+
+function insertAgentMention(agentId, context) {
+  const input = $("messageInput");
+  input.value = mentionHelpers.insertMention(input.value, context, agentId);
+  const cursor = context.start + agentId.length + 2;
+  input.setSelectionRange(cursor, cursor);
+  hideMentionMenu();
+  input.focus();
+}
+
+function renderMentionMenu() {
+  const input = $("messageInput");
+  const context = mentionHelpers.queryAtCursor(input.value, input.selectionStart);
+  const menu = $("mentionMenu");
+  if (!context) {
+    hideMentionMenu();
+    return;
+  }
+  const matches = mentionHelpers.matchingAgents(state.agents, context.query).slice(0, 8);
+  if (!matches.length) {
+    hideMentionMenu();
+    return;
+  }
+  menu.innerHTML = matches.map((agent) => `
+    <button type="button" role="option" data-mention-agent="${escapeHtml(agent.agent_id)}">
+      <span class="agent-menu-avatar">${initials(agent.title)}</span>
+      <span><strong>${escapeHtml(agent.title)}</strong><small>@${escapeHtml(agent.agent_id)}</small></span>
+    </button>
+  `).join("");
+  menu.querySelectorAll("[data-mention-agent]").forEach((button) => {
+    button.onmousedown = (event) => {
+      event.preventDefault();
+      insertAgentMention(button.dataset.mentionAgent, context);
+    };
+  });
+  menu.hidden = false;
 }
 
 async function deleteCurrentChat() {
@@ -775,14 +904,30 @@ function formatTime(value) {
 
 $("sendBtn").onclick = sendMessage;
 $("messageInput").addEventListener("keydown", (event) => {
+  const firstMention = $("mentionMenu").querySelector("[data-mention-agent]");
+  if (!$("mentionMenu").hidden && firstMention && ["Enter", "Tab"].includes(event.key)) {
+    event.preventDefault();
+    firstMention.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
+    return;
+  }
+  if (event.key === "Escape" && !$("mentionMenu").hidden) {
+    event.preventDefault();
+    hideMentionMenu();
+    return;
+  }
   if (!composerKeys.shouldSendOnKeydown(event)) return;
   event.preventDefault();
   sendMessage();
 });
+$("messageInput").addEventListener("input", renderMentionMenu);
+$("messageInput").addEventListener("click", renderMentionMenu);
+$("messageInput").addEventListener("blur", () => setTimeout(hideMentionMenu, 100));
 $("runAgentsBtn").onclick = runAgents;
 $("autoMeetingBtn").onclick = autoMeeting;
 $("deleteChatBtn").onclick = deleteCurrentChat;
+$("stopRunBtn").onclick = stopCurrentRun;
 $("refreshAgentsBtn").onclick = async () => {
+  if (state.runInProgress) return;
   await api("/api/agents/discover", { method: "POST", body: "{}" });
   await loadAgents();
 };

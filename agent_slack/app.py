@@ -4,6 +4,7 @@ from collections import Counter
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 from .architecture import AgentSystemArchitecture
 from .discovery import AgentDiscovery
@@ -25,6 +26,8 @@ class AgentSlackApp:
 
     def reload_host_configuration(self) -> None:
         self.architecture = AgentSystemArchitecture.load(self.project_root)
+        if hasattr(self, "orchestrator") and self.orchestrator.has_active_runs:
+            return
         self.orchestrator = CliOrchestrator(
             self.workspace_name,
             self.project_root,
@@ -132,6 +135,12 @@ class AgentSlackApp:
         ))
         return self.storage.get_chat(chat_id) or chat
 
+    def cancel_run(self, run_id: str) -> dict[str, Any]:
+        return self.orchestrator.cancel_run(run_id)
+
+    def cancel_task(self, run_id: str, task_id: str) -> dict[str, Any]:
+        return self.orchestrator.cancel_task(run_id, task_id)
+
     def stream_run(
         self,
         chat_id: str,
@@ -183,13 +192,18 @@ class AgentSlackApp:
         if run_agent is None:
             raise ValueError(f"Agent not found: {run_agent_id}")
 
+        run_id = uuid4().hex
+        self.orchestrator.prepare_run(run_id)
         yield {
             "type": "run_started",
+            "run_id": run_id,
             "mode": mode,
             "agent_ids": selected,
             "lead_agent_id": run_agent_id,
         }
         failed_agent_ids: list[str] = []
+        cancelled_agent_ids: list[str] = []
+        run_cancelled = False
         buffers: dict[str, str] = {}
         labels: dict[str, str] = {}
         native_events = self.orchestrator.stream_agent_reply(
@@ -198,20 +212,35 @@ class AgentSlackApp:
             transcript=list(chat.get("messages", [])),
             memory=self.storage.get_memory_json(run_agent_id),
             objective=objective,
+            run_id=run_id,
         )
         for event in native_events:
+            if event["type"] == "session_cancelled":
+                run_cancelled = True
+                continue
             agent_id = str(event.get("agent_id") or run_agent_id)
+            event = {
+                **event,
+                "run_id": run_id,
+                "task_id": str(event.get("task_id") or agent_id),
+            }
+            task_id = event["task_id"]
             registered_agent = self.get_agent(agent_id)
             registered_label = str((registered_agent or {}).get("title") or "")
             if event["type"] == "agent_started":
                 labels[agent_id] = registered_label or str(event.get("agent_label") or agent_id)
                 event = {**event, "agent_label": labels[agent_id]}
-                buffers.setdefault(agent_id, "")
+                buffers.setdefault(task_id, "")
             elif event["type"] == "delta":
-                buffers[agent_id] = buffers.get(agent_id, "") + str(event.get("text") or "")
-            elif event["type"] in {"agent_completed", "agent_failed"}:
+                buffers[task_id] = buffers.get(task_id, "") + str(event.get("text") or "")
+            elif event["type"] in {"agent_completed", "agent_failed", "agent_cancelled"}:
                 failed = event["type"] == "agent_failed"
-                body = str(event.get("message") or buffers.get(agent_id) or "").strip()
+                cancelled = event["type"] == "agent_cancelled"
+                body = str(
+                    event.get("message")
+                    or buffers.get(task_id)
+                    or ("Stopped by user." if cancelled else "")
+                ).strip()
                 label = (
                     registered_label
                     or labels.get(agent_id)
@@ -221,6 +250,8 @@ class AgentSlackApp:
                     event = {**event, "agent_label": label}
                 if failed:
                     failed_agent_ids.append(agent_id)
+                if cancelled:
+                    cancelled_agent_ids.append(agent_id)
                 if body:
                     chat = self.storage.append_message(
                         run_chat_id,
@@ -231,8 +262,12 @@ class AgentSlackApp:
                             "body": body,
                             "metadata": {
                                 "objective": objective,
-                                "source": "native_agent_error" if failed else "native_agent_reply",
-                                "status": "failed" if failed else "completed",
+                                "source": (
+                                    "native_agent_error" if failed
+                                    else "native_agent_cancelled" if cancelled
+                                    else "native_agent_reply"
+                                ),
+                                "status": "failed" if failed else "cancelled" if cancelled else "completed",
                                 "runner": self.orchestrator.backend,
                             },
                         },
@@ -247,10 +282,18 @@ class AgentSlackApp:
         if meeting_created:
             self._update_latest_meeting(
                 run_chat_id,
-                status="completed_with_errors" if failed_agent_ids else "completed",
+                status=(
+                    "cancelled" if run_cancelled
+                    else "completed_with_errors" if failed_agent_ids
+                    else "completed"
+                ),
                 failed_agent_ids=failed_agent_ids,
+                cancelled_agent_ids=cancelled_agent_ids,
             )
-        yield {"type": "run_completed", "chat_id": run_chat_id}
+        if run_cancelled:
+            yield {"type": "run_cancelled", "run_id": run_id, "chat_id": run_chat_id}
+        else:
+            yield {"type": "run_completed", "run_id": run_id, "chat_id": run_chat_id}
 
     def _update_latest_meeting(self, chat_id: str, **updates: Any) -> None:
         chat = self.storage.get_chat(chat_id)

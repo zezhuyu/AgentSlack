@@ -59,12 +59,16 @@
             <button id="runAgentsBtn">Run Members</button>
             <button id="autoMeetingBtn">Auto Meeting</button>
             <button id="manualMeetingBtn">Manual Meeting</button>
+            <button id="stopRunBtn" class="danger-button" type="button" hidden>Stop Run</button>
             <button id="deleteChatBtn" class="danger-button" disabled>Delete Chat</button>
           </div>
         </header>
         <section id="messages" class="messages"></section>
         <footer class="composer">
-          <textarea id="messageInput" rows="4" placeholder="Message Agent Slack"></textarea>
+          <div class="message-input-wrap">
+            <textarea id="messageInput" rows="4" placeholder="Message Agent Slack — use @ to address a person"></textarea>
+            <div id="mentionMenu" class="mention-menu" role="listbox" hidden></div>
+          </div>
           <div class="composer-actions">
             <input id="objectiveInput" placeholder="Optional objective for next agent run / meeting" />
             <button id="sendBtn">Send</button>
@@ -143,6 +147,7 @@
     <script src="/markdown.js"></script>
     <script src="/sync.js"></script>
     <script src="/composer.js"></script>
+    <script src="/mentions.js"></script>
     <script src="/app.js"></script>
   </body>
 </html>

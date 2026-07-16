@@ -3,6 +3,7 @@ from __future__ import annotations
 import subprocess
 import io
 import json
+import signal
 from pathlib import Path
 
 from agent_slack.orchestrator import CliOrchestrator
@@ -503,3 +504,175 @@ def test_claude_structured_error_outranks_session_end_hook_failure(tmp_path: Pat
     assert events[0]["type"] == "agent_failed"
     assert "session limit" in events[0]["message"]
     assert "SessionEnd hook" not in events[0]["message"]
+
+
+def test_cancel_task_sends_native_task_stop_without_touching_siblings(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setenv("AGENT_SLACK_CLI", "claude")
+    monkeypatch.setattr("agent_slack.orchestrator.shutil.which", lambda _name: "/bin/claude")
+    orchestrator = CliOrchestrator("Host", tmp_path, backend_preference="claude")
+    stdin = io.StringIO()
+    target = {
+        "task_id": "tool-target",
+        "agent_id": "reviewer",
+        "native_task_id": "native-target",
+    }
+    sibling = {
+        "task_id": "tool-sibling",
+        "agent_id": "researcher",
+        "native_task_id": "native-sibling",
+    }
+    orchestrator._active_runs["run-1"] = {
+        "process": object(),
+        "stdin": stdin,
+        "tasks": {"tool-target": target, "tool-sibling": sibling},
+        "cancel_requested": False,
+    }
+
+    result = orchestrator.cancel_task("run-1", "tool-target")
+
+    assert result["status"] == "stopping"
+    assert target["cancel_requested"] is True
+    assert target["stop_sent"] is True
+    assert sibling.get("cancel_requested") is None
+    interrupt_raw, control_raw = stdin.getvalue().splitlines()
+    interrupt = json.loads(interrupt_raw)
+    control = json.loads(control_raw)
+    assert interrupt["type"] == "control_request"
+    assert interrupt["request"]["subtype"] == "interrupt"
+    assert control["type"] == "user"
+    assert "native-target" in control["message"]["content"]
+    assert "native-sibling" not in control["message"]["content"]
+
+
+def test_cancel_run_terminates_process_tree_once(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("AGENT_SLACK_CLI", "claude")
+    monkeypatch.setattr("agent_slack.orchestrator.shutil.which", lambda _name: "/bin/claude")
+    orchestrator = CliOrchestrator("Host", tmp_path, backend_preference="claude")
+    process = object()
+    task = {"task_id": "tool-1", "agent_id": "reviewer"}
+    orchestrator._active_runs["run-1"] = {
+        "process": process,
+        "stdin": io.StringIO(),
+        "tasks": {"tool-1": task},
+        "cancel_requested": False,
+    }
+    terminated = []
+    monkeypatch.setattr(orchestrator, "_terminate_process_tree", terminated.append)
+
+    first = orchestrator.cancel_run("run-1")
+    second = orchestrator.cancel_run("run-1")
+
+    assert first["accepted"] is True
+    assert second["accepted"] is True
+    assert terminated == [process]
+    assert task["cancel_requested"] is True
+
+
+def test_terminate_process_tree_escalates_to_sigkill_after_timeout(monkeypatch) -> None:
+    class HungProcess:
+        pid = 4321
+
+        @staticmethod
+        def poll():
+            return None
+
+        @staticmethod
+        def wait(timeout=None):
+            assert timeout == 2
+            raise subprocess.TimeoutExpired("claude", timeout)
+
+        @staticmethod
+        def terminate():
+            raise AssertionError("process-group signalling should be used")
+
+        @staticmethod
+        def kill():
+            raise AssertionError("process-group signalling should be used")
+
+    signals = []
+    monkeypatch.setattr(
+        "agent_slack.orchestrator.os.killpg",
+        lambda pid, sent_signal: signals.append((pid, sent_signal)),
+    )
+
+    CliOrchestrator._terminate_process_tree(HungProcess())
+
+    assert signals == [(4321, signal.SIGTERM), (4321, signal.SIGKILL)]
+
+
+def test_prepared_run_can_be_cancelled_before_claude_is_spawned(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("AGENT_SLACK_CLI", "claude")
+    monkeypatch.setattr("agent_slack.orchestrator.shutil.which", lambda _name: "/bin/claude")
+    monkeypatch.setattr(
+        "agent_slack.orchestrator.subprocess.Popen",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("must not spawn")),
+    )
+    orchestrator = CliOrchestrator("Host", tmp_path, backend_preference="claude")
+    orchestrator.prepare_run("run-1")
+
+    assert orchestrator.cancel_run("run-1")["accepted"] is True
+    events = list(orchestrator.stream_agent_reply(
+        agent={"agent_id": "coordinator", "name": "coordinator", "title": "Coordinator"},
+        chat={"title": "Chat"},
+        transcript=[],
+        memory={},
+        run_id="run-1",
+    ))
+
+    assert events == [{"type": "session_cancelled", "run_id": "run-1"}]
+    assert orchestrator.has_active_runs is False
+
+
+def test_successful_task_result_wins_cancel_race(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("AGENT_SLACK_CLI", "claude")
+    monkeypatch.setattr("agent_slack.orchestrator.shutil.which", lambda _name: "/bin/claude")
+    frames = [
+        {
+            "type": "assistant",
+            "message": {"content": [{
+                "type": "tool_use",
+                "name": "Task",
+                "id": "task-1",
+                "input": {"subagent_type": "reviewer", "description": "Review Agent"},
+            }]},
+        },
+        {
+            "type": "user",
+            "message": {"content": [{
+                "type": "tool_result",
+                "tool_use_id": "task-1",
+                "content": "Completed before the stop took effect.",
+            }]},
+        },
+        {"type": "result", "result": "Done."},
+    ]
+
+    class FakeProcess:
+        pid = 1234
+
+        def __init__(self):
+            self.stdin = io.StringIO()
+            self.stdout = io.StringIO("".join(json.dumps(frame) + "\n" for frame in frames))
+
+        @staticmethod
+        def wait(timeout=None):
+            return 0
+
+    monkeypatch.setattr("agent_slack.orchestrator.subprocess.Popen", lambda *_args, **_kwargs: FakeProcess())
+    orchestrator = CliOrchestrator("Host", tmp_path, backend_preference="claude")
+    stream = orchestrator.stream_agent_reply(
+        agent={"agent_id": "coordinator", "name": "coordinator", "title": "Coordinator"},
+        chat={"title": "Chat"},
+        transcript=[],
+        memory={},
+        run_id="run-1",
+    )
+
+    assert next(stream)["type"] == "agent_started"
+    orchestrator.cancel_task("run-1", "task-1")
+    remaining = list(stream)
+
+    assert [event["type"] for event in remaining[:2]] == ["delta", "agent_completed"]
+    assert remaining[0]["text"] == "Completed before the stop took effect."

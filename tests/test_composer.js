@@ -27,3 +27,13 @@ test("mobile layout keeps People and Send available inside the viewport", () => 
   assert.match(styles, /#sendBtn[\s\S]*?min-height: 44px/);
   assert.match(styles, /\.composer-actions input[\s\S]*?display: none/);
 });
+
+test("active runs and individual agent rows expose stop controls", () => {
+  assert.match(html, /id="stopRunBtn"[\s\S]*?>Stop Run</);
+  assert.match(appSource, /class="agent-stop-button"/);
+  assert.match(appSource, /stopAgentTask\(taskId\)/);
+  assert.match(appSource, /\/tasks\/\$\{encodeURIComponent\(taskId\)\}\/cancel/);
+  assert.match(appSource, /stopCurrentRun/);
+  assert.match(appSource, /event\.type === "agent_cancelled"/);
+  assert.match(styles, /:not\(#stopRunBtn\)/);
+});

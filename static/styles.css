@@ -699,6 +699,31 @@ menu button:hover {
   color: var(--muted);
 }
 
+.agent-stop-button {
+  margin-left: auto;
+  border: 1px solid #d72c3f;
+  border-radius: 6px;
+  background: white;
+  color: #b7192d;
+  padding: 3px 8px;
+  font-size: 12px;
+  font-weight: 800;
+  cursor: pointer;
+}
+
+.agent-stop-button:hover {
+  background: #fff1f3;
+}
+
+.agent-stop-button:disabled {
+  cursor: wait;
+  opacity: 0.6;
+}
+
+.message.cancelled .message-content {
+  color: var(--muted);
+}
+
 .message-content {
   margin: 0;
   word-break: break-word;
@@ -974,6 +999,53 @@ dialog select {
   resize: vertical;
 }
 
+.message-input-wrap {
+  position: relative;
+}
+
+.mention-menu {
+  position: absolute;
+  z-index: 100;
+  right: 0;
+  bottom: calc(100% + 6px);
+  left: 0;
+  max-height: 280px;
+  overflow-y: auto;
+  border: 1px solid var(--line-strong);
+  border-radius: 9px;
+  background: white;
+  box-shadow: 0 12px 28px rgba(29, 28, 29, 0.16);
+  padding: 6px;
+}
+
+.mention-menu button {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  padding: 8px 10px;
+  color: var(--main-ink);
+  text-align: left;
+  cursor: pointer;
+}
+
+.mention-menu button:hover,
+.mention-menu button:focus {
+  background: #f4edf5;
+}
+
+.mention-menu button > span:last-child {
+  display: grid;
+  gap: 2px;
+}
+
+.mention-menu small {
+  color: var(--muted);
+}
+
 .composer-actions {
   margin-top: 10px;
 }
@@ -1156,7 +1228,7 @@ menu {
     justify-content: center;
   }
 
-  .chat-actions > button:not(#mobilePeopleBtn):not(#deleteChatBtn) {
+  .chat-actions > button:not(#mobilePeopleBtn):not(#deleteChatBtn):not(#stopRunBtn) {
     display: none;
   }
 

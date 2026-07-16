@@ -3,12 +3,15 @@ from __future__ import annotations
 import os
 import json
 import re
+import signal
 import shutil
 import subprocess
+import threading
 from html import unescape
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 
 class CliOrchestrator:
@@ -18,6 +21,8 @@ class CliOrchestrator:
         self.workspace_name = workspace_name
         self.project_root = project_root
         self.timeout_seconds = int(os.environ.get("AGENT_SLACK_CLI_TIMEOUT", "180"))
+        self._run_lock = threading.RLock()
+        self._active_runs: dict[str, dict[str, Any]] = {}
         self.backend, self.executable = self._resolve_backend(
             os.environ.get("AGENT_SLACK_CLI", backend_preference).strip().lower()
         )
@@ -25,6 +30,58 @@ class CliOrchestrator:
     @property
     def available(self) -> bool:
         return self.executable is not None
+
+    @property
+    def has_active_runs(self) -> bool:
+        with self._run_lock:
+            return bool(self._active_runs)
+
+    def prepare_run(self, run_id: str) -> None:
+        """Reserve a cancellable run before its first streaming event reaches the UI."""
+        with self._run_lock:
+            self._active_runs.setdefault(
+                run_id,
+                {
+                    "process": None,
+                    "stdin": None,
+                    "tasks": {},
+                    "cancel_requested": False,
+                },
+            )
+
+    def cancel_run(self, run_id: str) -> dict[str, Any]:
+        with self._run_lock:
+            active = self._active_runs.get(run_id)
+            if not active:
+                raise KeyError(f"Active run not found: {run_id}")
+            if active.get("cancel_requested"):
+                return {"accepted": True, "run_id": run_id, "status": "stopping"}
+            active["cancel_requested"] = True
+            for task in active["tasks"].values():
+                task["cancel_requested"] = True
+            process = active.get("process")
+        if process is not None:
+            self._terminate_process_tree(process)
+        return {"accepted": True, "run_id": run_id, "status": "stopping"}
+
+    def cancel_task(self, run_id: str, task_id: str) -> dict[str, Any]:
+        with self._run_lock:
+            active = self._active_runs.get(run_id)
+            if not active:
+                raise KeyError(f"Active run not found: {run_id}")
+            task = active["tasks"].get(task_id)
+            if not task:
+                raise KeyError(f"Active task not found: {task_id}")
+            if task.get("is_lead"):
+                return self.cancel_run(run_id)
+            task["cancel_requested"] = True
+            sent = self._send_task_stop(active, task)
+        return {
+            "accepted": True,
+            "run_id": run_id,
+            "task_id": task_id,
+            "status": "stopping" if sent else "queued",
+        }
 
     def generate_agent_reply(
         self,
@@ -66,6 +123,7 @@ class CliOrchestrator:
         transcript: list[dict[str, Any]],
         memory: dict[str, Any],
         objective: str | None = None,
+        run_id: str | None = None,
     ) -> Iterator[dict[str, Any]]:
         """Relay one native CLI session; the connected agent system owns delegation."""
         if self.backend != "claude" or self.executable is None:
@@ -83,33 +141,60 @@ class CliOrchestrator:
             }
             yield {"type": "delta", "agent_id": agent["agent_id"], "text": reply}
             yield {"type": "agent_completed", "agent_id": agent["agent_id"]}
+            if run_id:
+                with self._run_lock:
+                    self._active_runs.pop(run_id, None)
             return
 
+        spawn_error = ""
+        if run_id:
+            self.prepare_run(run_id)
         command = self._claude_stream_command(agent)
         prompt = self._compose_native_prompt(chat, transcript, objective)
-        try:
-            process = subprocess.Popen(
-                command,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                cwd=self.project_root,
-                bufsize=1,
-            )
-        except OSError as exc:
-            yield self._stream_failure(agent, str(exc))
-            return
-
-        assert process.stdin is not None
-        assert process.stdout is not None
-        process.stdin.write(json.dumps({
+        initial_frame = json.dumps({
             "type": "user",
             "message": {"role": "user", "content": prompt},
             "parent_tool_use_id": None,
             "session_id": "",
-        }) + "\n")
-        process.stdin.close()
+        }) + "\n"
+        if run_id:
+            with self._run_lock:
+                active_run = self._active_runs.get(run_id)
+                if active_run and active_run.get("cancel_requested"):
+                    self._active_runs.pop(run_id, None)
+                else:
+                    try:
+                        process = self._start_claude_process(command)
+                        assert process.stdin is not None
+                        process.stdin.write(initial_frame)
+                        process.stdin.flush()
+                        active_run["process"] = process
+                        active_run["stdin"] = process.stdin
+                    except (OSError, BrokenPipeError, ValueError) as exc:
+                        self._active_runs.pop(run_id, None)
+                        spawn_error = str(exc)
+            if active_run and active_run.get("cancel_requested"):
+                yield {"type": "session_cancelled", "run_id": run_id}
+                return
+            if spawn_error:
+                yield self._stream_failure(agent, spawn_error)
+                return
+        else:
+            try:
+                process = self._start_claude_process(command)
+                assert process.stdin is not None
+                process.stdin.write(initial_frame)
+                process.stdin.flush()
+            except (OSError, BrokenPipeError, ValueError) as exc:
+                yield self._stream_failure(agent, str(exc))
+                return
+            active_run = {
+                "process": process,
+                "stdin": process.stdin,
+                "tasks": {},
+                "cancel_requested": False,
+            }
+        assert process.stdout is not None
 
         tasks: dict[str, dict[str, Any]] = {}
         native_task_tools: dict[str, str] = {}
@@ -121,6 +206,14 @@ class CliOrchestrator:
         result_seen = False
         result_is_error = False
         diagnostics: list[str] = []
+        lead_task_id = f"lead-{agent['agent_id']}"
+        lead_task = {
+            "agent_id": agent["agent_id"],
+            "agent_label": agent["title"],
+            "task_id": lead_task_id,
+            "is_lead": True,
+        }
+        active_run["tasks"][lead_task_id] = lead_task
 
         def finish_task(source_tool_id: str, raw_result: str, is_error: bool = False) -> list[dict[str, Any]]:
             task = tasks.get(source_tool_id)
@@ -133,15 +226,38 @@ class CliOrchestrator:
                     "type": "agent_failed",
                     "agent_id": task["agent_id"],
                     "agent_label": task["agent_label"],
+                    "task_id": task["task_id"],
                     "message": result or "The native subagent failed.",
                 }]
             if not result:
                 return []
             completed.add(source_tool_id)
             return [
-                {"type": "delta", "agent_id": task["agent_id"], "text": result},
-                {"type": "agent_completed", "agent_id": task["agent_id"]},
+                {
+                    "type": "delta",
+                    "agent_id": task["agent_id"],
+                    "task_id": task["task_id"],
+                    "text": result,
+                },
+                {
+                    "type": "agent_completed",
+                    "agent_id": task["agent_id"],
+                    "task_id": task["task_id"],
+                },
             ]
+
+        def cancel_task_events(source_tool_id: str) -> list[dict[str, Any]]:
+            task = tasks.get(source_tool_id)
+            if not task or source_tool_id in completed:
+                return []
+            completed.add(source_tool_id)
+            return [{
+                "type": "agent_cancelled",
+                "agent_id": task["agent_id"],
+                "agent_label": task["agent_label"],
+                "task_id": task["task_id"],
+                "message": "Stopped by user.",
+            }]
 
         def notification_events(value: Any) -> list[dict[str, Any]]:
             notification = self._task_notification(value)
@@ -157,7 +273,10 @@ class CliOrchestrator:
             if not source_tool_id:
                 return []
             status = notification.get("status", "").lower()
-            if status in {"failed", "error", "stopped", "cancelled", "canceled"}:
+            task = tasks.get(source_tool_id)
+            if task and status in {"stopped", "cancelled", "canceled"}:
+                return cancel_task_events(source_tool_id)
+            if status in {"failed", "error"}:
                 return finish_task(
                     source_tool_id,
                     notification.get("result") or notification.get("summary") or "The native subagent failed.",
@@ -187,10 +306,12 @@ class CliOrchestrator:
                         if task_id and task_id not in tasks:
                             task = self._task_identity(task_id, block.get("input") or {})
                             tasks[task_id] = task
+                            active_run["tasks"][task["task_id"]] = task
                             yield {
                                 "type": "agent_started",
                                 "agent_id": task["agent_id"],
                                 "agent_label": task["agent_label"],
+                                "task_id": task["task_id"],
                             }
                     elif block_type == "tool_use" and block_name == "TaskOutput":
                         output_id = str(block.get("id") or "")
@@ -230,8 +351,11 @@ class CliOrchestrator:
                         if native_task_id:
                             native_task_tools[native_task_id] = task_id
                             task["native_task_id"] = native_task_id
+                            if task.get("cancel_requested"):
+                                self._send_task_stop(active_run, task)
                         continue
-                    for emitted in finish_task(task_id, raw_result, bool(block.get("is_error"))):
+                    emitted_events = finish_task(task_id, raw_result, bool(block.get("is_error")))
+                    for emitted in emitted_events:
                         yield emitted
 
             elif event_type == "queue-operation" and event.get("operation") == "enqueue":
@@ -244,6 +368,8 @@ class CliOrchestrator:
                 if native_task_id and source_tool_id in tasks:
                     native_task_tools[native_task_id] = source_tool_id
                     tasks[source_tool_id]["native_task_id"] = native_task_id
+                    if tasks[source_tool_id].get("cancel_requested"):
+                        self._send_task_stop(active_run, tasks[source_tool_id])
 
             elif event_type == "system" and event.get("subtype") == "task_notification":
                 native_task_id = str(event.get("task_id") or "")
@@ -257,7 +383,10 @@ class CliOrchestrator:
                     status = str(event.get("status") or "").lower()
                     task["notification_status"] = status
                     task["notification_summary"] = str(event.get("summary") or "")
-                    if status in {"failed", "error", "stopped", "cancelled", "canceled"}:
+                    if status in {"stopped", "cancelled", "canceled"}:
+                        for emitted in cancel_task_events(source_tool_id):
+                            yield emitted
+                    elif status in {"failed", "error"}:
                         for emitted in finish_task(
                             source_tool_id,
                             task["notification_summary"] or "The native subagent failed.",
@@ -277,36 +406,81 @@ class CliOrchestrator:
                                 "type": "agent_started",
                                 "agent_id": agent["agent_id"],
                                 "agent_label": agent["title"],
+                                "task_id": lead_task_id,
                             }
                         lead_text += text
-                        yield {"type": "delta", "agent_id": agent["agent_id"], "text": text}
+                        yield {
+                            "type": "delta",
+                            "agent_id": agent["agent_id"],
+                            "task_id": lead_task_id,
+                            "text": text,
+                        }
 
             elif event_type == "result":
                 result_seen = True
                 final_result = str(event.get("result") or "")
                 result_is_error = bool(event.get("is_error"))
+                if process.stdin and not process.stdin.closed:
+                    process.stdin.close()
 
         return_code = process.wait()
 
         for task_id, task in tasks.items():
             if task_id in completed:
                 continue
+            if active_run.get("cancel_requested") or task.get("cancel_requested"):
+                yield from cancel_task_events(task_id)
+                continue
             result = self._clean_agent_result(task.get("result", ""))
             if result:
-                yield {"type": "delta", "agent_id": task["agent_id"], "text": result}
-                yield {"type": "agent_completed", "agent_id": task["agent_id"]}
+                yield {
+                    "type": "delta",
+                    "agent_id": task["agent_id"],
+                    "task_id": task["task_id"],
+                    "text": result,
+                }
+                yield {
+                    "type": "agent_completed",
+                    "agent_id": task["agent_id"],
+                    "task_id": task["task_id"],
+                }
             elif task.get("notification_status") == "completed":
                 summary = self._clean_agent_result(task.get("notification_summary", ""))
                 if summary:
-                    yield {"type": "delta", "agent_id": task["agent_id"], "text": summary}
-                yield {"type": "agent_completed", "agent_id": task["agent_id"]}
+                    yield {
+                        "type": "delta",
+                        "agent_id": task["agent_id"],
+                        "task_id": task["task_id"],
+                        "text": summary,
+                    }
+                yield {
+                    "type": "agent_completed",
+                    "agent_id": task["agent_id"],
+                    "task_id": task["task_id"],
+                }
             else:
                 yield {
                     "type": "agent_failed",
                     "agent_id": task["agent_id"],
                     "agent_label": task["agent_label"],
+                    "task_id": task["task_id"],
                     "message": "The native subagent ended without a result.",
                 }
+
+        if active_run.get("cancel_requested"):
+            if lead_started:
+                yield {
+                    "type": "agent_cancelled",
+                    "agent_id": agent["agent_id"],
+                    "agent_label": agent["title"],
+                    "task_id": lead_task_id,
+                    "message": "Stopped by user.",
+                }
+            yield {"type": "session_cancelled", "run_id": run_id}
+            if run_id:
+                with self._run_lock:
+                    self._active_runs.pop(run_id, None)
+            return
 
         if final_result and not lead_text and not result_is_error:
             if not lead_started:
@@ -314,8 +488,14 @@ class CliOrchestrator:
                     "type": "agent_started",
                     "agent_id": agent["agent_id"],
                     "agent_label": agent["title"],
+                    "task_id": lead_task_id,
                 }
-            yield {"type": "delta", "agent_id": agent["agent_id"], "text": final_result}
+            yield {
+                "type": "delta",
+                "agent_id": agent["agent_id"],
+                "task_id": lead_task_id,
+                "text": final_result,
+            }
             lead_started = True
 
         if result_seen and result_is_error:
@@ -324,12 +504,23 @@ class CliOrchestrator:
         elif result_seen and lead_started:
             # Claude's structured result is authoritative. SessionEnd hooks may
             # exit non-zero after a successful response and must not replace it.
-            yield {"type": "agent_completed", "agent_id": agent["agent_id"]}
+            yield {
+                "type": "agent_completed",
+                "agent_id": agent["agent_id"],
+                "task_id": lead_task_id,
+            }
         elif return_code == 0 and lead_started:
-            yield {"type": "agent_completed", "agent_id": agent["agent_id"]}
+            yield {
+                "type": "agent_completed",
+                "agent_id": agent["agent_id"],
+                "task_id": lead_task_id,
+            }
         elif return_code != 0:
             detail = final_result or " ".join(diagnostics) or f"exited with status {return_code}"
             yield self._stream_failure(agent, detail)
+        if run_id:
+            with self._run_lock:
+                self._active_runs.pop(run_id, None)
 
     def _resolve_backend(self, preference: str) -> tuple[str | None, str | None]:
         if preference in {"", "auto"}:
@@ -390,6 +581,18 @@ class CliOrchestrator:
             "--no-session-persistence",
         ]
 
+    def _start_claude_process(self, command: list[str]) -> subprocess.Popen[str]:
+        return subprocess.Popen(
+            command,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            cwd=self.project_root,
+            bufsize=1,
+            start_new_session=True,
+        )
+
     def _compose_native_prompt(
         self,
         chat: dict[str, Any],
@@ -429,6 +632,63 @@ class CliOrchestrator:
                 task_input.get("run_in_background") or task_input.get("background")
             ),
         }
+
+    @staticmethod
+    def _terminate_process_tree(process: subprocess.Popen[str]) -> None:
+        if process.poll() is not None:
+            return
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError, OSError):
+            try:
+                process.terminate()
+            except OSError:
+                pass
+        try:
+            process.wait(timeout=2)
+            return
+        except (subprocess.TimeoutExpired, OSError):
+            pass
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError, OSError):
+            try:
+                process.kill()
+            except OSError:
+                pass
+
+    @staticmethod
+    def _send_task_stop(active_run: dict[str, Any], task: dict[str, Any]) -> bool:
+        native_task_id = str(task.get("native_task_id") or "")
+        stdin = active_run.get("stdin")
+        if not native_task_id or task.get("stop_sent") or stdin is None or stdin.closed:
+            return False
+        control = (
+            "<agent-slack-control action=\"stop-task\" "
+            f"task-id=\"{native_task_id}\">"
+            "Immediately call the native TaskStop tool for this task only. "
+            "Do not stop sibling tasks. Do not wait for the task before applying this control."
+            "</agent-slack-control>"
+        )
+        frame = {
+            "type": "user",
+            "message": {"role": "user", "content": control},
+            "parent_tool_use_id": None,
+            "session_id": "",
+        }
+        interrupt = {
+            "type": "control_request",
+            "request_id": uuid4().hex,
+            "request": {"subtype": "interrupt"},
+        }
+        try:
+            stdin.write(json.dumps(interrupt) + "\n")
+            stdin.write(json.dumps(frame) + "\n")
+            stdin.flush()
+        except (BrokenPipeError, OSError, ValueError):
+            return False
+        task["stop_sent"] = True
+        return True
 
     @staticmethod
     def _is_background_launch_receipt(value: str) -> bool:

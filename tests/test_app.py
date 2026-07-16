@@ -154,3 +154,54 @@ def test_native_failure_is_persisted_and_marks_meeting(tmp_path: Path, monkeypat
     assert updated["meetings"][-1]["status"] == "completed_with_errors"
     assert updated["meetings"][-1]["failed_agent_ids"] == ["coordinator"]
     assert updated["messages"][-1]["metadata"]["source"] == "native_agent_error"
+
+
+def test_cancelled_native_agent_is_persisted_without_marking_failure(
+    tmp_path: Path, monkeypatch
+) -> None:
+    app = _app(tmp_path, monkeypatch)
+
+    def stream(**_kwargs):
+        yield {
+            "type": "agent_started",
+            "agent_id": "reviewer",
+            "agent_label": "Review Agent",
+            "task_id": "task-reviewer",
+        }
+        yield {
+            "type": "agent_cancelled",
+            "agent_id": "reviewer",
+            "agent_label": "Review Agent",
+            "task_id": "task-reviewer",
+            "message": "Stopped by user.",
+        }
+        yield {"type": "session_cancelled"}
+
+    app.orchestrator.stream_agent_reply = stream
+    direct = app.create_chat("Coordinator", ["coordinator"], kind="direct")
+    events = list(app.stream_run(
+        direct["chat_id"],
+        mode="auto_meeting",
+        lead_agent_id="coordinator",
+        objective="Review the release",
+    ))
+
+    created = events[0]
+    saved = app.get_chat(created["chat_id"])
+    cancelled = next(message for message in saved["messages"] if message["author_id"] == "reviewer")
+    assert cancelled["body"] == "Stopped by user."
+    assert cancelled["metadata"]["status"] == "cancelled"
+    assert cancelled["metadata"]["source"] == "native_agent_cancelled"
+    assert saved["meetings"][-1]["status"] == "cancelled"
+    assert events[-1]["type"] == "run_cancelled"
+
+
+def test_reload_keeps_orchestrator_that_owns_an_active_run(tmp_path: Path, monkeypatch) -> None:
+    app = _app(tmp_path, monkeypatch)
+    original = app.orchestrator
+    original.prepare_run("run-1")
+
+    app.reload_host_configuration()
+
+    assert app.orchestrator is original
+    assert app.orchestrator.has_active_runs is True

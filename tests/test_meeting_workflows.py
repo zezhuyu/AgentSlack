@@ -251,7 +251,46 @@ def test_versioned_api_exposes_mobile_contract_and_preserves_legacy_routes(tmp_p
         assert document["base_path"] == "/api/v1"
         assert openapi["openapi"] == "3.1.0"
         assert "/chats/{chat_id}/run-stream" in openapi["paths"]
+        assert "/runs/{run_id}/cancel" in openapi["paths"]
+        assert "/runs/{run_id}/tasks/{task_id}/cancel" in openapi["paths"]
         assert versioned_agents == legacy_agents
+
+
+def test_run_and_task_cancellation_endpoints_delegate_to_active_app(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setenv("AGENT_SLACK_CLI", "offline")
+    with _running_server(tmp_path) as (base_url, server_id):
+        app = _Handler.manager.active_app()
+        calls = []
+        app.cancel_run = lambda run_id: calls.append(("run", run_id)) or {
+            "accepted": True,
+            "run_id": run_id,
+            "status": "stopping",
+        }
+        app.cancel_task = lambda run_id, task_id: calls.append(("task", run_id, task_id)) or {
+            "accepted": True,
+            "run_id": run_id,
+            "task_id": task_id,
+            "status": "stopping",
+        }
+
+        run_result = _request(
+            base_url,
+            server_id,
+            "/api/v1/runs/run-1/cancel",
+            {},
+        )
+        task_result = _request(
+            base_url,
+            server_id,
+            "/api/v1/runs/run-1/tasks/task-2/cancel",
+            {},
+        )
+
+        assert run_result["accepted"] is True
+        assert task_result["task_id"] == "task-2"
+        assert calls == [("run", "run-1"), ("task", "run-1", "task-2")]
 
 
 def test_versioned_mobile_chat_and_stream_workflow(tmp_path: Path, monkeypatch) -> None:
