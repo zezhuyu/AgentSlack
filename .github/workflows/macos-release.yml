@@ -1,0 +1,129 @@
+name: Build and release macOS app
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+
+concurrency:
+  group: macos-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Apple Silicon
+            runner: macos-15
+            electron_arch: arm64
+            backend_arch: arm64
+            artifact_arch: arm64
+          - name: Intel
+            runner: macos-15-intel
+            electron_arch: x64
+            backend_arch: x86_64
+            artifact_arch: x64
+    runs-on: ${{ matrix.runner }}
+    defaults:
+      run:
+        working-directory: macos
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: macos/requirements-build.txt
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: macos/package-lock.json
+
+      - name: Install build dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-build.txt
+          npm ci
+
+      - name: Build native backend
+        env:
+          AGENT_SLACK_BUILD_PYTHON: python
+          AGENT_SLACK_BUILD_ARCH: ${{ matrix.backend_arch }}
+        run: npm run backend
+
+      - name: Build ad-hoc-signed DMG
+        run: npx electron-builder --mac dmg --${{ matrix.electron_arch }} --config.mac.identity=-
+
+      - name: Verify signing and package
+        shell: bash
+        run: |
+          set -euo pipefail
+          app_path=$(find dist -maxdepth 3 -type d -name 'Agent Slack.app' -print -quit)
+          dmg_path=$(find dist -maxdepth 1 -type f -name '*.dmg' -print -quit)
+          test -n "$app_path"
+          test -n "$dmg_path"
+          codesign --verify --deep --strict --verbose=2 "$app_path"
+          codesign_details=$(codesign --display --verbose=4 "$app_path" 2>&1)
+          grep -q 'Signature=adhoc' <<<"$codesign_details"
+          hdiutil verify "$dmg_path"
+          mv "$dmg_path" "dist/Agent-Slack-${{ matrix.artifact_arch }}.dmg"
+
+      - name: Upload DMG
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent-slack-macos-${{ matrix.artifact_arch }}
+          path: macos/dist/Agent-Slack-${{ matrix.artifact_arch }}.dmg
+          if-no-files-found: error
+          retention-days: 30
+
+  release:
+    name: Create GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_TAG: agent-slack-main-${{ github.run_number }}
+
+    steps:
+      - name: Download macOS artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: agent-slack-macos-*
+          path: release
+          merge-multiple: true
+
+      - name: Create or update release
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          artifacts=(release/*.dmg)
+          if (( ${#artifacts[@]} != 2 )); then
+            echo "Expected two DMG files, found ${#artifacts[@]}" >&2
+            exit 1
+          fi
+
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" "${artifacts[@]}" \
+              --repo "$GITHUB_REPOSITORY" \
+              --clobber
+          else
+            gh release create "$RELEASE_TAG" "${artifacts[@]}" \
+              --repo "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" \
+              --title "Agent Slack main build #${GITHUB_RUN_NUMBER}" \
+              --notes "Automated ad-hoc-signed macOS build from commit ${GITHUB_SHA}. Includes Apple Silicon and Intel DMGs."
+          fi

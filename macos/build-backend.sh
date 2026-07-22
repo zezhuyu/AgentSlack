@@ -10,12 +10,13 @@ elif [ -x "$BACKEND_ROOT/../../.venv/bin/python" ]; then
 else
   PYTHON=python3
 fi
+TARGET_ARCHITECTURE=${AGENT_SLACK_BUILD_ARCH:-universal2}
 
 "$PYTHON" -m PyInstaller \
   --noconfirm \
   --clean \
   --onefile \
-  --target-architecture universal2 \
+  --target-architecture "$TARGET_ARCHITECTURE" \
   --name agent-slack-backend \
   --distpath "$SCRIPT_DIR/backend" \
   --workpath "$SCRIPT_DIR/build/backend" \
