@@ -17,5 +17,30 @@
     return Boolean(summary && summary.updated_at && summary.updated_at !== renderedUpdatedAt);
   }
 
-  return { chatListSignature, shouldRefreshChat };
+  function activeRunForChat(runs, chatId) {
+    return (runs || []).find((run) => run.chat_id === chatId && run.status === "running") || null;
+  }
+
+  function connectionLostMessage(error) {
+    const detail = error?.message ? ` (${error.message})` : "";
+    return `The live connection was lost${detail}. The agent continues in the background; status will reconnect automatically.`;
+  }
+
+  function streamErrorMessage(error) {
+    if (error?.agentRunFailure) return `Agent run failed: ${error.message || "unknown error"}`;
+    return connectionLostMessage(error);
+  }
+
+  function visibleMessages(messages) {
+    return (messages || []).filter((message) => message.author_type !== "system");
+  }
+
+  return {
+    chatListSignature,
+    shouldRefreshChat,
+    activeRunForChat,
+    connectionLostMessage,
+    streamErrorMessage,
+    visibleMessages,
+  };
 });

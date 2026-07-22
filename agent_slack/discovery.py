@@ -56,8 +56,24 @@ class AgentDiscovery:
                 continue
             seen.add(parsed.agent_id)
             agents.append(parsed)
+        if not agents:
+            agents.append(self._project_fallback())
         agents.sort(key=lambda item: (item.group, item.title.lower()))
         return agents
+
+    def _project_fallback(self) -> AgentProfile:
+        project_name = self.project_root.name or "Project"
+        return AgentProfile(
+            agent_id="project_claude",
+            name="",
+            title=f"{project_name} Claude",
+            summary=f"Claude running directly in the {project_name} project folder.",
+            system_prompt="",
+            source_path=".",
+            group="workspace",
+            kind="project",
+            tools=[],
+        )
 
     def _collect_files(self) -> list[Path]:
         matches: list[Path] = []

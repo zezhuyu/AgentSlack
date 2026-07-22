@@ -13,6 +13,7 @@ const state = {
   currentRunId: null,
   stoppingTaskIds: new Set(),
   syncInProgress: false,
+  streamAttached: false,
   chatListSignature: "",
   streamingRows: new Map(),
   serverDialogMode: "create",
@@ -217,6 +218,7 @@ async function openChat(chatId) {
   state.currentChatId = chatId;
   $("deleteChatBtn").disabled = state.runInProgress;
   renderChat(chat);
+  await restoreActiveRun(chatId);
   await loadChats({ openFirst: false });
   renderChats();
   renderAgents();
@@ -224,7 +226,7 @@ async function openChat(chatId) {
 }
 
 async function syncChatState() {
-  if (!state.activeServerId || state.runInProgress || state.syncInProgress || document.hidden) return;
+  if (!state.activeServerId || state.streamAttached || state.syncInProgress || document.hidden) return;
   const serverId = state.activeServerId;
   state.syncInProgress = true;
   try {
@@ -237,13 +239,14 @@ async function syncChatState() {
       return;
     }
     const summary = state.chats.find((chat) => chat.chat_id === state.currentChatId);
-    if (!chatSync.shouldRefreshChat(summary, state.currentChatUpdatedAt)) return;
-
     const chatId = state.currentChatId;
-    const chat = await api(`/api/chats/${chatId}`);
-    if (serverId === state.activeServerId && chatId === state.currentChatId && !state.runInProgress) {
-      renderChat(chat);
+    if (chatSync.shouldRefreshChat(summary, state.currentChatUpdatedAt)) {
+      const chat = await api(`/api/chats/${chatId}`);
+      if (serverId === state.activeServerId && chatId === state.currentChatId && !state.streamAttached) {
+        renderChat(chat);
+      }
     }
+    await restoreActiveRun(chatId);
   } catch (error) {
     console.warn("Agent Slack background sync failed", error);
   } finally {
@@ -333,8 +336,9 @@ function renderChat(chat) {
   $("chatTitle").textContent = chat.title;
   $("chatMembers").textContent = chat.member_ids.join(", ");
   state.currentChatUpdatedAt = chat.updated_at || null;
+  state.streamingRows.clear();
   messages.innerHTML = "";
-  (chat.messages || []).forEach((message) => {
+  chatSync.visibleMessages(chat.messages).forEach((message) => {
     const row = document.createElement("article");
     row.className = `message ${message.author_type}`;
     row.innerHTML = `
@@ -353,6 +357,7 @@ function renderChat(chat) {
 }
 
 function createStreamingRow(taskId, agentId, agentLabel) {
+  if (state.streamingRows.has(taskId)) return state.streamingRows.get(taskId);
   const row = document.createElement("article");
   row.className = "message agent streaming";
   row.innerHTML = `
@@ -378,6 +383,53 @@ function createStreamingRow(taskId, agentId, agentLabel) {
     rawText: "",
     started: false,
   });
+  return state.streamingRows.get(taskId);
+}
+
+function applyActiveRun(run) {
+  if (!run) {
+    if (state.streamAttached) return;
+    state.streamingRows.forEach((stream) => stream.row.remove());
+    state.streamingRows.clear();
+    state.runInProgress = false;
+    state.currentRunId = null;
+    $("stopRunBtn").hidden = true;
+    $("deleteChatBtn").disabled = !state.currentChatId;
+    $("sendBtn").disabled = false;
+    $("sendBtn").textContent = "Send";
+    return;
+  }
+
+  state.runInProgress = true;
+  state.currentRunId = run.run_id;
+  $("stopRunBtn").hidden = false;
+  $("stopRunBtn").disabled = false;
+  $("stopRunBtn").textContent = "Stop Run";
+  $("deleteChatBtn").disabled = true;
+  $("sendBtn").disabled = true;
+  $("sendBtn").textContent = "Working...";
+
+  const runningTasks = (run.tasks || []).filter((task) => task.status === "running");
+  const runningTaskIds = new Set(runningTasks.map((task) => task.task_id));
+  state.streamingRows.forEach((stream, taskId) => {
+    if (!runningTaskIds.has(taskId)) {
+      stream.row.remove();
+      state.streamingRows.delete(taskId);
+    }
+  });
+  runningTasks.forEach((task) => {
+    const stream = createStreamingRow(task.task_id, task.agent_id, task.agent_label || task.agent_id);
+    stream.rawText = task.text || "";
+    stream.started = Boolean(stream.rawText);
+    if (stream.rawText) stream.body.innerHTML = renderMarkdown(stream.rawText);
+  });
+}
+
+async function restoreActiveRun(chatId) {
+  if (!chatId || state.streamAttached) return;
+  const payload = await api(`/api/runs/active?chat_id=${encodeURIComponent(chatId)}`);
+  if (chatId !== state.currentChatId || state.streamAttached) return;
+  applyActiveRun(chatSync.activeRunForChat(payload.runs, chatId));
 }
 
 async function renderStreamEvent(event) {
@@ -444,7 +496,9 @@ async function renderStreamEvent(event) {
     $("stopRunBtn").disabled = true;
     $("stopRunBtn").textContent = "Stopped";
   } else if (event.type === "error") {
-    throw new Error(event.message || "Agent run failed");
+    const error = new Error(event.message || "Agent run failed");
+    error.agentRunFailure = true;
+    throw error;
   }
 }
 
@@ -491,6 +545,7 @@ async function runChatStream(payload, chatId = state.currentChatId) {
   if (!chatId || state.runInProgress) return;
   let resultChatId = chatId;
   state.runInProgress = true;
+  state.streamAttached = true;
   $("deleteChatBtn").disabled = true;
   $("sendBtn").disabled = true;
   $("sendBtn").textContent = "Working...";
@@ -506,9 +561,10 @@ async function runChatStream(payload, chatId = state.currentChatId) {
       await renderStreamEvent(event);
     });
   } catch (error) {
-    console.error(error);
-    alert(`Agent run failed: ${error.message}`);
+    console.warn("Agent Slack stream detached", error);
+    alert(chatSync.streamErrorMessage(error));
   } finally {
+    state.streamAttached = false;
     state.runInProgress = false;
     state.currentRunId = null;
     state.stoppingTaskIds.clear();
@@ -621,6 +677,8 @@ function openServerSettings() {
   $("serverName").value = server.name;
   $("serverPath").value = server.project_root;
   $("serverPath").disabled = true;
+  $("serverRunner").value = server.runner || "claude";
+  $("serverModel").value = server.model || "";
   $("serverPathLabel").hidden = true;
   $("serverPathPicker").hidden = true;
   $("serverFormError").hidden = true;
@@ -651,17 +709,21 @@ async function submitServer() {
   const projectRoot = $("serverPath").value.trim();
   const name = $("serverName").value.trim();
   const logoPath = $("serverLogoPath").value.trim();
+  const runtime = {
+    runner: $("serverRunner").value,
+    model: $("serverModel").value.trim(),
+  };
   if (state.serverDialogMode === "create" && !projectRoot) return;
   try {
     if (state.serverDialogMode === "edit") {
       await api(`/api/servers/${state.activeServerId}`, {
         method: "PATCH",
-        body: JSON.stringify({ name, logo_path: logoPath || undefined }),
+        body: JSON.stringify({ name, logo_path: logoPath || undefined, ...runtime }),
       });
     } else {
       await api("/api/servers", {
         method: "POST",
-        body: JSON.stringify({ project_root: projectRoot, name, logo_path: logoPath || undefined }),
+        body: JSON.stringify({ project_root: projectRoot, name, logo_path: logoPath || undefined, ...runtime }),
       });
     }
     $("serverDialog").close();

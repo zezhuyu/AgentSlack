@@ -205,3 +205,82 @@ def test_reload_keeps_orchestrator_that_owns_an_active_run(tmp_path: Path, monke
 
     assert app.orchestrator is original
     assert app.orchestrator.has_active_runs is True
+
+
+def test_active_run_state_survives_without_the_streaming_client(tmp_path: Path, monkeypatch) -> None:
+    app = _app(tmp_path, monkeypatch)
+
+    def stream(**_kwargs):
+        yield {
+            "type": "agent_started",
+            "agent_id": "reviewer",
+            "agent_label": "Review Agent",
+            "task_id": "task-reviewer",
+        }
+        yield {
+            "type": "delta",
+            "agent_id": "reviewer",
+            "task_id": "task-reviewer",
+            "text": "Still researching.",
+        }
+        yield {
+            "type": "agent_completed",
+            "agent_id": "reviewer",
+            "task_id": "task-reviewer",
+        }
+
+    app.orchestrator.stream_agent_reply = stream
+    chat = app.create_chat("Coordinator", ["coordinator"], kind="direct")
+    events = app.stream_run(chat["chat_id"], mode="respond", objective="Review this")
+
+    started = next(events)
+    assert started["type"] == "run_started"
+    assert next(events)["type"] == "agent_started"
+    assert next(events)["type"] == "delta"
+
+    active = app.list_active_runs(chat["chat_id"])
+    assert len(active) == 1
+    assert active[0]["run_id"] == started["run_id"]
+    assert active[0]["status"] == "running"
+    assert active[0]["tasks"] == [
+        {
+            "task_id": "task-reviewer",
+            "agent_id": "reviewer",
+            "agent_label": "Review Agent",
+            "status": "running",
+            "text": "Still researching.",
+        }
+    ]
+
+    assert [event["type"] for event in events] == ["agent_completed", "run_completed"]
+    assert app.list_active_runs(chat["chat_id"]) == []
+
+
+def test_plain_project_defaults_to_claude_without_an_agent_manifest(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.delenv("AGENT_SLACK_CLI", raising=False)
+    monkeypatch.setattr("agent_slack.orchestrator.shutil.which", lambda name: f"/bin/{name}")
+    project_root = tmp_path / "plain-project"
+    app_root = tmp_path / "agent-slack"
+    project_root.mkdir()
+    app_root.mkdir()
+
+    app = AgentSlackApp(project_root, app_root)
+
+    assert app.orchestrator.backend == "claude"
+    assert [agent["kind"] for agent in app.list_agents()] == ["project"]
+
+
+def test_chat_summary_excludes_internal_system_messages(tmp_path: Path, monkeypatch) -> None:
+    app = _app(tmp_path, monkeypatch)
+    chat = app.create_chat("Coordinator", ["coordinator"], kind="direct")
+
+    initial = next(item for item in app.list_chats() if item["chat_id"] == chat["chat_id"])
+    assert initial["message_count"] == 0
+    assert initial["last_message_preview"] == ""
+
+    app.add_user_message(chat["chat_id"], "Visible user message")
+    updated = next(item for item in app.list_chats() if item["chat_id"] == chat["chat_id"])
+    assert updated["message_count"] == 1
+    assert updated["last_message_preview"] == "Visible user message"

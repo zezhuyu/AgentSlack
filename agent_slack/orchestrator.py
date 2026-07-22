@@ -17,9 +17,16 @@ from uuid import uuid4
 class CliOrchestrator:
     SUPPORTED_BACKENDS = ("codex", "claude")
 
-    def __init__(self, workspace_name: str, project_root: Path, backend_preference: str = "auto"):
+    def __init__(
+        self,
+        workspace_name: str,
+        project_root: Path,
+        backend_preference: str = "auto",
+        model: str | None = None,
+    ):
         self.workspace_name = workspace_name
         self.project_root = project_root
+        self.model = str(model or "").strip() or None
         self.timeout_seconds = int(os.environ.get("AGENT_SLACK_CLI_TIMEOUT", "180"))
         self._run_lock = threading.RLock()
         self._active_runs: dict[str, dict[str, Any]] = {}
@@ -150,7 +157,7 @@ class CliOrchestrator:
         if run_id:
             self.prepare_run(run_id)
         command = self._claude_stream_command(agent)
-        prompt = self._compose_native_prompt(chat, transcript, objective)
+        prompt = self._compose_native_prompt(agent, chat, transcript, objective)
         initial_frame = json.dumps({
             "type": "user",
             "message": {"role": "user", "content": prompt},
@@ -540,7 +547,7 @@ class CliOrchestrator:
 
     def _command(self) -> list[str]:
         if self.backend == "codex":
-            return [
+            command = [
                 str(self.executable),
                 "exec",
                 "--ephemeral",
@@ -551,9 +558,12 @@ class CliOrchestrator:
                 "never",
                 "--cd",
                 str(self.project_root),
-                "-",
             ]
-        return [
+            if self.model:
+                command.extend(["--model", self.model])
+            command.append("-")
+            return command
+        command = [
             str(self.executable),
             "--print",
             "--output-format",
@@ -562,13 +572,23 @@ class CliOrchestrator:
             "dontAsk",
             "--no-session-persistence",
         ]
+        if self.model:
+            command.extend(["--model", self.model])
+        return command
 
     def _claude_stream_command(self, agent: dict[str, Any]) -> list[str]:
-        return [
+        command = [
             str(self.executable),
             "--print",
-            "--agent",
-            str(agent.get("name") or agent.get("agent_id")),
+        ]
+        if agent.get("kind") != "project":
+            command.extend([
+                "--agent",
+                str(agent.get("name") or agent.get("agent_id")),
+            ])
+        if self.model:
+            command.extend(["--model", self.model])
+        command.extend([
             "--output-format",
             "stream-json",
             "--input-format",
@@ -579,7 +599,8 @@ class CliOrchestrator:
             "--permission-mode",
             "dontAsk",
             "--no-session-persistence",
-        ]
+        ])
+        return command
 
     def _start_claude_process(self, command: list[str]) -> subprocess.Popen[str]:
         return subprocess.Popen(
@@ -595,6 +616,7 @@ class CliOrchestrator:
 
     def _compose_native_prompt(
         self,
+        agent: dict[str, Any],
         chat: dict[str, Any],
         transcript: list[dict[str, Any]],
         objective: str | None,
@@ -604,14 +626,21 @@ class CliOrchestrator:
             f"[{item.get('author_label', item.get('author_id', 'unknown'))}] {item.get('body', '').strip()}"
             for item in recent
         )
-        return (
-            f"Agent Slack conversation: {chat.get('title')}\n"
-            f"Objective: {objective or 'Respond to the latest user message.'}\n\n"
-            f"Recent transcript:\n{transcript_text}\n\n"
+        direct_instruction = (
+            "Handle this request directly in the project root using the project's own instructions and tools. "
+            "No Agent Slack subagent roster is configured for this folder. "
+            if agent.get("kind") == "project"
+            else
             "Continue using your host-defined role, tools, workflows, and agent system. "
             "When your workflow delegates to background subagents, wait for every required result and "
             "retrieve each complete result through the host's native task-result tools before the final "
             "synthesis so the client can relay each specialist response. "
+        )
+        return (
+            f"Agent Slack conversation: {chat.get('title')}\n"
+            f"Objective: {objective or 'Respond to the latest user message.'}\n\n"
+            f"Recent transcript:\n{transcript_text}\n\n"
+            f"{direct_instruction}"
             "Return the final user-facing answer as Slack-ready Markdown."
         )
 

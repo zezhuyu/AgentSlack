@@ -37,3 +37,20 @@ test("active runs and individual agent rows expose stop controls", () => {
   assert.match(appSource, /event\.type === "agent_cancelled"/);
   assert.match(styles, /:not\(#stopRunBtn\)/);
 });
+
+test("user messages are aligned on the right", () => {
+  assert.match(styles, /\.message\.user\s*\{[\s\S]*?grid-template-columns:\s*minmax\(0,\s*1fr\)\s+44px/);
+  assert.match(styles, /\.message\.user \.message-avatar\s*\{[\s\S]*?grid-column:\s*2/);
+  assert.match(styles, /\.message\.user \.message-body\s*\{[\s\S]*?justify-self:\s*end/);
+  assert.match(styles, /\.message\.user \.message-body header\s*\{[\s\S]*?justify-content:\s*flex-end/);
+});
+
+test("plain projects can choose a CLI provider and model without API keys", () => {
+  assert.match(html, /id="serverRunner"/);
+  assert.match(html, /value="claude"[^>]*>Claude Code CLI/);
+  assert.match(html, /value="codex"[^>]*>OpenAI Codex CLI/);
+  assert.match(html, /id="serverModel"/);
+  assert.doesNotMatch(html, /api[ -]?key/i);
+  assert.match(appSource, /runner:\s*\$\("serverRunner"\)\.value/);
+  assert.match(appSource, /model:\s*\$\("serverModel"\)\.value\.trim\(\)/);
+});

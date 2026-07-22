@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from collections import Counter
 from collections.abc import Iterator
+from copy import deepcopy
 from pathlib import Path
+from threading import RLock
 from typing import Any
 from uuid import uuid4
 
@@ -13,7 +15,14 @@ from .storage import AgentSlackStorage, utc_now
 
 
 class AgentSlackApp:
-    def __init__(self, project_root: Path, app_root: Path, data_root: Path | None = None):
+    def __init__(
+        self,
+        project_root: Path,
+        app_root: Path,
+        data_root: Path | None = None,
+        runner_override: str | None = None,
+        model_override: str | None = None,
+    ):
         self.project_root = project_root
         self.app_root = app_root
         self.data_root = data_root or self.app_root / "data"
@@ -21,6 +30,10 @@ class AgentSlackApp:
         self.discovery = AgentDiscovery(project_root)
         self.storage = AgentSlackStorage(self.data_root)
         self.workspace_name = self.project_root.name
+        self.runner_override = str(runner_override or "").strip().casefold() or None
+        self.model_override = str(model_override or "").strip() or None
+        self._run_state_lock = RLock()
+        self._active_run_states: dict[str, dict[str, Any]] = {}
         self.reload_host_configuration()
         self.bootstrap()
 
@@ -28,11 +41,24 @@ class AgentSlackApp:
         self.architecture = AgentSystemArchitecture.load(self.project_root)
         if hasattr(self, "orchestrator") and self.orchestrator.has_active_runs:
             return
+        discovered = self.discovery.discover()
+        project_fallback = len(discovered) == 1 and discovered[0].kind == "project"
+        runner = (
+            self.runner_override or "claude"
+            if project_fallback and self.architecture.runner == "auto"
+            else self.architecture.runner
+        )
         self.orchestrator = CliOrchestrator(
             self.workspace_name,
             self.project_root,
-            backend_preference=self.architecture.runner,
+            backend_preference=runner,
+            model=self.model_override if project_fallback else None,
         )
+
+    def configure_runtime(self, runner: str | None, model: str | None) -> None:
+        self.runner_override = str(runner or "").strip().casefold() or None
+        self.model_override = str(model or "").strip() or None
+        self.reload_host_configuration()
 
     def bootstrap(self) -> None:
         if not self.storage.load_agents():
@@ -59,7 +85,11 @@ class AgentSlackApp:
         agents = {agent["agent_id"]: agent for agent in self.list_agents()}
         summaries = []
         for chat in chats:
-            messages = chat.get("messages", [])
+            messages = [
+                message
+                for message in chat.get("messages", [])
+                if message.get("author_type") != "system"
+            ]
             last = messages[-1] if messages else None
             summaries.append(
                 {
@@ -77,6 +107,77 @@ class AgentSlackApp:
 
     def get_chat(self, chat_id: str) -> dict[str, Any] | None:
         return self.storage.get_chat(chat_id)
+
+    def list_active_runs(self, chat_id: str | None = None) -> list[dict[str, Any]]:
+        """Return reconnect-safe UI state without exposing runner internals."""
+        with self._run_state_lock:
+            runs = [
+                deepcopy(run)
+                for run in self._active_run_states.values()
+                if chat_id is None or run["chat_id"] == chat_id
+            ]
+        for run in runs:
+            run["tasks"] = list(run["tasks"].values())
+        return runs
+
+    def _begin_run_state(
+        self,
+        run_id: str,
+        chat_id: str,
+        mode: str,
+        lead_agent_id: str,
+    ) -> None:
+        with self._run_state_lock:
+            self._active_run_states[run_id] = {
+                "run_id": run_id,
+                "chat_id": chat_id,
+                "mode": mode,
+                "lead_agent_id": lead_agent_id,
+                "status": "running",
+                "started_at": utc_now(),
+                "tasks": {},
+            }
+
+    def _update_run_task(
+        self,
+        run_id: str,
+        task_id: str,
+        agent_id: str,
+        agent_label: str,
+        *,
+        status: str | None = None,
+        text_delta: str = "",
+        text: str | None = None,
+    ) -> None:
+        with self._run_state_lock:
+            run = self._active_run_states.get(run_id)
+            if not run:
+                return
+            task = run["tasks"].setdefault(
+                task_id,
+                {
+                    "task_id": task_id,
+                    "agent_id": agent_id,
+                    "agent_label": agent_label,
+                    "status": "running",
+                    "text": "",
+                },
+            )
+            if agent_label:
+                task["agent_label"] = agent_label
+            if status:
+                task["status"] = status
+            if text is not None:
+                task["text"] = text
+            elif text_delta:
+                task["text"] += text_delta
+
+    def _run_events(self, run_id: str, events: Iterator[dict[str, Any]]) -> Iterator[dict[str, Any]]:
+        try:
+            yield from events
+        finally:
+            with self._run_state_lock:
+                self._active_run_states.pop(run_id, None)
 
     def delete_chat(self, chat_id: str) -> dict[str, Any]:
         chat = self.storage.get_chat(chat_id)
@@ -194,6 +295,7 @@ class AgentSlackApp:
 
         run_id = uuid4().hex
         self.orchestrator.prepare_run(run_id)
+        self._begin_run_state(run_id, run_chat_id, mode, run_agent_id)
         yield {
             "type": "run_started",
             "run_id": run_id,
@@ -214,7 +316,7 @@ class AgentSlackApp:
             objective=objective,
             run_id=run_id,
         )
-        for event in native_events:
+        for event in self._run_events(run_id, native_events):
             if event["type"] == "session_cancelled":
                 run_cancelled = True
                 continue
@@ -231,8 +333,23 @@ class AgentSlackApp:
                 labels[agent_id] = registered_label or str(event.get("agent_label") or agent_id)
                 event = {**event, "agent_label": labels[agent_id]}
                 buffers.setdefault(task_id, "")
+                self._update_run_task(
+                    run_id,
+                    task_id,
+                    agent_id,
+                    labels[agent_id],
+                    status="running",
+                )
             elif event["type"] == "delta":
-                buffers[task_id] = buffers.get(task_id, "") + str(event.get("text") or "")
+                delta = str(event.get("text") or "")
+                buffers[task_id] = buffers.get(task_id, "") + delta
+                self._update_run_task(
+                    run_id,
+                    task_id,
+                    agent_id,
+                    registered_label or labels.get(agent_id) or str(event.get("agent_label") or agent_id),
+                    text_delta=delta,
+                )
             elif event["type"] in {"agent_completed", "agent_failed", "agent_cancelled"}:
                 failed = event["type"] == "agent_failed"
                 cancelled = event["type"] == "agent_cancelled"
@@ -252,6 +369,14 @@ class AgentSlackApp:
                     failed_agent_ids.append(agent_id)
                 if cancelled:
                     cancelled_agent_ids.append(agent_id)
+                self._update_run_task(
+                    run_id,
+                    task_id,
+                    agent_id,
+                    label,
+                    status="failed" if failed else "cancelled" if cancelled else "completed",
+                    text=body,
+                )
                 if body:
                     chat = self.storage.append_message(
                         run_chat_id,

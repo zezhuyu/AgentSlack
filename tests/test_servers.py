@@ -114,3 +114,41 @@ def test_initial_server_reuses_legacy_storage(tmp_path: Path) -> None:
     assert server_id is not None
     assert manager._registry["servers"][0]["storage_key"] == "legacy"
     assert manager.active_app().data_root == data_root
+
+
+def test_plain_project_folder_can_be_added_without_agent_directories(tmp_path: Path) -> None:
+    app_root = tmp_path / "app"
+    project_root = tmp_path / "plain-project"
+    (app_root / "static").mkdir(parents=True)
+    project_root.mkdir()
+    manager = AgentServerManager(app_root=app_root, data_root=tmp_path / "data")
+
+    server = manager.add_server(project_root)
+
+    assert server["project_root"] == str(project_root)
+    assert [agent["agent_id"] for agent in manager.active_app().list_agents()] == [
+        "project_claude"
+    ]
+
+
+def test_plain_project_persists_selected_cli_provider_and_model(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.delenv("AGENT_SLACK_CLI", raising=False)
+    monkeypatch.setattr("agent_slack.orchestrator.shutil.which", lambda name: f"/bin/{name}")
+    app_root = tmp_path / "app"
+    project_root = tmp_path / "plain-project"
+    (app_root / "static").mkdir(parents=True)
+    project_root.mkdir()
+    manager = AgentServerManager(app_root=app_root, data_root=tmp_path / "data")
+
+    server = manager.add_server(project_root, runner="codex", model="gpt-custom")
+
+    assert server["runner"] == "codex"
+    assert server["model"] == "gpt-custom"
+    assert manager.active_app().orchestrator.backend == "codex"
+    assert manager.active_app().orchestrator.model == "gpt-custom"
+
+    updated = manager.update_server(server["server_id"], runner="claude", model="claude-custom")
+    assert updated["runner"] == "claude"
+    assert updated["model"] == "claude-custom"
+    assert manager.active_app().orchestrator.backend == "claude"
+    assert manager.active_app().orchestrator.model == "claude-custom"

@@ -99,13 +99,22 @@
     <dialog id="serverDialog">
       <form method="dialog" id="serverForm">
         <h3 id="serverDialogTitle">Add Agent System</h3>
-        <p class="dialog-help">Choose the root folder containing the agent definitions for this server.</p>
+        <p class="dialog-help">Choose any project root. If it has no agent definitions, Agent Slack runs the selected CLI directly in that folder.</p>
         <label>Server name <input id="serverName" placeholder="Optional; folder name is used by default" /></label>
         <label id="serverPathLabel">Agent system folder</label>
         <div id="serverPathPicker" class="folder-picker">
           <input id="serverPath" required placeholder="/Users/you/projects/agent-system" />
           <button id="browseServerPathBtn" type="button">Browse</button>
         </div>
+        <label>Plain-project provider
+          <select id="serverRunner">
+            <option value="claude">Claude Code CLI</option>
+            <option value="codex">OpenAI Codex CLI</option>
+          </select>
+        </label>
+        <label>Model <span class="label-note">optional; passed to the selected CLI</span>
+          <input id="serverModel" placeholder="Use the CLI default model" />
+        </label>
         <label>Server logo <span class="label-note">optional</span></label>
         <div class="folder-picker">
           <input id="serverLogoPath" placeholder="PNG, JPEG, WebP, or GIF" />

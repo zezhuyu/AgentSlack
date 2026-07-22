@@ -100,6 +100,43 @@ def test_host_runner_preference_is_used_without_environment_override(tmp_path: P
     assert orchestrator.executable == "/bin/claude"
 
 
+def test_plain_project_claude_command_omits_named_agent_selection(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("AGENT_SLACK_CLI", "claude")
+    monkeypatch.setattr("agent_slack.orchestrator.shutil.which", lambda _name: "/bin/claude")
+    orchestrator = CliOrchestrator("PlainProject", tmp_path)
+    agent = {
+        "agent_id": "project_claude",
+        "name": "",
+        "title": "PlainProject Claude",
+        "kind": "project",
+    }
+
+    command = orchestrator._claude_stream_command(agent)
+    prompt = orchestrator._compose_native_prompt(
+        agent,
+        {"title": "PlainProject", "kind": "direct"},
+        [{"author_label": "You", "body": "Inspect the project"}],
+        "Inspect the project",
+    )
+
+    assert "--agent" not in command
+    assert "Handle this request directly in the project root" in prompt
+    assert "wait for every required result" not in prompt
+
+
+def test_selected_models_are_forwarded_to_both_cli_providers(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr("agent_slack.orchestrator.shutil.which", lambda name: f"/bin/{name}")
+    agent = {"agent_id": "project_claude", "name": "", "kind": "project"}
+
+    claude = CliOrchestrator("PlainProject", tmp_path, backend_preference="claude", model="claude-custom")
+    codex = CliOrchestrator("PlainProject", tmp_path, backend_preference="codex", model="gpt-custom")
+
+    claude_command = claude._claude_stream_command(agent)
+    assert claude_command[claude_command.index("--model") + 1] == "claude-custom"
+    codex_command = codex._command()
+    assert codex_command[codex_command.index("--model") + 1] == "gpt-custom"
+
+
 def test_claude_stream_relays_native_task_results_and_final_answer(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv("AGENT_SLACK_CLI", "claude")
     monkeypatch.setattr("agent_slack.orchestrator.shutil.which", lambda _name: "/bin/claude")

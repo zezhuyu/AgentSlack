@@ -39,6 +39,8 @@ class AgentServerManager:
                 "name": item["name"],
                 "project_root": item["project_root"],
                 "project_name": Path(item["project_root"]).name or item["name"],
+                "runner": item.get("runner") or "claude",
+                "model": item.get("model") or "",
                 "available": Path(item["project_root"]).is_dir(),
                 "active": item["server_id"] == active_id,
                 "logo_url": (
@@ -54,10 +56,13 @@ class AgentServerManager:
         project_root: Path,
         name: str | None = None,
         logo_path: Path | None = None,
+        runner: str | None = None,
+        model: str | None = None,
     ) -> dict[str, Any]:
         root = project_root.expanduser().resolve()
         if not root.is_dir():
             raise ValueError(f"Agent system folder does not exist: {root}")
+        selected_runner = self._validate_runner(runner) if runner is not None else None
         with self._lock:
             existing = next(
                 (item for item in self._registry["servers"] if Path(item["project_root"]) == root),
@@ -71,10 +76,20 @@ class AgentServerManager:
                     "project_root": str(root),
                     "storage_key": server_id,
                     "created_at": utc_now(),
+                    "runner": selected_runner or "claude",
+                    "model": str(model or "").strip(),
                 }
                 self._registry["servers"].append(existing)
             elif name and name.strip():
                 existing["name"] = name.strip()
+            if selected_runner is not None:
+                existing["runner"] = selected_runner
+            else:
+                existing.setdefault("runner", "claude")
+            if model is not None:
+                existing["model"] = str(model).strip()
+            else:
+                existing.setdefault("model", "")
             self._registry["active_server_id"] = existing["server_id"]
             if logo_path is not None:
                 self._store_logo(existing, logo_path)
@@ -87,6 +102,8 @@ class AgentServerManager:
         server_id: str,
         name: str | None = None,
         logo_path: Path | None = None,
+        runner: str | None = None,
+        model: str | None = None,
     ) -> dict[str, Any]:
         with self._lock:
             item = self._find(server_id)
@@ -96,7 +113,14 @@ class AgentServerManager:
                 item["name"] = name.strip()
             if logo_path is not None:
                 self._store_logo(item, logo_path)
+            if runner is not None:
+                item["runner"] = self._validate_runner(runner)
+            if model is not None:
+                item["model"] = str(model).strip()
             self._save_registry()
+            app = self._apps.get(server_id)
+            if app is not None:
+                app.configure_runtime(item.get("runner"), item.get("model"))
             return next(server for server in self.list_servers() if server["server_id"] == server_id)
 
     def logo_path(self, server_id: str) -> Path | None:
@@ -184,6 +208,8 @@ class AgentServerManager:
                 project_root=root,
                 app_root=self.app_root,
                 data_root=server_data_root,
+                runner_override=item.get("runner"),
+                model_override=item.get("model"),
             )
         elif refresh:
             self._apps[server_id].reload_host_configuration()
@@ -192,6 +218,13 @@ class AgentServerManager:
 
     def _find(self, server_id: str) -> dict[str, Any] | None:
         return next((item for item in self._registry["servers"] if item["server_id"] == server_id), None)
+
+    @staticmethod
+    def _validate_runner(value: str) -> str:
+        runner = str(value or "").strip().casefold()
+        if runner not in {"claude", "codex"}:
+            raise ValueError("Runner must be 'claude' or 'codex'")
+        return runner
 
     def _has_legacy_data(self) -> bool:
         return (self.data_root / "agents.json").exists() or (self.data_root / "chats").is_dir()

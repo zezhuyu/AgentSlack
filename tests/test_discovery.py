@@ -34,7 +34,22 @@ def test_ignores_subagent_bundle_readme(tmp_path: Path) -> None:
     readme.parent.mkdir(parents=True)
     readme.write_text("# reviewer subagent bundle\n\nBundle docs only.\n", encoding="utf-8")
     agents = AgentDiscovery(tmp_path).discover()
-    assert agents == []
+    assert len(agents) == 1
+    assert agents[0].kind == "project"
+    assert agents[0].source_path == "."
+
+
+def test_plain_project_folder_gets_one_direct_claude_profile(tmp_path: Path) -> None:
+    (tmp_path / "README.md").write_text("# Plain project\n", encoding="utf-8")
+
+    agents = AgentDiscovery(tmp_path).discover()
+
+    assert len(agents) == 1
+    assert agents[0].agent_id == "project_claude"
+    assert agents[0].name == ""
+    assert agents[0].title == f"{tmp_path.name} Claude"
+    assert agents[0].kind == "project"
+    assert agents[0].source_path == "."
 
 
 def test_uses_agent_identity_when_first_heading_is_generic(tmp_path: Path) -> None:

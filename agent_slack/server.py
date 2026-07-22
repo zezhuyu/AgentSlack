@@ -6,7 +6,7 @@ import re
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 from .servers import AgentServerManager
 
@@ -68,6 +68,9 @@ def _openapi_document() -> dict:
                 "summary": "Run agents and stream NDJSON events",
                 "responses": {"200": {"description": "NDJSON event stream"}},
             }
+        },
+        "/runs/active": {
+            "get": {"summary": "List active runs and tasks for reconnecting clients"},
         },
         "/runs/{run_id}/cancel": {
             "post": {"summary": "Stop an active agent-system run"},
@@ -164,6 +167,9 @@ class _Handler(BaseHTTPRequestHandler):
             return self._json({"agents": app.list_agents()})
         if path == "/api/chats":
             return self._json({"chats": app.list_chats()})
+        if path == "/api/runs/active":
+            chat_id = (parse_qs(parsed.query).get("chat_id") or [None])[0]
+            return self._json({"runs": app.list_active_runs(chat_id)})
         match = re.fullmatch(r"/api/chats/([^/]+)", path)
         if match:
             chat = app.get_chat(match.group(1))
@@ -182,9 +188,11 @@ class _Handler(BaseHTTPRequestHandler):
                 return self._json({"error": "project_root is required"}, status=400)
             try:
                 server = self.manager.add_server(
-                    Path(project_root),
-                    name=str(payload.get("name") or "") or None,
-                    logo_path=(Path(str(payload["logo_path"])) if payload.get("logo_path") else None),
+                Path(project_root),
+                name=str(payload.get("name") or "") or None,
+                logo_path=(Path(str(payload["logo_path"])) if payload.get("logo_path") else None),
+                runner=(str(payload["runner"]) if "runner" in payload else None),
+                model=(str(payload["model"]) if "model" in payload else None),
                 )
             except ValueError as exc:
                 return self._json({"error": str(exc)}, status=400)
@@ -292,6 +300,8 @@ class _Handler(BaseHTTPRequestHandler):
                 match.group(1),
                 name=(str(payload["name"]) if "name" in payload else None),
                 logo_path=(Path(str(payload["logo_path"])) if payload.get("logo_path") else None),
+                runner=(str(payload["runner"]) if "runner" in payload else None),
+                model=(str(payload["model"]) if "model" in payload else None),
             )
         except KeyError as exc:
             return self._json({"error": str(exc)}, status=404)

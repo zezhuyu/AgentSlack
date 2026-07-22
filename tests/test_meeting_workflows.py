@@ -125,6 +125,25 @@ def test_chat_can_be_deleted_through_versioned_api(tmp_path: Path, monkeypatch) 
         assert chat["chat_id"] not in {item["chat_id"] for item in listed}
 
 
+def test_active_runs_endpoint_is_available_for_reconnecting_clients(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("AGENT_SLACK_CLI", "offline")
+    with _running_server(tmp_path) as (base_url, server_id):
+        chat = _request(
+            base_url,
+            server_id,
+            "/api/chats",
+            {"title": "Reconnect", "member_ids": ["coordinator"], "kind": "direct"},
+        )
+
+        payload = _request(
+            base_url,
+            server_id,
+            f"/api/runs/active?chat_id={chat['chat_id']}",
+        )
+
+        assert payload == {"runs": []}
+
+
 def test_manual_group_meeting_is_listed_and_accepts_follow_up(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv("AGENT_SLACK_CLI", "offline")
     with _running_server(tmp_path) as (base_url, server_id):
@@ -387,3 +406,91 @@ def test_disconnected_stream_still_consumes_backend_job() -> None:
     handler._ndjson(events())
 
     assert consumed == [0, 1, 2]
+
+
+def test_disconnected_client_can_query_running_task_and_later_receive_saved_result(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setenv("AGENT_SLACK_CLI", "offline")
+    release = threading.Event()
+    finished = threading.Event()
+
+    with _running_server(tmp_path) as (base_url, server_id):
+        app = _Handler.manager.active_app()
+
+        def stream(**_kwargs):
+            try:
+                yield {
+                    "type": "agent_started",
+                    "agent_id": "coordinator",
+                    "agent_label": "System Coordinator",
+                    "task_id": "task-coordinator",
+                }
+                yield {
+                    "type": "delta",
+                    "agent_id": "coordinator",
+                    "task_id": "task-coordinator",
+                    "text": "Partial result.",
+                }
+                assert release.wait(timeout=5)
+                yield {
+                    "type": "delta",
+                    "agent_id": "coordinator",
+                    "task_id": "task-coordinator",
+                    "text": " Final result.",
+                }
+                yield {
+                    "type": "agent_completed",
+                    "agent_id": "coordinator",
+                    "task_id": "task-coordinator",
+                }
+            finally:
+                finished.set()
+
+        app.orchestrator.stream_agent_reply = stream
+        chat = _request(
+            base_url,
+            server_id,
+            "/api/chats",
+            {"title": "Reconnect", "member_ids": ["coordinator"], "kind": "direct"},
+        )
+        request = Request(
+            f"{base_url}/api/chats/{chat['chat_id']}/run-stream",
+            data=json.dumps({"mode": "respond", "objective": "Long task"}).encode(),
+            headers={
+                "Content-Type": "application/json",
+                "X-Agent-Slack-Server": server_id,
+            },
+            method="POST",
+        )
+        response = urlopen(request, timeout=5)
+        assert json.loads(response.readline())["type"] == "run_started"
+        assert json.loads(response.readline())["type"] == "agent_started"
+        assert json.loads(response.readline())["type"] == "delta"
+        response.close()
+
+        active = _request(
+            base_url,
+            server_id,
+            f"/api/runs/active?chat_id={chat['chat_id']}",
+        )["runs"]
+        assert active[0]["tasks"][0]["status"] == "running"
+        assert active[0]["tasks"][0]["text"] == "Partial result."
+
+        release.set()
+        assert finished.wait(timeout=5)
+        for _index in range(50):
+            saved = _request(base_url, server_id, f"/api/chats/{chat['chat_id']}")
+            agent_messages = [
+                message for message in saved["messages"] if message["author_type"] == "agent"
+            ]
+            if agent_messages:
+                break
+            threading.Event().wait(0.02)
+
+        assert agent_messages[-1]["body"] == "Partial result. Final result."
+        assert _request(
+            base_url,
+            server_id,
+            f"/api/runs/active?chat_id={chat['chat_id']}",
+        ) == {"runs": []}

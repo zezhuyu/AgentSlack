@@ -672,6 +672,23 @@ menu button:hover {
 
 .message.user .message-avatar {
   background: linear-gradient(135deg, #2eb67d, #1f8a5b);
+  grid-column: 2;
+  grid-row: 1;
+}
+
+.message.user {
+  grid-template-columns: minmax(0, 1fr) 44px;
+}
+
+.message.user .message-body {
+  grid-column: 1;
+  grid-row: 1;
+  justify-self: end;
+  width: min(760px, 82%);
+}
+
+.message.user .message-body header {
+  justify-content: flex-end;
 }
 
 .message.system .message-avatar {
@@ -846,6 +863,10 @@ menu button:hover {
 
 .message.user .message-content {
   color: #12416a;
+  padding: 10px 14px;
+  border: 1px solid #cce5d8;
+  border-radius: 14px 4px 14px 14px;
+  background: #eaf7f0;
 }
 
 .message.system .message-content {
@@ -1284,6 +1305,14 @@ menu {
     grid-template-columns: 36px minmax(0, 1fr);
     gap: 9px;
     padding: 9px 14px;
+  }
+
+  .message.user {
+    grid-template-columns: minmax(0, 1fr) 36px;
+  }
+
+  .message.user .message-body {
+    width: min(560px, 92%);
   }
 
   .message-avatar {
