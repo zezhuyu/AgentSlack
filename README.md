@@ -88,6 +88,18 @@ desktop API uses `0.0.0.0:8899` by default; `AGENT_SLACK_IP` and
 `AGENT_SLACK_PORT` override those values globally. `AGENT_SLACK_HOST` remains a
 backward-compatible alias for `AGENT_SLACK_IP`.
 
+## iOS app
+
+The native SwiftUI client lives in [`ios/`](./ios). It connects to one or more
+Agent Slack daemons, exposes every registered agent-system workspace, and
+supports people, direct messages, group chats, streamed replies, Markdown, and
+structured JSON cards on iPhone and iPad.
+
+Open `ios/AgentSlack.xcodeproj`, run the shared `AgentSlack` scheme, then use
+**Add Server** with the API URL copied from the macOS menu-bar app. The iOS
+client requires iOS 17 or later and has no third-party dependencies. See
+[`ios/README.md`](./ios/README.md) for setup and security notes.
+
 ## Server behavior
 
 - each server has a stable generated ID and points to one local agent-system root folder
@@ -116,7 +128,7 @@ backward-compatible alias for `AGENT_SLACK_IP`.
 - Agent replies are requested as Slack-ready Markdown rather than JSON envelopes; the shared, server-agnostic renderer displays structured JSON from any connected agent system as readable cards, including nested objects and arrays
 - Native agent sessions continue in the backend if the initiating browser disconnects, and emitted subagent/final results persist in the meeting thread
 - Messages render safe ChatGPT-style Markdown, including headings, lists, links, code blocks, blockquotes, and tables
-- Open chats and the sidebar synchronize every two seconds across desktop, web, and future mobile clients; focus changes trigger an immediate refresh
+- Open chats and the sidebar synchronize every two seconds across desktop, web, and the native iOS client; focus changes trigger an immediate refresh
 - In the message composer, `Return` sends and `Shift+Return` inserts a newline; IME composition is never submitted prematurely
 - On mobile, Send stays above the device safe area and People opens the same dynamically discovered agent list in a drawer
 

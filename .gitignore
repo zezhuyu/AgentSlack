@@ -16,3 +16,23 @@ __pycache__/
 logs/
 macos/dist/
 node_modules/
+# iOS / Xcode generated build output and per-user state
+ios/build/
+ios/**/build/
+ios/.build/
+ios/**/.build/
+ios/DerivedData/
+ios/**/DerivedData/
+ios/**/Build/
+ios/**/*.app
+ios/**/*.dSYM
+ios/**/*.dSYM.zip
+ios/**/*.ipa
+ios/**/*.xcarchive
+ios/**/*.xcresult
+ios/**/xcuserdata/
+ios/**/*.xcuserdatad
+ios/**/*.xcuserstate
+ios/**/*.xccheckout
+ios/**/*.xcscmblueprint
+ios/**/*.moved-aside
