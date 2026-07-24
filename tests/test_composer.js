@@ -45,6 +45,10 @@ test("user messages are aligned on the right", () => {
   assert.match(styles, /\.message\.user \.message-body header\s*\{[\s\S]*?justify-content:\s*flex-end/);
 });
 
+test("server logos fit inside the workspace button without cropping", () => {
+  assert.match(styles, /\.server-btn img\s*\{[\s\S]*?object-fit:\s*contain/);
+});
+
 test("plain projects can choose a CLI provider and model without API keys", () => {
   assert.match(html, /id="serverRunner"/);
   assert.match(html, /value="claude"[^>]*>Claude Code CLI/);

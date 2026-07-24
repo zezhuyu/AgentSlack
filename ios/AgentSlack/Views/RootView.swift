@@ -312,6 +312,7 @@ struct WorkspaceSidebarView: View {
                                     Label("Remove Server", systemImage: "trash")
                                 }
                             }
+                            .listRowBackground(Color.clear)
                         }
                     }
 
@@ -332,6 +333,7 @@ struct WorkspaceSidebarView: View {
                                     }
                                 }
                                 .disabled(!workspace.available)
+                                .listRowBackground(Color.clear)
                             }
                         }
                     }
