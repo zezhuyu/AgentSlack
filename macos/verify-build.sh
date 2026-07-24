@@ -16,7 +16,7 @@ for path in "$BACKEND" "$ARM_APP" "$INTEL_APP" "$ARM_DMG" "$INTEL_DMG"; do
 done
 
 for app_path in "$ARM_APP" "$INTEL_APP"; do
-  if [ ! -f "$app_path/Contents/Resources/tray-logo.png" ]; then
+  if [ ! -f "$app_path/Contents/Resources/menu-icon.png" ]; then
     printf 'Missing transparent menu-bar logo: %s\n' "$app_path" >&2
     exit 1
   fi

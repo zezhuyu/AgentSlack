@@ -334,9 +334,10 @@ function refreshTrayMenu() {
 
 function createTray() {
   const iconPath = app.isPackaged
-    ? path.join(process.resourcesPath, 'tray-logo.png')
-    : path.resolve(__dirname, '..', 'static', 'logo.png');
+    ? path.join(process.resourcesPath, 'menu-icon.png')
+    : path.join(__dirname, 'assets', 'menu-icon.png');
   const icon = nativeImage.createFromPath(iconPath).resize({ width: 18, height: 18 });
+  icon.setTemplateImage(true);
   tray = new Tray(icon);
   tray.on('click', showWindow);
   refreshTrayMenu();
