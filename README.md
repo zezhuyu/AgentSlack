@@ -42,11 +42,14 @@ http://127.0.0.1:8899
 ```
 
 The browser UI and API have no built-in token authentication. The daemon binds
-to `0.0.0.0` by default so trusted LAN clients can connect.
+to `0.0.0.0` by default so trusted LAN clients can connect. Because agent
+runners have unrestricted terminal-equivalent access, any client that can
+reach this API can cause commands to run with the desktop user's permissions.
+Expose it only to clients and networks you fully trust.
 
 Omit `--project-root` to start with an empty server registry, then use the `+` button in the workspace rail and enter an agent-system folder. Use `--data-root <folder>` to move the server registry, chats, and memories out of the source tree.
 
-Agent replies use `AGENT_SLACK_CLI=auto` by default, preferring Codex and then Claude Code. Set `AGENT_SLACK_CLI=codex` or `AGENT_SLACK_CLI=claude` to force a runner, and optionally set `AGENT_SLACK_CLI_TIMEOUT` to change the 180-second reply timeout.
+Agent replies use `AGENT_SLACK_CLI=auto` by default, preferring Codex and then Claude Code. Set `AGENT_SLACK_CLI=codex` or `AGENT_SLACK_CLI=claude` to force a runner, and optionally set `AGENT_SLACK_CLI_TIMEOUT` to change the 180-second reply timeout. Both runners execute with the same unrestricted filesystem, command, network, MCP, plugin, and user-configuration access as their trusted terminal CLIs. Agent Slack also directs either runner to honor matching skills from project and user `.agents/skills`, `.claude/skills`, and `.codex/skills` roots.
 
 ## macOS app
 
@@ -93,7 +96,9 @@ backward-compatible alias for `AGENT_SLACK_IP`.
 The native SwiftUI client lives in [`ios/`](./ios). It connects to one or more
 Agent Slack daemons, exposes every registered agent-system workspace, and
 supports people, direct messages, group chats, streamed replies, Markdown, and
-structured JSON cards on iPhone and iPad.
+structured JSON cards on iPhone and iPad. The web, macOS, and iOS composers can
+attach files or photos; the Mac daemon stores each upload and gives the agent
+its validated absolute path with the user's prompt.
 
 Open `ios/AgentSlack.xcodeproj`, run the shared `AgentSlack` scheme, then use
 **Add Server** with the API URL copied from the macOS menu-bar app. The iOS
@@ -130,6 +135,7 @@ client requires iOS 17 or later and has no third-party dependencies. See
 - Messages render safe ChatGPT-style Markdown, including headings, lists, links, code blocks, blockquotes, and tables
 - Open chats and the sidebar synchronize every two seconds across desktop, web, and the native iOS client; focus changes trigger an immediate refresh
 - In the message composer, `Return` sends and `Shift+Return` inserts a newline; IME composition is never submitted prematurely
+- Files and images upload to the selected server before the message is posted; messages retain attachment metadata and agents receive only backend-validated absolute paths
 - On mobile, Send stays above the device safe area and People opens the same dynamically discovered agent list in a drawer
 
 ## Outside access

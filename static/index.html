@@ -65,11 +65,16 @@
         </header>
         <section id="messages" class="messages"></section>
         <footer class="composer">
-          <div class="message-input-wrap">
-            <textarea id="messageInput" rows="4" placeholder="Message Agent Slack — use @ to address a person"></textarea>
-            <div id="mentionMenu" class="mention-menu" role="listbox" hidden></div>
+          <div id="pendingAttachments" class="pending-attachments" aria-live="polite"></div>
+          <div class="message-input-row">
+            <button id="voiceBtn" class="voice-button" type="button" title="Start voice input" aria-label="Start voice input">&#127908;</button>
+            <div class="message-input-wrap">
+              <textarea id="messageInput" rows="4" placeholder="Message Agent Slack — use @ to address a person"></textarea>
+              <div id="mentionMenu" class="mention-menu" role="listbox" hidden></div>
+            </div>
           </div>
           <div class="composer-actions">
+            <span id="voiceStatus" class="voice-status" aria-live="polite" hidden><span class="voice-status-dot"></span><span id="voiceStatusText"></span></span>
             <input id="objectiveInput" placeholder="Optional objective for next agent run / meeting" />
             <button id="sendBtn">Send</button>
           </div>
@@ -157,6 +162,7 @@
     <script src="/sync.js"></script>
     <script src="/composer.js"></script>
     <script src="/mentions.js"></script>
+    <script src="/interactions.js"></script>
     <script src="/app.js"></script>
   </body>
 </html>

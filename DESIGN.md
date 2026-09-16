@@ -2,9 +2,9 @@
 
 ## Source of truth
 - Status: Active
-- Last refreshed: 2026-07-22
+- Last refreshed: 2026-07-27
 - Primary product surfaces: desktop/web Agent Slack, macOS shell, native iOS client
-- Evidence reviewed: `README.md`, `MOBILE-API.md`, `static/index.html`, `static/styles.css`, `static/app.js`, `static/markdown.js`, `agent_slack/server.py`
+- Evidence reviewed: `README.md`, `MOBILE-API.md`, `static/index.html`, `static/styles.css`, `static/app.js`, `static/markdown.js`, `agent_slack/server.py`, `ios/AgentSlack/Views/RootView.swift`, `ios/AgentSlack/Views/ChatView.swift`, `ios/AgentSlack/State/AppModel.swift`, `ios/AgentSlack/Networking/AgentSlackAPI.swift`
 
 ## Brand
 - Personality: capable, direct, collaborative, and familiar to Slack users without copying proprietary artwork.
@@ -42,8 +42,8 @@
 
 ## Components
 - Existing components to reuse conceptually: workspace rail, backend-provided server logo, chat row, people row, message row, composer, structured JSON card.
-- New/changed components: saved host connection picker, compact workspace switcher, full-screen chat focus toggle, multi-select `@` mention picker and selection chips, native Markdown block renderer, recursive JSON renderer.
-- Variants and states: selected/unselected server, direct/group chat, green-tinted user bubble, neutral agent bubble, streaming/error/offline.
+- New/changed components: saved host connection picker, compact workspace switcher, full-screen chat focus toggle, multi-select `@` mention picker and selection chips, file/photo pickers with removable attachment chips, sent attachment cards, native Markdown block renderer, recursive JSON renderer, destructive chat actions, active-run stop controls, and agent-authored choice cards.
+- Variants and states: selected/unselected server, direct/group chat, green-tinted user bubble, neutral agent bubble, streaming/error/offline, and pending/submitting/answered interaction.
 - Structured JSON cards size to their rendered content and trim boundary-only whitespace from string values; they must not introduce empty vertical regions around a message.
 - Token/component ownership: iOS tokens live in `ios/AgentSlack/Design/SlackTheme.swift`; web tokens remain in `static/styles.css`.
 
@@ -64,9 +64,15 @@
 - Empty: actionable prompts to add a server, choose a workspace, open a person, or create a group.
 - Error: an unreachable saved backend returns to the startup connection gate with the saved URL prefilled and editable; in-workspace errors use non-destructive alert text.
 - Success: the requested content replaces its loading state; no noisy success toast for routine chat operations.
-- Mention targeting: typing `@` opens installed-agent suggestions; each selection inserts the stable agent ID and remains visible as a chip. One mention targets one agent; two or more mentions start a meeting with all selected agents and preserve mention order for lead selection.
+- Mention targeting: typing `@` opens installed-agent suggestions in a horizontally centered, bounded panel on wide layouts while retaining the available composer width on compact iPhone layouts. Each selection inserts the stable agent ID and remains visible as a chip. One mention targets one agent; two or more mentions start a meeting with all selected agents and preserve mention order for lead selection.
+- Conversation entry: opening or switching chats starts at the newest message. New messages and streamed replies continue to follow the bottom while the active conversation is changing.
+- Attachments: desktop/web and iOS expose file and image pickers plus removable pending chips. Uploading occurs before message submission; sent messages show filename, type, and size while the backend privately resolves opaque attachment IDs to absolute paths for the agent.
+- Chat deletion: swipe or context actions expose Delete, require destructive confirmation, and never delete a chat with an active run.
+- Run control: each visible running-agent row exposes Stop, with a separate stop-all control for the active run; stopping is acknowledged immediately and remains visible until the backend confirms completion.
+- Head-agent meetings: a message sent in a configured head-agent direct chat starts an automatic meeting. The backend-created meeting is a distinct group conversation, and the client follows that new chat as soon as `meeting_created` is streamed.
+- Agent questions: when an agent cannot continue without a decision, the backend persists its prompt, single- or multi-select mode, and task-specific options as message metadata. Desktop and iOS render those supplied labels and descriptions as native controls; clients never substitute hard-coded approval choices. On iOS, the choice card is horizontally centered with a bounded readable width on wide layouts. Submitting a valid selection records one user message, marks the card answered, and starts the next agent turn.
 - Disabled: unavailable servers and send controls visibly dim and explain why.
-- Offline/slow network: verify the selected saved backend on every cold launch; retain and prefill its URL when unreachable so the user can retry or modify it without losing configuration. Reachability uses a short timeout, while active agent streams tolerate multi-hour tasks without presenting a false timeout.
+- Offline/slow network: verify the selected saved backend on every cold launch; retain and prefill its URL when unreachable so the user can retry or modify it without losing configuration. Reachability uses a short timeout, while active agent streams tolerate multi-hour tasks without presenting a false timeout. When iOS backgrounds, it detaches its foreground stream without cancelling the Mac-side run; on activation it reloads the selected chat and `/runs/active` state before permitting another run.
 
 ## Content voice
 - Tone: concise, factual, and operational.

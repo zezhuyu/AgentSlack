@@ -272,7 +272,48 @@ def test_versioned_api_exposes_mobile_contract_and_preserves_legacy_routes(tmp_p
         assert "/chats/{chat_id}/run-stream" in openapi["paths"]
         assert "/runs/{run_id}/cancel" in openapi["paths"]
         assert "/runs/{run_id}/tasks/{task_id}/cancel" in openapi["paths"]
+        assert "/chats/{chat_id}/questions/{question_id}/answer" in openapi["paths"]
         assert versioned_agents == legacy_agents
+
+
+def test_dynamic_question_answer_endpoint_returns_updated_chat(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("AGENT_SLACK_CLI", "offline")
+    with _running_server(tmp_path) as (base_url, server_id):
+        app = _Handler.manager.active_app()
+        chat = app.create_chat("Approval", ["coordinator"], kind="direct")
+        app.storage.append_message(
+            chat["chat_id"],
+            {
+                "author_type": "agent",
+                "author_id": "coordinator",
+                "author_label": "System Coordinator",
+                "body": "Review the proposed task.",
+                "metadata": {
+                    "interaction": {
+                        "kind": "choice",
+                        "question_id": "approve-task",
+                        "prompt": "Approve this task?",
+                        "multiple": False,
+                        "status": "pending",
+                        "selected_option_ids": [],
+                        "options": [
+                            {"id": "approve", "label": "Approve"},
+                            {"id": "reject", "label": "Reject"},
+                        ],
+                    }
+                },
+            },
+        )
+
+        answered = _request(
+            base_url,
+            server_id,
+            f"/api/v1/chats/{chat['chat_id']}/questions/approve-task/answer",
+            {"option_ids": ["approve"]},
+        )
+
+        assert answered["messages"][-2]["metadata"]["interaction"]["status"] == "answered"
+        assert answered["messages"][-1]["body"] == 'Response to "Approve this task?": Approve'
 
 
 def test_run_and_task_cancellation_endpoints_delegate_to_active_app(
@@ -355,6 +396,43 @@ def test_api_responses_advertise_version_and_preflight_methods(tmp_path: Path, m
             assert response.status == 204
             assert "POST" in response.headers["Access-Control-Allow-Methods"]
             assert response.headers["X-Agent-Slack-Api-Version"] == API_VERSION
+
+
+def test_upload_then_message_attaches_server_absolute_path(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("AGENT_SLACK_CLI", "offline")
+    with _running_server(tmp_path) as (base_url, server_id):
+        chat = _request(
+            base_url,
+            server_id,
+            "/api/v1/chats",
+            {"title": "Attachment", "member_ids": ["coordinator"], "kind": "direct"},
+        )
+        upload_request = Request(
+            f"{base_url}/api/v1/uploads",
+            data=b"\x89PNG\r\nattachment",
+            headers={
+                "Content-Type": "image/png",
+                "X-Agent-Slack-Server": server_id,
+                "X-Agent-Slack-Filename": "screen%20shot.png",
+            },
+            method="POST",
+        )
+        with urlopen(upload_request, timeout=5) as response:
+            upload = json.loads(response.read())
+
+        updated = _request(
+            base_url,
+            server_id,
+            f"/api/v1/chats/{chat['chat_id']}/messages",
+            {
+                "body": "Explain what is shown",
+                "attachment_ids": [upload["attachment_id"]],
+            },
+        )
+
+        assert Path(upload["path"]).is_absolute()
+        assert Path(upload["path"]).read_bytes() == b"\x89PNG\r\nattachment"
+        assert updated["messages"][-1]["metadata"]["attachments"][0]["path"] == upload["path"]
 
 
 def test_empty_registry_supports_client_bootstrap_and_returns_setup_action(tmp_path: Path) -> None:

@@ -40,11 +40,17 @@ def test_auto_prefers_codex_cli(tmp_path: Path, monkeypatch) -> None:
     assert _reply(orchestrator) == "Hello from coordinator"
     command, kwargs = calls[0]
     assert command[:2] == ["/bin/codex", "exec"]
-    assert "workspace-write" in command
+    assert "--dangerously-bypass-approvals-and-sandbox" in command
+    assert "--sandbox" not in command
     assert kwargs["cwd"] == tmp_path
     assert "Return only the message" in kwargs["input"]
     assert "Do not return JSON" in kwargs["input"]
     assert "Slack-ready Markdown" in kwargs["input"]
+    assert ".agents/skills" in kwargs["input"]
+    assert ".claude/skills" in kwargs["input"]
+    assert ".codex/skills" in kwargs["input"]
+    assert ".claude/agents/*.md" in kwargs["input"]
+    assert "create the requested Markdown file" in kwargs["input"]
 
 
 def test_can_select_claude_cli(tmp_path: Path, monkeypatch) -> None:
@@ -62,6 +68,8 @@ def test_can_select_claude_cli(tmp_path: Path, monkeypatch) -> None:
     assert _reply(orchestrator) == "Claude reply"
     assert commands[0][0] == "/bin/claude"
     assert "--print" in commands[0]
+    assert "--dangerously-skip-permissions" in commands[0]
+    assert "dontAsk" not in commands[0]
     assert "--tools" not in commands[0]
 
 
@@ -74,6 +82,41 @@ def test_reports_missing_local_cli(tmp_path: Path, monkeypatch) -> None:
 
     assert reply.startswith("[CLI unavailable]")
     assert "ANTHROPIC_API_KEY" not in reply
+
+
+def test_native_prompt_includes_trusted_attachment_paths(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("AGENT_SLACK_CLI", "offline")
+    orchestrator = CliOrchestrator("SampleProject", tmp_path)
+    attachment_path = str((tmp_path / "uploads" / "diagram.png").resolve())
+    prompt = orchestrator._compose_native_prompt(
+        {
+            "agent_id": "project_claude",
+            "title": "Project Claude",
+            "kind": "project",
+        },
+        {"title": "Review", "kind": "direct", "member_ids": ["project_claude"]},
+        [
+            {
+                "author_type": "user",
+                "author_label": "You",
+                "body": "Inspect this diagram",
+                "metadata": {
+                    "attachments": [
+                        {
+                            "filename": "diagram.png",
+                            "path": attachment_path,
+                            "content_type": "image/png",
+                            "size": 123,
+                        }
+                    ]
+                },
+            }
+        ],
+        "Inspect this diagram",
+    )
+
+    assert "Inspect this diagram" in prompt
+    assert f"diagram.png: {attachment_path}" in prompt
 
 
 def test_reports_cli_failure_without_offline_api_message(tmp_path: Path, monkeypatch) -> None:
@@ -120,8 +163,37 @@ def test_plain_project_claude_command_omits_named_agent_selection(tmp_path: Path
     )
 
     assert "--agent" not in command
+    assert "--dangerously-skip-permissions" in command
     assert "Handle this request directly in the project root" in prompt
     assert "wait for every required result" not in prompt
+    assert ".agents/skills" in prompt
+    assert ".claude/skills" in prompt
+    assert ".codex/skills" in prompt
+    assert "<agent-slack-question>" in prompt
+
+
+def test_prompts_define_dynamic_user_question_contract(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("AGENT_SLACK_CLI", "codex")
+    monkeypatch.setattr("agent_slack.orchestrator.shutil.which", lambda name: f"/bin/{name}")
+    orchestrator = CliOrchestrator("SampleProject", tmp_path)
+    agent = {
+        "agent_id": "coordinator",
+        "name": "coordinator",
+        "title": "System Coordinator",
+        "summary": "Leads decisions.",
+        "source_path": ".claude/agents/coordinator.md",
+        "system_prompt": "Coordinate.",
+    }
+    chat = {"title": "Coordinator", "kind": "direct", "member_ids": ["coordinator"]}
+    transcript = [{"author_type": "user", "author_label": "You", "body": "Prepare a spec"}]
+
+    native = orchestrator._compose_native_prompt(agent, chat, transcript, "Prepare a spec")
+    fallback = orchestrator._compose_prompt(agent, chat, transcript, {}, "Prepare a spec")
+
+    for prompt in (native, fallback):
+        assert "<agent-slack-question>" in prompt
+        assert '"options"' in prompt
+        assert "labels and descriptions" in prompt
 
 
 def test_selected_models_are_forwarded_to_both_cli_providers(tmp_path: Path, monkeypatch) -> None:
@@ -135,6 +207,33 @@ def test_selected_models_are_forwarded_to_both_cli_providers(tmp_path: Path, mon
     assert claude_command[claude_command.index("--model") + 1] == "claude-custom"
     codex_command = codex._command()
     assert codex_command[codex_command.index("--model") + 1] == "gpt-custom"
+
+
+def test_codex_can_use_claude_markdown_agent_definition_without_claude_flags(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("AGENT_SLACK_CLI", "codex")
+    monkeypatch.setattr("agent_slack.orchestrator.shutil.which", lambda name: f"/bin/{name}")
+    orchestrator = CliOrchestrator("SampleProject", tmp_path)
+    agent = {
+        "agent_id": "coordinator",
+        "name": "coordinator",
+        "title": "Coordinator",
+        "summary": "Leads the work.",
+        "source_path": ".claude/agents/coordinator.md",
+        "system_prompt": "Read the specialist Markdown definitions and coordinate them.",
+        "kind": "lead",
+    }
+    prompt = orchestrator._compose_prompt(
+        agent,
+        {"title": "Project", "kind": "direct", "member_ids": ["coordinator"]},
+        [{"author_type": "user", "body": "Write the review as Markdown."}],
+        {},
+        "Write the review as Markdown.",
+    )
+    command = orchestrator._command()
+    assert ".claude/agents/*.md" in prompt
+    assert ".claude/subagents/*/*.md" in prompt
+    assert "create the requested Markdown file" in prompt
+    assert "--agent" not in command
 
 
 def test_claude_stream_relays_native_task_results_and_final_answer(tmp_path: Path, monkeypatch) -> None:

@@ -75,6 +75,13 @@ final class ParserTests: XCTestCase {
         XCTAssertEqual(payload.servers.first?.runner, "claude")
     }
 
+    func testWorkspaceHealthDecodesConfiguredHeadAgents() throws {
+        let data = Data(#"{"ok":true,"architecture":{"orchestrator_ids":["coordinator","planner"]}}"#.utf8)
+        let payload = try JSONDecoder().decode(HealthResponse.self, from: data)
+
+        XCTAssertEqual(payload.architecture?.orchestratorIDs, ["coordinator", "planner"])
+    }
+
     func testStreamingEventPayloadDecodes() throws {
         let data = Data(#"{"type":"delta","run_id":"run-1","task_id":"task-1","agent_id":"cio","agent_label":"Chief Investment Officer","text":"Working"}"#.utf8)
         let event = try JSONDecoder().decode(RunEvent.self, from: data)
@@ -82,6 +89,114 @@ final class ParserTests: XCTestCase {
         XCTAssertEqual(event.type, "delta")
         XCTAssertEqual(event.taskID, "task-1")
         XCTAssertEqual(event.text, "Working")
+    }
+
+    func testMeetingCreatedEventIdentifiesSeparateChat() throws {
+        let data = Data(#"{"type":"meeting_created","chat_id":"meeting-2","source_chat_id":"direct-1","title":"Release meeting"}"#.utf8)
+        let event = try JSONDecoder().decode(RunEvent.self, from: data)
+
+        XCTAssertEqual(event.chatID, "meeting-2")
+        XCTAssertEqual(event.sourceChatID, "direct-1")
+        XCTAssertEqual(event.title, "Release meeting")
+    }
+
+    func testChatMessageDecodesDynamicChoiceInteraction() throws {
+        let data = Data(
+            #"""
+            {
+              "message_id": "agent-7",
+              "author_type": "agent",
+              "author_id": "coordinator",
+              "author_label": "Coordinator",
+              "body": "Choose how to proceed.",
+              "created_at": "2026-07-27T16:00:00Z",
+              "metadata": {
+                "interaction": {
+                  "kind": "choice",
+                  "question_id": "q-1",
+                  "prompt": "Approve the deployment scope?",
+                  "options": [
+                    {"id": "approve", "label": "Approve", "description": "Proceed with the current scope."},
+                    {"id": "revise", "label": "Revise", "description": "Ask for a narrower plan."}
+                  ],
+                  "multiple": false,
+                  "status": "pending",
+                  "selected_option_ids": []
+                }
+              }
+            }
+            """#.utf8
+        )
+        let message = try JSONDecoder().decode(ChatMessage.self, from: data)
+
+        XCTAssertEqual(message.metadata?.interaction?.questionID, "q-1")
+        XCTAssertEqual(message.metadata?.interaction?.prompt, "Approve the deployment scope?")
+        XCTAssertEqual(message.metadata?.interaction?.options.map(\.label), ["Approve", "Revise"])
+        XCTAssertEqual(message.metadata?.interaction?.options.first?.description, "Proceed with the current scope.")
+        XCTAssertEqual(message.metadata?.interaction?.isChoice, true)
+        XCTAssertEqual(message.metadata?.interaction?.isPendingChoice, true)
+    }
+
+    func testAnsweredChoiceInteractionRemainsRenderableWithSelectedOptions() throws {
+        let data = Data(
+            #"""
+            {
+              "message_id": "agent-8",
+              "author_type": "agent",
+              "body": "Decision recorded.",
+              "metadata": {
+                "interaction": {
+                  "kind": "choice",
+                  "question_id": "q-answered",
+                  "prompt": "Choose a path",
+                  "options": [
+                    {"id": "safe", "label": "Safe"},
+                    {"id": "fast", "label": "Fast"}
+                  ],
+                  "multiple": false,
+                  "status": "answered",
+                  "selected_option_ids": ["safe"]
+                }
+              }
+            }
+            """#.utf8
+        )
+        let message = try JSONDecoder().decode(ChatMessage.self, from: data)
+        let interaction = try XCTUnwrap(message.metadata?.interaction)
+
+        XCTAssertTrue(interaction.isChoice)
+        XCTAssertFalse(interaction.isPendingChoice)
+        XCTAssertEqual(interaction.selectedOptionIDs, ["safe"])
+    }
+
+    func testChatMessageDecodesAttachmentMetadata() throws {
+        let data = Data(
+            #"""
+            {
+              "message_id": "user-attachment",
+              "author_type": "user",
+              "body": "See attached.",
+              "metadata": {
+                "attachments": [
+                  {
+                    "attachment_id": "att-1",
+                    "filename": "diagram.png",
+                    "path": "/uploads/diagram.png",
+                    "content_type": "image/png",
+                    "size": 2048
+                  }
+                ]
+              }
+            }
+            """#.utf8
+        )
+        let message = try JSONDecoder().decode(ChatMessage.self, from: data)
+        let attachment = try XCTUnwrap(message.metadata?.attachments?.first)
+
+        XCTAssertEqual(attachment.id, "att-1")
+        XCTAssertEqual(attachment.filename, "diagram.png")
+        XCTAssertEqual(attachment.contentType, "image/png")
+        XCTAssertEqual(attachment.size, 2048)
     }
 
     func testBackendLogoURLIncludesRevision() throws {
@@ -164,6 +279,82 @@ final class ParserTests: XCTestCase {
         XCTAssertNil(object["agent_ids"])
     }
 
+    func testConfiguredHeadAgentDirectMessageRoutesToSeparateAutoMeeting() throws {
+        let chat = Chat(
+            chatID: "direct-1",
+            title: "Coordinator",
+            kind: "direct",
+            memberIDs: ["coordinator"],
+            messages: [],
+            createdAt: nil,
+            updatedAt: nil
+        )
+        let request = RunRouting.request(
+            chat: chat,
+            mentionedAgentIDs: [],
+            orchestratorIDs: ["coordinator"],
+            objective: "Schedule a release review"
+        )
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: JSONEncoder().encode(request)) as? [String: Any]
+        )
+
+        XCTAssertEqual(object["mode"] as? String, "auto_meeting")
+        XCTAssertEqual(object["lead_agent_id"] as? String, "coordinator")
+        XCTAssertEqual(object["objective"] as? String, "Schedule a release review")
+    }
+
+    func testQuestionAnswerRequestEncodesOptionIDs() throws {
+        let request = AnswerQuestionRequest(optionIDs: ["approve", "notify-team"])
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: JSONEncoder().encode(request)) as? [String: Any]
+        )
+
+        XCTAssertEqual(object["option_ids"] as? [String], ["approve", "notify-team"])
+    }
+
+    func testPostMessageRequestEncodesAttachmentIDs() throws {
+        let request = PostMessageRequest(body: "See files", attachmentIDs: ["att-1", "att-2"])
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: JSONEncoder().encode(request)) as? [String: Any]
+        )
+
+        XCTAssertEqual(object["body"] as? String, "See files")
+        XCTAssertEqual(object["attachment_ids"] as? [String], ["att-1", "att-2"])
+    }
+
+    func testUploadedAttachmentDecodesServerFields() throws {
+        let data = Data(
+            #"{"attachment_id":"att-1","filename":"report.pdf","path":"/uploads/report.pdf","content_type":"application/pdf","size":4096}"#.utf8
+        )
+        let attachment = try JSONDecoder().decode(UploadedAttachment.self, from: data)
+
+        XCTAssertEqual(attachment.id, "att-1")
+        XCTAssertEqual(attachment.filename, "report.pdf")
+        XCTAssertEqual(attachment.path, "/uploads/report.pdf")
+        XCTAssertEqual(attachment.contentType, "application/pdf")
+        XCTAssertEqual(attachment.size, 4096)
+    }
+
+    func testInteractionFollowUpObjectiveIncludesPromptAndLabels() {
+        XCTAssertEqual(
+            InteractionFollowUp.objective(
+                prompt: "Approve the deployment scope?",
+                optionLabels: ["Approve", "Notify team"]
+            ),
+            #"The user answered the question "Approve the deployment scope?" by selecting: Approve, Notify team. Continue from that choice."#
+        )
+    }
+
+    func testActiveRunPayloadDecodesRunningTasks() throws {
+        let data = Data(#"{"runs":[{"run_id":"run-1","chat_id":"chat-1","mode":"respond","lead_agent_id":"coordinator","status":"running","started_at":"2026-07-27T12:00:00Z","tasks":[{"task_id":"task-1","agent_id":"reviewer","agent_label":"Reviewer","status":"running","text":"Checking"}]}]}"#.utf8)
+        let payload = try JSONDecoder().decode(ActiveRunsResponse.self, from: data)
+
+        XCTAssertEqual(payload.runs.first?.runID, "run-1")
+        XCTAssertEqual(payload.runs.first?.tasks.first?.taskID, "task-1")
+        XCTAssertEqual(payload.runs.first?.tasks.first?.text, "Checking")
+    }
+
     private var mentionAgents: [AgentProfile] {
         [
             AgentProfile(
@@ -232,8 +423,11 @@ final class AppModelStartupTests: XCTestCase {
             type: "agent_started",
             runID: "run-1",
             taskID: "task-1",
+            chatID: nil,
+            sourceChatID: nil,
             agentID: "cio",
             agentLabel: "Chief Investment Officer",
+            title: nil,
             text: nil,
             message: nil
         )
@@ -241,8 +435,11 @@ final class AppModelStartupTests: XCTestCase {
             type: "delta",
             runID: "run-1",
             taskID: "task-1",
+            chatID: nil,
+            sourceChatID: nil,
             agentID: "cio",
             agentLabel: nil,
+            title: nil,
             text: "Market ",
             message: nil
         )
@@ -250,8 +447,11 @@ final class AppModelStartupTests: XCTestCase {
             type: "delta",
             runID: "run-1",
             taskID: "task-1",
+            chatID: nil,
+            sourceChatID: nil,
             agentID: "cio",
             agentLabel: nil,
+            title: nil,
             text: "update",
             message: nil
         )
@@ -263,5 +463,62 @@ final class AppModelStartupTests: XCTestCase {
 
         XCTAssertEqual(model.streamingReplies.first?.agentLabel, "Chief Investment Officer")
         XCTAssertEqual(model.streamingReplies.first?.text, "Market update")
+    }
+
+    func testBackgroundDetachesTransportWithoutDiscardingActiveRun() {
+        let model = AppModel(defaults: defaults)
+        model.isSending = true
+        model.applyRunEvent(
+            RunEvent(
+                type: "run_started",
+                runID: "run-1",
+                taskID: nil,
+                chatID: "chat-1",
+                sourceChatID: nil,
+                agentID: "coordinator",
+                agentLabel: "Coordinator",
+                title: nil,
+                text: nil,
+                message: nil
+            )
+        )
+
+        model.prepareForBackground()
+
+        XCTAssertFalse(model.isSending)
+        XCTAssertEqual(model.activeRunID, "run-1")
+        XCTAssertNil(model.errorMessage)
+    }
+
+    func testDetachedActiveRunStillBlocksASecondSend() {
+        let model = AppModel(defaults: defaults)
+        model.applyRunEvent(
+            RunEvent(
+                type: "run_started",
+                runID: "run-1",
+                taskID: nil,
+                chatID: "chat-1",
+                sourceChatID: nil,
+                agentID: "coordinator",
+                agentLabel: "Coordinator",
+                title: nil,
+                text: nil,
+                message: nil
+            )
+        )
+        model.prepareForBackground()
+
+        XCTAssertFalse(model.canStartRun)
+    }
+
+    func testForegroundResumeClearsTheDetachedSendingState() async {
+        let model = AppModel(defaults: defaults)
+        model.isSending = true
+        model.prepareForBackground()
+
+        await model.resumeAfterForeground()
+
+        XCTAssertFalse(model.isSending)
+        XCTAssertNil(model.errorMessage)
     }
 }

@@ -3,10 +3,12 @@ from __future__ import annotations
 import json
 import mimetypes
 import re
+import sys
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
+from uuid import uuid4
 
 from .servers import AgentServerManager
 
@@ -63,6 +65,22 @@ def _openapi_document() -> dict:
             "delete": {"summary": "Delete a chat and its stored messages"},
         },
         "/chats/{chat_id}/messages": {"post": {"summary": "Post a user message"}},
+        "/uploads": {
+            "post": {
+                "summary": "Upload one file for a later chat message",
+                "description": "Raw request body with a percent-encoded X-Agent-Slack-Filename header.",
+            }
+        },
+        "/uploads/{attachment_id}": {"get": {"summary": "Preview or download an uploaded file"}},
+        "/voice/capabilities": {"get": {"summary": "Return local voice channel capabilities"}},
+        "/voice/utterances": {"post": {"summary": "Submit a committed utterance through the shared agent"}},
+        "/voice/transcribe": {"post": {"summary": "Transcribe audio using backend-local whisper.cpp"}},
+        "/voice/synthesize": {"post": {"summary": "Synthesize speech using backend-local TTS"}},
+        "/voice/sessions": {"post": {"summary": "Create an isolated voice conversation session"}},
+        "/voice/turns": {"post": {"summary": "Process one conversational voice turn with backend ASR/TTS"}},
+        "/chats/{chat_id}/questions/{question_id}/answer": {
+            "post": {"summary": "Answer an agent-authored dynamic choice question"},
+        },
         "/chats/{chat_id}/run-stream": {
             "post": {
                 "summary": "Run agents and stream NDJSON events",
@@ -149,6 +167,26 @@ class _Handler(BaseHTTPRequestHandler):
             if logo_path is None:
                 return self._json({"error": "server logo not found"}, status=404)
             return self._serve_file(logo_path)
+        match = re.fullmatch(r"/api/uploads/([0-9a-f]{32})", path)
+        if match:
+            upload = self._active_app().get_upload_path(match.group(1))
+            if upload is None:
+                return self._json({"error": "attachment not found"}, status=404)
+            file_path, metadata = upload
+            return self._serve_file(file_path, filename=metadata.get("filename"), inline=True)
+        match = re.fullmatch(r"/api/artifacts/([0-9a-f]{32})", path)
+        if match:
+            artifact = self._active_app().get_artifact_path(match.group(1))
+            if artifact is None:
+                return self._json({"error": "artifact not found"}, status=404)
+            file_path, metadata = artifact
+            return self._serve_file(file_path, filename=metadata.get("filename"), inline=True)
+        match = re.fullmatch(r"/api/voice/speech/([0-9a-f]{32})", path)
+        if match:
+            speech_path = self._active_app().speech_path(match.group(1))
+            if speech_path is None:
+                return self._json({"error": "speech not found"}, status=404)
+            return self._serve_file(speech_path, filename="response.wav", inline=True)
         if not path.startswith("/api/"):
             return self._serve_static(parsed.path)
         if path.startswith("/api/") and self.manager.active_server_id is None:
@@ -170,6 +208,8 @@ class _Handler(BaseHTTPRequestHandler):
         if path == "/api/runs/active":
             chat_id = (parse_qs(parsed.query).get("chat_id") or [None])[0]
             return self._json({"runs": app.list_active_runs(chat_id)})
+        if path == "/api/voice/capabilities":
+            return self._json(app.voice_capabilities())
         match = re.fullmatch(r"/api/chats/([^/]+)", path)
         if match:
             chat = app.get_chat(match.group(1))
@@ -181,8 +221,8 @@ class _Handler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
         path = _versioned_path(parsed.path)
-        payload = self._read_json_body()
         if path == "/api/servers":
+            payload = self._read_json_body()
             project_root = str(payload.get("project_root") or "").strip()
             if not project_root:
                 return self._json({"error": "project_root is required"}, status=400)
@@ -214,6 +254,75 @@ class _Handler(BaseHTTPRequestHandler):
             return self._json({"error": str(exc).strip("'")}, status=404)
         except (LookupError, ValueError) as exc:
             return self._json({"error": str(exc)}, status=409)
+        if path == "/api/uploads":
+            filename = unquote(self.headers.get("X-Agent-Slack-Filename", "")).strip()
+            if not filename:
+                return self._json({"error": "X-Agent-Slack-Filename is required"}, status=400)
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+            except ValueError:
+                return self._json({"error": "Invalid Content-Length"}, status=400)
+            if length <= 0:
+                return self._json({"error": "Upload is empty"}, status=400)
+            if length > app.MAX_UPLOAD_BYTES:
+                return self._json({"error": "Upload exceeds the 50 MB limit"}, status=413)
+            try:
+                upload = app.store_upload(
+                    filename,
+                    self.headers.get("Content-Type", "application/octet-stream"),
+                    self.rfile.read(length),
+                )
+            except ValueError as exc:
+                return self._json({"error": str(exc)}, status=400)
+            return self._json(upload, status=201)
+        if path == "/api/voice/transcribe":
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+            except ValueError:
+                return self._json({"error": "Invalid Content-Length"}, status=400)
+            if length <= 0 or length > app.MAX_UPLOAD_BYTES:
+                return self._json({"error": "Audio must be between 1 byte and 50 MB"}, status=413)
+            try:
+                text = app.voice.transcribe(
+                    self.rfile.read(length),
+                    Path(self.headers.get("X-Agent-Slack-Filename", "audio.wav")).suffix,
+                )
+            except (OSError, ValueError) as exc:
+                return self._json({"error": str(exc)}, status=400)
+            except Exception as exc:
+                return self._json({"error": str(exc)}, status=503)
+            return self._json({"text": text, "final": True})
+        if path == "/api/voice/turns":
+            chat_id = str(self.headers.get("X-Agent-Slack-Voice-Chat") or "")
+            request_id = str(self.headers.get("Idempotency-Key") or uuid4().hex)
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+            except ValueError:
+                return self._json({"error": "Invalid Content-Length"}, status=400)
+            if not chat_id or length <= 0 or length > app.MAX_UPLOAD_BYTES:
+                return self._json({"error": "voice chat and audio body are required"}, status=400)
+            try:
+                events = app.stream_voice_turn(
+                    chat_id,
+                    self.rfile.read(length),
+                    Path(self.headers.get("X-Agent-Slack-Filename", "voice.wav")).suffix,
+                    request_id,
+                )
+            except (KeyError, ValueError) as exc:
+                return self._json({"error": str(exc)}, status=400)
+            return self._ndjson(events)
+        payload = self._read_json_body()
+        if path == "/api/voice/sessions":
+            try:
+                return self._json(app.create_voice_session(str(payload.get("source_chat_id") or "")), status=201)
+            except (KeyError, ValueError) as exc:
+                return self._json({"error": str(exc)}, status=400)
+        if path == "/api/voice/synthesize":
+            try:
+                audio = app.voice.synthesize(str(payload.get("text") or ""), payload.get("voice"))
+            except Exception as exc:
+                return self._json({"error": str(exc)}, status=503)
+            return self._audio(audio, "audio/wav")
         if path == "/api/agents/discover":
             app.reload_host_configuration()
             return self._json({"agents": app.refresh_agents()})
@@ -226,8 +335,50 @@ class _Handler(BaseHTTPRequestHandler):
             return self._json(chat, status=201)
         match = re.fullmatch(r"/api/chats/([^/]+)/messages", path)
         if match:
-            chat = app.add_user_message(match.group(1), str(payload.get("body") or ""))
+            try:
+                chat = app.add_user_message(
+                    match.group(1),
+                    str(payload.get("body") or ""),
+                    attachment_ids=list(payload.get("attachment_ids") or []),
+                    idempotency_key=str(payload.get("idempotency_key") or self.headers.get("Idempotency-Key") or ""),
+                )
+            except (KeyError, ValueError) as exc:
+                return self._json({"error": str(exc).strip("'")}, status=400)
             return self._json(chat, status=201)
+        if path == "/api/voice/utterances":
+            chat_id = str(payload.get("chat_id") or "")
+            text = str(payload.get("text") or payload.get("body") or "").strip()
+            request_id = str(payload.get("request_id") or self.headers.get("Idempotency-Key") or "").strip()
+            if not chat_id or not text:
+                return self._json({"error": "chat_id and text are required"}, status=400)
+            try:
+                chat, is_new = app.submit_voice_utterance(chat_id, text, request_id)
+                if not is_new:
+                    existing = app.find_message_by_idempotency(chat_id, request_id)
+                    return self._json({"accepted": True, "duplicate": True, "message_id": existing.get("message_id") if existing else None})
+                events = app.stream_run(
+                    chat_id=chat_id,
+                    mode="respond",
+                    objective=payload.get("objective"),
+                    agent_ids=list(payload.get("agent_ids") or []),
+                    lead_agent_id=payload.get("lead_agent_id"),
+                )
+            except (KeyError, ValueError) as exc:
+                return self._json({"error": str(exc)}, status=400)
+            return self._ndjson(events)
+        match = re.fullmatch(r"/api/chats/([^/]+)/questions/([^/]+)/answer", path)
+        if match:
+            try:
+                chat = app.answer_question(
+                    match.group(1),
+                    match.group(2),
+                    list(payload.get("option_ids") or []),
+                )
+            except KeyError as exc:
+                return self._json({"error": str(exc).strip("'")}, status=404)
+            except ValueError as exc:
+                return self._json({"error": str(exc)}, status=400)
+            return self._json(chat)
         match = re.fullmatch(r"/api/chats/([^/]+)/run-stream", path)
         if match:
             try:
@@ -329,7 +480,10 @@ class _Handler(BaseHTTPRequestHandler):
         self.send_response(HTTPStatus.NO_CONTENT)
         self.send_header("Allow", "GET, POST, PATCH, DELETE, OPTIONS")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, PATCH, DELETE, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type, X-Agent-Slack-Server")
+        self.send_header(
+            "Access-Control-Allow-Headers",
+            "Content-Type, X-Agent-Slack-Server, X-Agent-Slack-Filename",
+        )
         self.send_header("X-Agent-Slack-Api-Version", API_VERSION)
         self.end_headers()
 
@@ -360,6 +514,15 @@ class _Handler(BaseHTTPRequestHandler):
         self.send_header("X-Agent-Slack-Api-Version", API_VERSION)
         self.end_headers()
         self.wfile.write(raw)
+
+    def _audio(self, content: bytes, content_type: str) -> None:
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(content)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Agent-Slack-Api-Version", API_VERSION)
+        self.end_headers()
+        self.wfile.write(content)
 
     def _ndjson(self, events) -> None:
         self.send_response(200)
@@ -400,12 +563,15 @@ class _Handler(BaseHTTPRequestHandler):
             file_path = self.manager.static_root / "index.html"
         return self._serve_file(file_path)
 
-    def _serve_file(self, file_path: Path) -> None:
+    def _serve_file(self, file_path: Path, filename: str | None = None, inline: bool = False) -> None:
         content = file_path.read_bytes()
         mime, _enc = mimetypes.guess_type(str(file_path))
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", mime or "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(content)))
+        if filename:
+            disposition = "inline" if inline else "attachment"
+            self.send_header("Content-Disposition", f'{disposition}; filename="{str(filename).replace(chr(34), chr(39))}"')
         self.send_header("X-Agent-Slack-Api-Version", API_VERSION)
         self.end_headers()
         self.wfile.write(content)
@@ -417,7 +583,9 @@ class AgentSlackHTTPServer(ThreadingHTTPServer):
 
 
 def run_server(project_root: Path | None, host: str, port: int, data_root: Path | None = None) -> None:
-    app_root = Path(__file__).resolve().parent.parent
+    # PyInstaller extracts bundled static assets beside the frozen executable
+    # under _MEIPASS; source runs keep the repository root as before.
+    app_root = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent.parent))
     manager = AgentServerManager(
         app_root=app_root,
         data_root=data_root or app_root / "data",

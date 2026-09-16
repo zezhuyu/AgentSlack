@@ -16,6 +16,8 @@ const state = {
   streamAttached: false,
   chatListSignature: "",
   streamingRows: new Map(),
+  answeringQuestionIds: new Set(),
+  pendingAttachments: [],
   serverDialogMode: "create",
   peoplePickers: {
     chat: new Set(),
@@ -30,6 +32,13 @@ const appendStreamMarkdown = (currentText, delta) => window.AgentSlackMarkdown.a
 const chatSync = window.AgentSlackSync;
 const composerKeys = window.AgentSlackComposer;
 const mentionHelpers = window.AgentSlackMentions;
+const interactionHelpers = window.AgentSlackInteractions;
+const voiceState = {
+  recorder: null, stream: null, active: false, speaking: false, chunks: [],
+  voiceChatId: null, sourceChatId: null, audio: null, audioContext: null,
+  analyser: null, monitorFrame: null, silenceSince: 0, processing: false,
+  queuedBlob: null, discardNextRecording: false,
+};
 
 async function api(path, options = {}) {
   const headers = {
@@ -117,6 +126,7 @@ function renderServers() {
 
 async function switchServer(serverId) {
   if (serverId === state.activeServerId || state.runInProgress) return;
+  clearPendingAttachments();
   await api(`/api/servers/${serverId}/activate`, { method: "POST", body: "{}" });
   state.activeServerId = serverId;
   state.currentChatId = null;
@@ -351,9 +361,274 @@ function renderChat(chat) {
         <div class="message-content">${renderMarkdown(message.body || "")}</div>
       </div>
     `;
+    appendMessageAttachments(row.querySelector(".message-body"), message);
+    appendChoiceInteraction(row.querySelector(".message-body"), message);
     messages.appendChild(row);
   });
   messages.scrollTop = followLatest ? messages.scrollHeight : previousScrollTop;
+}
+
+function appendMessageAttachments(container, message) {
+  const attachments = message.metadata?.attachments || [];
+  if (!attachments.length) return;
+  const list = document.createElement("div");
+  list.className = "message-attachments";
+  attachments.forEach((attachment) => {
+    const item = document.createElement("a");
+    item.className = "message-attachment";
+    item.href = attachment.url || `/api/uploads/${encodeURIComponent(attachment.attachment_id)}`;
+    item.target = "_blank";
+    item.rel = "noopener";
+    item.textContent = `📎 ${attachment.filename} · ${formatBytes(attachment.size)}`;
+    item.title = attachment.content_type || "File attachment";
+    list.appendChild(item);
+  });
+  container.appendChild(list);
+}
+
+const VOICE_STATES = ["listening", "speaking", "thinking", "responding", "error"];
+
+function setVoiceStatus(text, visible = true, voiceState_ = null) {
+  const status = $("voiceStatus");
+  const label = $("voiceStatusText");
+  if (label) label.textContent = text;
+  else status.textContent = text;
+  status.hidden = !visible;
+  const btn = $("voiceBtn");
+  for (const name of VOICE_STATES) {
+    status.classList.toggle(`is-${name}`, name === voiceState_);
+    btn.classList.toggle(`is-${name}`, name === voiceState_);
+  }
+}
+
+async function toggleVoice() {
+  if (!navigator.mediaDevices?.getUserMedia || !window.MediaRecorder) {
+    setVoiceStatus("Backend voice capture is unavailable in this browser.", true, "error");
+    return;
+  }
+  if (voiceState.active) {
+    stopContinuousVoice();
+    return;
+  }
+  try {
+    voiceState.stream = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+    });
+    voiceState.audioContext = new AudioContext();
+    voiceState.analyser = voiceState.audioContext.createAnalyser();
+    voiceState.analyser.fftSize = 1024;
+    voiceState.audioContext.createMediaStreamSource(voiceState.stream).connect(voiceState.analyser);
+    voiceState.active = true;
+    voiceState.speaking = false;
+    voiceState.discardNextRecording = false;
+    voiceState.monitorFrame = requestAnimationFrame(monitorVoiceLevel);
+    $("voiceBtn").textContent = "⏹";
+    setVoiceStatus("Listening — speak naturally, I'll respond out loud", true, "listening");
+  } catch (error) {
+    setVoiceStatus("Microphone error: " + error.message, true, "error");
+  }
+}
+
+function monitorVoiceLevel() {
+  if (!voiceState.active || !voiceState.analyser) return;
+  const samples = new Uint8Array(voiceState.analyser.fftSize);
+  voiceState.analyser.getByteTimeDomainData(samples);
+  const rms = Math.sqrt(samples.reduce((sum, sample) => {
+    const normalized = (sample - 128) / 128;
+    return sum + normalized * normalized;
+  }, 0) / samples.length);
+  const speakingNow = rms > 0.028;
+  const now = performance.now();
+  if (speakingNow) {
+    voiceState.silenceSince = 0;
+    if (!voiceState.speaking) {
+      voiceState.speaking = true;
+      voiceState.chunks = [];
+      voiceState.discardNextRecording = false;
+      if (voiceState.audio && !voiceState.audio.paused) {
+        voiceState.audio.pause();
+        voiceState.audio.currentTime = 0;
+      }
+      voiceState.recorder = new MediaRecorder(voiceState.stream);
+      voiceState.recorder.ondataavailable = (event) => {
+        if (event.data.size) voiceState.chunks.push(event.data);
+      };
+      voiceState.recorder.onstop = () => {
+        const blob = new Blob(voiceState.chunks, { type: voiceState.recorder?.mimeType || "audio/webm" });
+        voiceState.recorder = null;
+        voiceState.chunks = [];
+        if (!voiceState.discardNextRecording && blob.size) void submitVoiceBlob(blob);
+      };
+      voiceState.recorder.start();
+      setVoiceStatus("Listening to you…", true, "speaking");
+    }
+  } else if (voiceState.speaking) {
+    if (!voiceState.silenceSince) voiceState.silenceSince = now;
+    if (now - voiceState.silenceSince >= 850) {
+      voiceState.speaking = false;
+      voiceState.recorder?.stop();
+      setVoiceStatus("Thinking…", true, "thinking");
+    }
+  }
+  voiceState.monitorFrame = requestAnimationFrame(monitorVoiceLevel);
+}
+
+function stopContinuousVoice() {
+  voiceState.active = false;
+  if (voiceState.monitorFrame) cancelAnimationFrame(voiceState.monitorFrame);
+  voiceState.monitorFrame = null;
+  voiceState.discardNextRecording = true;
+  voiceState.recorder?.stop();
+  voiceState.recorder = null;
+  voiceState.speaking = false;
+  voiceState.stream?.getTracks().forEach((track) => track.stop());
+  voiceState.stream = null;
+  voiceState.audioContext?.close();
+  voiceState.audioContext = null;
+  voiceState.analyser = null;
+  voiceState.audio?.pause();
+  $("voiceBtn").textContent = "🎤";
+  setVoiceStatus("", false, null);
+  if (voiceState.voiceChatId) void openChat(voiceState.voiceChatId);
+}
+
+async function submitVoiceBlob(blob) {
+  if (voiceState.processing) {
+    voiceState.queuedBlob = blob;
+    return;
+  }
+  voiceState.processing = true;
+  setVoiceStatus("Thinking…", true, "thinking");
+  try {
+    if (!voiceState.voiceChatId || !voiceState.sourceChatId) {
+      if (!state.currentChatId) throw new Error("Select a chat before starting voice");
+      const session = await api("/api/v1/voice/sessions", {
+        method: "POST",
+        body: JSON.stringify({ source_chat_id: state.currentChatId }),
+      });
+      voiceState.voiceChatId = session.chat_id;
+      voiceState.sourceChatId = state.currentChatId;
+    }
+    const requestId = globalThis.crypto?.randomUUID?.() || `voice-${Date.now()}-${Math.random()}`;
+    const response = await fetch("/api/v1/voice/turns", {
+      method: "POST",
+      headers: {
+        "Content-Type": blob.type || "audio/webm",
+        "X-Agent-Slack-Filename": "voice.webm",
+        "X-Agent-Slack-Voice-Chat": voiceState.voiceChatId,
+        "Idempotency-Key": requestId,
+        ...(state.activeServerId ? { "X-Agent-Slack-Server": state.activeServerId } : {}),
+      },
+      body: blob,
+    });
+    if (!response.ok) throw new Error(await response.text() || "Backend voice turn failed");
+    const events = (await response.text()).split("\n").filter(Boolean).map((line) => JSON.parse(line));
+    for (const event of events) {
+      if (event.type === "voice_transcript") setVoiceStatus(`Heard: "${event.text || ""}"`, true, "thinking");
+      if (event.type === "speech_ready" && event.url) {
+        voiceState.audio?.pause();
+        voiceState.audio = new Audio(new URL(event.url, window.location.origin));
+        setVoiceStatus(event.text ? `"${event.text}"` : "Responding…", true, "responding");
+        await voiceState.audio.play();
+        await new Promise((resolve) => {
+          voiceState.audio.addEventListener("ended", resolve, { once: true });
+          voiceState.audio.addEventListener("error", resolve, { once: true });
+        });
+      }
+      if (event.type === "agent_failed" || event.type === "error") throw new Error(event.message || event.text || "Backend voice turn failed");
+    }
+    if (voiceState.active) setVoiceStatus("Listening — speak naturally, I'll respond out loud", true, "listening");
+  } catch (error) {
+    setVoiceStatus("Backend voice error: " + error.message, true, "error");
+  } finally {
+    voiceState.processing = false;
+    if (voiceState.queuedBlob && voiceState.active) {
+      const queued = voiceState.queuedBlob;
+      voiceState.queuedBlob = null;
+      void submitVoiceBlob(queued);
+    }
+  }
+}
+
+function appendChoiceInteraction(container, message) {
+  const choice = interactionHelpers.choiceForMessage(message);
+  if (!choice) return;
+  const selected = new Set(choice.selectedOptionIds);
+  const card = document.createElement("section");
+  card.className = `choice-card ${choice.status}`;
+  card.setAttribute("aria-label", choice.prompt);
+
+  const prompt = document.createElement("strong");
+  prompt.className = "choice-prompt";
+  prompt.textContent = choice.prompt;
+  card.appendChild(prompt);
+
+  const options = document.createElement("div");
+  options.className = "choice-options";
+  card.appendChild(options);
+
+  const submit = document.createElement("button");
+  submit.type = "button";
+  submit.className = "choice-submit";
+  submit.textContent = "Submit selection";
+
+  const setBusy = (busy) => {
+    card.querySelectorAll("button").forEach((button) => {
+      button.disabled = busy || choice.status === "answered";
+    });
+    if (busy) submit.textContent = "Sending…";
+  };
+
+  const update = () => {
+    options.querySelectorAll("[data-choice-option]").forEach((button) => {
+      const isSelected = selected.has(button.dataset.choiceOption);
+      button.classList.toggle("selected", isSelected);
+      button.setAttribute("aria-pressed", String(isSelected));
+    });
+    submit.disabled = selected.size === 0 || state.answeringQuestionIds.has(choice.questionId);
+  };
+
+  choice.options.forEach((option) => {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "choice-option";
+    button.dataset.choiceOption = option.id;
+    const label = document.createElement("strong");
+    label.textContent = option.label;
+    button.appendChild(label);
+    if (option.description) {
+      const description = document.createElement("span");
+      description.textContent = option.description;
+      button.appendChild(description);
+    }
+    button.disabled = choice.status === "answered";
+    button.onclick = async () => {
+      const next = interactionHelpers.nextSelection(choice, [...selected], option.id);
+      selected.clear();
+      next.forEach((id) => selected.add(id));
+      update();
+      if (!choice.multiple) {
+        setBusy(true);
+        await answerAgentQuestion(choice, [...selected]);
+      }
+    };
+    options.appendChild(button);
+  });
+
+  if (choice.multiple && choice.status === "pending") {
+    submit.onclick = async () => {
+      setBusy(true);
+      await answerAgentQuestion(choice, [...selected]);
+    };
+    card.appendChild(submit);
+  } else if (choice.status === "answered") {
+    const status = document.createElement("small");
+    status.className = "choice-status";
+    status.textContent = "Answered";
+    card.appendChild(status);
+  }
+  update();
+  container.appendChild(card);
 }
 
 function createStreamingRow(taskId, agentId, agentLabel) {
@@ -455,7 +730,7 @@ async function renderStreamEvent(event) {
   } else if (event.type === "agent_completed") {
     const stream = state.streamingRows.get(taskId);
     if (stream) {
-      stream.body.innerHTML = renderMarkdown(stream.rawText);
+      stream.body.innerHTML = renderMarkdown(event.body || stream.rawText);
       stream.row.classList.remove("streaming");
       stream.row.querySelector("time").textContent = "just now";
       stream.stopButton.remove();
@@ -499,6 +774,65 @@ async function renderStreamEvent(event) {
     const error = new Error(event.message || "Agent run failed");
     error.agentRunFailure = true;
     throw error;
+  }
+}
+
+function runPayloadForMessage(currentChat, body, mentionedAgentIdsOverride = null) {
+  const memberIds = currentChat?.member_ids || [];
+  const mentionedAgentIds = mentionedAgentIdsOverride
+    ?? mentionHelpers.resolveAgentIds(body, state.agents);
+  const leadAgentId = state.orchestratorIds.find((agentId) => memberIds.includes(agentId));
+  if (currentChat?.kind !== "direct" && mentionedAgentIds.length > 0) {
+    const targetAgentId = mentionedAgentIds[0];
+    return {
+      mode: "respond",
+      agent_ids: [targetAgentId],
+      lead_agent_id: targetAgentId,
+      objective: body,
+    };
+  }
+  if (currentChat?.kind === "direct" && memberIds.length === 1) {
+    const directAgentId = memberIds[0];
+    return state.orchestratorIds.includes(directAgentId)
+      ? { mode: "auto_meeting", lead_agent_id: directAgentId, objective: body }
+      : { mode: "respond", agent_ids: [directAgentId], objective: body };
+  }
+  if (!memberIds.length) return null;
+  return leadAgentId
+    ? { mode: "meeting", lead_agent_id: leadAgentId, participant_ids: memberIds, objective: body }
+    : { mode: "respond", agent_ids: memberIds, objective: body };
+}
+
+async function answerAgentQuestion(choice, optionIds) {
+  if (
+    !state.currentChatId
+    || state.runInProgress
+    || state.answeringQuestionIds.has(choice.questionId)
+    || optionIds.length === 0
+  ) return;
+  state.answeringQuestionIds.add(choice.questionId);
+  const chatId = state.currentChatId;
+  try {
+    const chat = await api(
+      `/api/chats/${encodeURIComponent(chatId)}/questions/${encodeURIComponent(choice.questionId)}/answer`,
+      {
+        method: "POST",
+        body: JSON.stringify({ option_ids: optionIds }),
+      },
+    );
+    if (state.currentChatId !== chatId) return;
+    renderChat(chat);
+    await loadChats();
+    const currentChat = state.chats.find((item) => item.chat_id === chatId);
+    const objective = interactionHelpers.answerObjective(choice, optionIds);
+    const payload = runPayloadForMessage(currentChat, objective, []);
+    if (payload) await runChatStream(payload, chatId);
+  } catch (error) {
+    console.error(error);
+    alert(`Unable to answer agent question: ${error.message}`);
+    if (state.currentChatId === chatId) await openChat(chatId);
+  } finally {
+    state.answeringQuestionIds.delete(choice.questionId);
   }
 }
 
@@ -742,39 +1076,102 @@ async function sendMessage() {
   const body = $("messageInput").value.trim();
   if (!body) return;
   const currentChat = state.chats.find((chat) => chat.chat_id === state.currentChatId);
-  await api(`/api/chats/${state.currentChatId}/messages`, {
-    method: "POST",
-    body: JSON.stringify({ body }),
-  });
-  $("messageInput").value = "";
-  await openChat(state.currentChatId);
-  const memberIds = currentChat?.member_ids || [];
-  const mentionedAgentIds = mentionHelpers.resolveAgentIds(body, state.agents);
-  const leadAgentId = state.orchestratorIds.find((agentId) => memberIds.includes(agentId));
-  let runPayload = null;
-  if (currentChat?.kind !== "direct" && mentionedAgentIds.length > 0) {
-    const targetAgentId = mentionedAgentIds[0];
-    runPayload = {
-      mode: "respond",
-      agent_ids: [targetAgentId],
-      lead_agent_id: targetAgentId,
-      objective: body,
-    };
-  } else if (currentChat?.kind === "direct" && memberIds.length === 1) {
-    const directAgentId = memberIds[0];
-    if (state.orchestratorIds.includes(directAgentId)) {
-      runPayload = { mode: "auto_meeting", lead_agent_id: directAgentId, objective: body };
+  $("sendBtn").disabled = true;
+  $("sendBtn").textContent = state.pendingAttachments.length ? "Uploading..." : "Sending...";
+  try {
+    const uploads = await Promise.all(state.pendingAttachments.map(uploadAttachment));
+    await api(`/api/chats/${state.currentChatId}/messages`, {
+      method: "POST",
+      body: JSON.stringify({
+        body,
+        attachment_ids: uploads.map((attachment) => attachment.attachment_id),
+      }),
+    });
+    $("messageInput").value = "";
+    clearPendingAttachments();
+    await openChat(state.currentChatId);
+    const runPayload = runPayloadForMessage(currentChat, body);
+    if (runPayload) {
+      await runChatStream(runPayload, state.currentChatId);
     } else {
-      runPayload = { mode: "respond", agent_ids: [directAgentId], objective: body };
+      $("sendBtn").disabled = false;
+      $("sendBtn").textContent = "Send";
     }
-  } else if (memberIds.length > 0) {
-    if (leadAgentId) {
-      runPayload = { mode: "meeting", lead_agent_id: leadAgentId, participant_ids: memberIds, objective: body };
-    } else {
-      runPayload = { mode: "respond", agent_ids: memberIds, objective: body };
+  } catch (error) {
+    $("sendBtn").disabled = false;
+    $("sendBtn").textContent = "Send";
+    alert(`Unable to send message: ${error.message}`);
+  }
+}
+
+async function uploadAttachment(file) {
+  const response = await fetch("/api/v1/uploads", {
+    method: "POST",
+    headers: {
+      "Content-Type": file.type || "application/octet-stream",
+      "X-Agent-Slack-Filename": encodeURIComponent(file.name),
+      ...(state.activeServerId ? { "X-Agent-Slack-Server": state.activeServerId } : {}),
+    },
+    body: file,
+  });
+  if (!response.ok) throw new Error(await response.text() || `HTTP ${response.status}`);
+  return response.json();
+}
+
+function selectAttachments(files) {
+  let rejectedLargeFile = false;
+  let rejectedCount = false;
+  const existing = new Set(
+    state.pendingAttachments.map((file) => `${file.name}:${file.size}:${file.lastModified}`)
+  );
+  for (const file of files) {
+    if (file.size > 50 * 1024 * 1024) {
+      rejectedLargeFile = true;
+      continue;
+    }
+    const key = `${file.name}:${file.size}:${file.lastModified}`;
+    if (!existing.has(key) && state.pendingAttachments.length < 10) {
+      state.pendingAttachments.push(file);
+      existing.add(key);
+    } else if (!existing.has(key)) {
+      rejectedCount = true;
     }
   }
-  if (runPayload) await runChatStream(runPayload, state.currentChatId);
+  renderPendingAttachments();
+  if (rejectedLargeFile) alert("Attachments must be 50 MB or smaller.");
+  if (rejectedCount) alert("You can attach up to 10 items per message.");
+}
+
+function renderPendingAttachments() {
+  const container = $("pendingAttachments");
+  container.innerHTML = "";
+  state.pendingAttachments.forEach((file, index) => {
+    const chip = document.createElement("span");
+    chip.className = "pending-attachment";
+    chip.append(document.createTextNode(`${file.type.startsWith("image/") ? "🖼️" : "📄"} ${file.name} · ${formatBytes(file.size)}`));
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.textContent = "×";
+    remove.setAttribute("aria-label", `Remove ${file.name}`);
+    remove.onclick = () => {
+      state.pendingAttachments.splice(index, 1);
+      renderPendingAttachments();
+    };
+    chip.appendChild(remove);
+    container.appendChild(chip);
+  });
+}
+
+function clearPendingAttachments() {
+  state.pendingAttachments = [];
+  renderPendingAttachments();
+}
+
+function formatBytes(value) {
+  const bytes = Number(value) || 0;
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
 function hideMentionMenu() {
@@ -965,6 +1362,20 @@ function formatTime(value) {
 }
 
 $("sendBtn").onclick = sendMessage;
+$("voiceBtn").onclick = toggleVoice;
+const messageInputWrap = $("messageInput").closest(".message-input-wrap");
+["dragenter", "dragover"].forEach((eventName) => messageInputWrap.addEventListener(eventName, (event) => {
+  event.preventDefault();
+  if (event.dataTransfer?.types?.includes("Files")) messageInputWrap.classList.add("drag-active");
+}));
+messageInputWrap.addEventListener("dragleave", (event) => {
+  if (!messageInputWrap.contains(event.relatedTarget)) messageInputWrap.classList.remove("drag-active");
+});
+messageInputWrap.addEventListener("drop", (event) => {
+  event.preventDefault();
+  messageInputWrap.classList.remove("drag-active");
+  if (event.dataTransfer?.files?.length) selectAttachments(event.dataTransfer.files);
+});
 $("messageInput").addEventListener("keydown", (event) => {
   const firstMention = $("mentionMenu").querySelector("[data-mention-agent]");
   if (!$("mentionMenu").hidden && firstMention && ["Enter", "Tab"].includes(event.key)) {

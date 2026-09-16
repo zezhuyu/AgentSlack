@@ -152,3 +152,19 @@ def test_plain_project_persists_selected_cli_provider_and_model(tmp_path: Path, 
     assert updated["model"] == "claude-custom"
     assert manager.active_app().orchestrator.backend == "claude"
     assert manager.active_app().orchestrator.model == "claude-custom"
+
+
+def test_multi_agent_project_honors_selected_cli_provider(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.delenv("AGENT_SLACK_CLI", raising=False)
+    monkeypatch.setattr("agent_slack.orchestrator.shutil.which", lambda name: f"/bin/{name}")
+    app_root = tmp_path / "app"
+    project_root = tmp_path / "multi-agent-project"
+    (app_root / "static").mkdir(parents=True)
+    _write_agent(project_root, "coordinator")
+    _write_agent(project_root, "reviewer")
+    manager = AgentServerManager(app_root=app_root, data_root=tmp_path / "data")
+
+    server = manager.add_server(project_root, runner="claude")
+
+    assert server["runner"] == "claude"
+    assert manager.active_app().orchestrator.backend == "claude"

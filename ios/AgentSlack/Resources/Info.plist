@@ -27,6 +27,8 @@
 	</dict>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>Agent Slack connects to agent servers running on your trusted local network.</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>Agent Slack uses the microphone for optional voice input.</string>
 	<key>UILaunchScreen</key>
 	<dict>
 		<key>UIColorName</key>

@@ -1,6 +1,6 @@
 'use strict';
 
-const { app, BrowserWindow, Menu, Tray, clipboard, dialog, ipcMain, nativeImage, shell } = require('electron');
+const { app, BrowserWindow, Menu, Tray, clipboard, dialog, ipcMain, nativeImage, session, shell, systemPreferences } = require('electron');
 const { spawn, execFileSync } = require('child_process');
 const fs = require('fs');
 const http = require('http');
@@ -154,6 +154,7 @@ async function startBackend() {
   const launch = backendLaunch();
   const dataRoot = path.join(app.getPath('userData'), 'data');
   const logRoot = path.join(app.getPath('userData'), 'logs');
+  const defaultWhisperModel = path.join(app.getPath('userData'), 'models', 'ggml-base.bin');
   fs.mkdirSync(dataRoot, { recursive: true });
   fs.mkdirSync(logRoot, { recursive: true });
   const log = fs.openSync(path.join(logRoot, 'backend.log'), 'a');
@@ -173,6 +174,9 @@ async function startBackend() {
     env: {
       ...process.env,
       PATH: pathValue,
+      ...(process.env.AGENT_SLACK_WHISPER_MODEL || !fs.existsSync(defaultWhisperModel)
+        ? {}
+        : { AGENT_SLACK_WHISPER_MODEL: defaultWhisperModel }),
       PYTHONUNBUFFERED: '1',
       PYTHONDONTWRITEBYTECODE: '1',
     },
@@ -203,6 +207,17 @@ async function restartBackend() {
   backendPort = null;
   const port = await startBackend();
   if (mainWindow) mainWindow.loadURL(`http://127.0.0.1:${port}`);
+}
+
+function configureMicrophoneAccess() {
+  const defaultSession = session.defaultSession;
+  defaultSession.setPermissionRequestHandler((webContents, permission, callback) => {
+    callback(permission === 'media');
+  });
+  defaultSession.setPermissionCheckHandler((webContents, permission) => permission === 'media');
+  if (process.platform === 'darwin' && systemPreferences.askForMediaAccess) {
+    systemPreferences.askForMediaAccess('microphone').catch(() => {});
+  }
 }
 
 function createWindow(port) {
@@ -370,6 +385,7 @@ app.whenReady().then(async () => {
   try {
     settings = loadSettings();
     if (settings.launchAtLogin) app.setLoginItemSettings({ openAtLogin: true });
+    configureMicrophoneAccess();
     const port = await startBackend();
     createTray();
     configureDockMenu();

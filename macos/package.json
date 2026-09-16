@@ -26,6 +26,12 @@
       "category": "public.app-category.productivity",
       "icon": "assets/app-icon.png",
       "identity": "-",
+      "extendInfo": {
+        "NSMicrophoneUsageDescription": "Agent Slack uses your microphone for voice chat with your local agent."
+      },
+      "hardenedRuntime": true,
+      "entitlements": "entitlements.mac.plist",
+      "entitlementsInherit": "entitlements.mac.plist",
       "signIgnore": [
         "Resources/backend/agent-slack-backend$"
       ],

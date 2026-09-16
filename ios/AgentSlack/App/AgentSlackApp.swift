@@ -26,7 +26,7 @@ private struct ChatVisualFixture: View {
         let defaults = UserDefaults(suiteName: suiteName) ?? .standard
         defaults.removePersistentDomain(forName: suiteName)
         let model = AppModel(defaults: defaults)
-        model.selectedChat = Chat(
+        let chat = Chat(
             chatID: "visual-fixture",
             title: "Portfolio review",
             kind: "direct",
@@ -59,10 +59,69 @@ private struct ChatVisualFixture: View {
                     {"status":"pass","confidence":0.91,"note":"\\n\\n Inputs are current \\n\\n"}
                     """,
                     createdAt: "2026-07-22T02:20:12.000Z"
+                ),
+                ChatMessage(
+                    messageID: "agent-question",
+                    authorType: "agent",
+                    authorID: "risk_gate",
+                    authorLabel: "Risk Gate",
+                    body: "I need your allocation preference before continuing.",
+                    createdAt: "2026-07-22T02:20:16.000Z",
+                    metadata: ChatMessageMetadata(
+                        interaction: ChatInteraction(
+                            kind: "choice",
+                            questionID: "allocation-preference",
+                            prompt: "Which risk profile should the agents use?",
+                            options: [
+                                ChatInteractionOption(
+                                    id: "balanced",
+                                    label: "Balanced",
+                                    description: "Keep growth and downside protection evenly weighted."
+                                ),
+                                ChatInteractionOption(
+                                    id: "conservative",
+                                    label: "Conservative",
+                                    description: "Prioritize capital preservation and lower volatility."
+                                )
+                            ],
+                            multiple: false,
+                            status: "pending",
+                            selectedOptionIDs: nil
+                        )
+                    )
                 )
             ],
             createdAt: nil,
             updatedAt: nil
+        )
+        model.configureVisualFixture(
+            chat: chat,
+            agents: [
+                AgentProfile(
+                    agentID: "chief_investment_officer",
+                    name: "Chief Investment Officer",
+                    title: "Chief Investment Officer",
+                    summary: "Coordinates portfolio decisions.",
+                    group: "Leadership",
+                    kind: "lead"
+                ),
+                AgentProfile(
+                    agentID: "data_quality",
+                    name: "Data Quality",
+                    title: "Data Quality Agent",
+                    summary: "Checks source and calculation quality.",
+                    group: "Research",
+                    kind: "specialist"
+                ),
+                AgentProfile(
+                    agentID: "risk_gate",
+                    name: "Risk Gate",
+                    title: "Risk Gate",
+                    summary: "Reviews portfolio downside.",
+                    group: "Risk",
+                    kind: "specialist"
+                )
+            ]
         )
         _model = StateObject(wrappedValue: model)
     }

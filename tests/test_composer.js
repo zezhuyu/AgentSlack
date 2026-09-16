@@ -58,3 +58,32 @@ test("plain projects can choose a CLI provider and model without API keys", () =
   assert.match(appSource, /runner:\s*\$\("serverRunner"\)\.value/);
   assert.match(appSource, /model:\s*\$\("serverModel"\)\.value\.trim\(\)/);
 });
+
+test("composer uploads selected files before posting attachment ids", () => {
+  assert.doesNotMatch(html, /id="attachBtn"/);
+  assert.match(html, /id="pendingAttachments"/);
+  assert.match(appSource, /\/api\/v1\/uploads/);
+  assert.match(appSource, /X-Agent-Slack-Filename/);
+  assert.match(appSource, /attachment_ids:\s*uploads\.map/);
+  assert.match(appSource, /message\.metadata\?\.attachments/);
+  assert.match(appSource, /dataTransfer\?\.files/);
+  assert.match(appSource, /selectAttachments\(event\.dataTransfer\.files\)/);
+  assert.match(styles, /message-input-wrap\.drag-active/);
+  assert.match(styles, /\.pending-attachments/);
+  assert.match(styles, /\.message-attachments/);
+});
+
+test("created files and voice input have client actions", () => {
+  assert.match(html, /id="voiceBtn"/);
+  assert.match(html, /class="message-input-row"[\s\S]*id="voiceBtn"[\s\S]*id="messageInput"/);
+  assert.match(appSource, /voice\/turns/);
+  assert.match(appSource, /X-Agent-Slack-Voice-Chat/);
+  assert.match(appSource, /speech_ready/);
+  assert.match(appSource, /getUserMedia\(\{\s*audio:/);
+  assert.match(appSource, /requestAnimationFrame\(monitorVoiceLevel\)/);
+  assert.match(appSource, /getByteTimeDomainData/);
+  assert.match(appSource, /stopContinuousVoice\(\)/);
+  assert.doesNotMatch(appSource, /messageInput\"\)\.value = result\.text/);
+  assert.doesNotMatch(appSource, /SpeechRecognition/);
+  assert.match(appSource, /attachment\.url \|\|/);
+});

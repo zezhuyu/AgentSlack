@@ -69,6 +69,10 @@ struct AgentSlackAPI {
         try await request(path: "servers", method: "GET", workspaceID: nil, body: Optional<String>.none)
     }
 
+    func health(workspaceID: String) async throws -> HealthResponse {
+        try await request(path: "health", method: "GET", workspaceID: workspaceID, body: Optional<String>.none)
+    }
+
     func agents(workspaceID: String) async throws -> [AgentProfile] {
         let response: AgentsResponse = try await request(path: "agents", method: "GET", workspaceID: workspaceID, body: Optional<String>.none)
         return response.agents
@@ -87,18 +91,142 @@ struct AgentSlackAPI {
         try await request(path: "chats", method: "POST", workspaceID: workspaceID, body: payload)
     }
 
-    func postMessage(_ body: String, chatID: String, workspaceID: String) async throws -> Chat {
+    func deleteChat(_ chatID: String, workspaceID: String) async throws -> DeleteChatResponse {
+        try await request(
+            path: "chats/\(chatID)",
+            method: "DELETE",
+            workspaceID: workspaceID,
+            body: Optional<String>.none
+        )
+    }
+
+    func postMessage(_ body: String, chatID: String, workspaceID: String, idempotencyKey: String = UUID().uuidString) async throws -> Chat {
         try await request(
             path: "chats/\(chatID)/messages",
             method: "POST",
             workspaceID: workspaceID,
-            body: PostMessageRequest(body: body)
+            body: PostMessageRequest(body: body, idempotencyKey: idempotencyKey)
+        )
+    }
+
+    func postMessage(
+        _ body: String,
+        attachmentIDs: [String],
+        chatID: String,
+        workspaceID: String,
+        idempotencyKey: String = UUID().uuidString
+    ) async throws -> Chat {
+        try await request(
+            path: "chats/\(chatID)/messages",
+            method: "POST",
+            workspaceID: workspaceID,
+            body: PostMessageRequest(
+                body: body,
+                attachmentIDs: attachmentIDs.isEmpty ? nil : attachmentIDs,
+                idempotencyKey: idempotencyKey
+            )
+        )
+    }
+
+    func uploadAttachment(
+        _ attachment: PendingAttachmentUpload,
+        workspaceID: String
+    ) async throws -> UploadedAttachment {
+        var request = try makeRequest(
+            path: "uploads",
+            method: "POST",
+            workspaceID: workspaceID
+        )
+        request.httpBody = attachment.data
+        request.setValue(attachment.contentType, forHTTPHeaderField: "Content-Type")
+        request.setValue(
+            attachment.filename.agentSlackPercentEncodedFilename,
+            forHTTPHeaderField: "X-Agent-Slack-Filename"
+        )
+        let (data, response) = try await session.data(for: request)
+        try validate(response: response, data: data)
+        do {
+            return try JSONDecoder().decode(UploadedAttachment.self, from: data)
+        } catch {
+            throw APIError.invalidResponse
+        }
+    }
+
+    func transcribeAudio(_ data: Data, filename: String = "voice.wav", workspaceID: String) async throws -> String {
+        var request = try makeRequest(path: "voice/transcribe", method: "POST", workspaceID: workspaceID)
+        request.httpBody = data
+        request.setValue("audio/wav", forHTTPHeaderField: "Content-Type")
+        request.setValue(filename.agentSlackPercentEncodedFilename, forHTTPHeaderField: "X-Agent-Slack-Filename")
+        let (data, response) = try await session.data(for: request)
+        try validate(response: response, data: data)
+        let result = try JSONDecoder().decode(VoiceTranscriptionResponse.self, from: data)
+        return result.text
+    }
+
+    func createVoiceSession(sourceChatID: String, workspaceID: String) async throws -> Chat {
+        try await request(
+            path: "voice/sessions",
+            method: "POST",
+            workspaceID: workspaceID,
+            body: ["source_chat_id": sourceChatID]
+        )
+    }
+
+    func streamVoiceTurn(
+        _ data: Data,
+        filename: String = "voice.wav",
+        chatID: String,
+        workspaceID: String,
+        requestID: String = UUID().uuidString
+    ) -> AsyncThrowingStream<VoiceTurnEvent, Error> {
+        AsyncThrowingStream { continuation in
+            let producer = Task {
+                do {
+                    var request = try makeRequest(path: "voice/turns", method: "POST", workspaceID: workspaceID, timeoutInterval: Self.streamingTimeout)
+                    request.httpBody = data
+                    request.setValue("audio/wav", forHTTPHeaderField: "Content-Type")
+                    request.setValue(filename.agentSlackPercentEncodedFilename, forHTTPHeaderField: "X-Agent-Slack-Filename")
+                    request.setValue(chatID, forHTTPHeaderField: "X-Agent-Slack-Voice-Chat")
+                    request.setValue(requestID, forHTTPHeaderField: "Idempotency-Key")
+                    let (bytes, response) = try await session.bytes(for: request)
+                    try validate(response: response, data: nil)
+                    for try await line in bytes.lines where !line.isEmpty {
+                        guard let data = line.data(using: .utf8) else { continue }
+                        continuation.yield(try JSONDecoder().decode(VoiceTurnEvent.self, from: data))
+                    }
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+            continuation.onTermination = { @Sendable _ in producer.cancel() }
+        }
+    }
+
+    func speechData(path: String) async throws -> Data {
+        guard let url = URL(string: path, relativeTo: baseURL)?.absoluteURL else { throw APIError.invalidResponse }
+        let (data, response) = try await session.data(from: url)
+        try validate(response: response, data: data)
+        return data
+    }
+
+    func answerQuestion(
+        chatID: String,
+        questionID: String,
+        optionIDs: [String],
+        workspaceID: String
+    ) async throws -> Chat {
+        try await request(
+            path: "chats/\(chatID)/questions/\(questionID)/answer",
+            method: "POST",
+            workspaceID: workspaceID,
+            body: AnswerQuestionRequest(optionIDs: optionIDs)
         )
     }
 
     func streamReply(chatID: String, workspaceID: String, runRequest: RunRequest) -> AsyncThrowingStream<RunEvent, Error> {
         AsyncThrowingStream { continuation in
-            Task {
+            let producer = Task {
                 do {
                     var request = try makeRequest(
                         path: "chats/\(chatID)/run-stream",
@@ -118,7 +246,38 @@ struct AgentSlackAPI {
                     continuation.finish(throwing: error)
                 }
             }
+            continuation.onTermination = { @Sendable _ in
+                producer.cancel()
+            }
         }
+    }
+
+    func activeRuns(workspaceID: String) async throws -> [ActiveRun] {
+        let response: ActiveRunsResponse = try await request(
+            path: "runs/active",
+            method: "GET",
+            workspaceID: workspaceID,
+            body: Optional<String>.none
+        )
+        return response.runs
+    }
+
+    func cancelRun(_ runID: String, workspaceID: String) async throws -> CancellationResponse {
+        try await request(
+            path: "runs/\(runID)/cancel",
+            method: "POST",
+            workspaceID: workspaceID,
+            body: Optional<String>.none
+        )
+    }
+
+    func cancelTask(_ taskID: String, runID: String, workspaceID: String) async throws -> CancellationResponse {
+        try await request(
+            path: "runs/\(runID)/tasks/\(taskID)/cancel",
+            method: "POST",
+            workspaceID: workspaceID,
+            body: Optional<String>.none
+        )
     }
 
     func imageURL(path: String?, revision: String? = nil) -> URL? {
@@ -137,6 +296,15 @@ struct AgentSlackAPI {
         queryItems.append(URLQueryItem(name: "revision", value: revision))
         components.queryItems = queryItems
         return components.url
+    }
+
+    func fileURL(for attachment: UploadedAttachment) -> URL? {
+        if let path = attachment.url, let url = URL(string: path, relativeTo: baseURL)?.absoluteURL {
+            return url
+        }
+        var url = baseURL.appendingPathComponent("api/v1/uploads")
+            .appendingPathComponent(attachment.attachmentID)
+        return url
     }
 
     private func request<Response: Decodable, Body: Encodable>(
@@ -207,4 +375,11 @@ private extension URLSession {
         configuration.timeoutIntervalForResource = AgentSlackAPI.streamingTimeout
         return URLSession(configuration: configuration)
     }()
+}
+
+private extension String {
+    var agentSlackPercentEncodedFilename: String {
+        let allowed = CharacterSet(charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~")
+        return addingPercentEncoding(withAllowedCharacters: allowed) ?? self
+    }
 }

@@ -2,6 +2,7 @@ import SwiftUI
 
 struct RootView: View {
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
+    @Environment(\.scenePhase) private var scenePhase
     @StateObject private var model = AppModel()
     @State private var showingAddServer = false
     @State private var showingNewChat = false
@@ -22,6 +23,18 @@ struct RootView: View {
         }
         .tint(SlackTheme.interactiveAccent)
         .task { await model.bootstrap() }
+        .onChange(of: scenePhase) { _, phase in
+            switch phase {
+            case .background:
+                model.prepareForBackground()
+            case .active:
+                Task { await model.resumeAfterForeground() }
+            case .inactive:
+                break
+            @unknown default:
+                break
+            }
+        }
     }
 
     private var workspace: some View {
@@ -389,6 +402,7 @@ struct DirectoryView: View {
     @ObservedObject var model: AppModel
     @Binding var section: DirectorySection
     @Binding var showingNewChat: Bool
+    @State private var chatPendingDeletion: ChatSummary?
 
     var body: some View {
         VStack(spacing: 0) {
@@ -442,8 +456,42 @@ struct DirectoryView: View {
                         }
                     }
                     .listRowBackground(chat.id == model.selectedChat?.id ? SlackTheme.selection.opacity(0.12) : Color.clear)
+                    .swipeActions {
+                        Button(role: .destructive) {
+                            chatPendingDeletion = chat
+                        } label: {
+                            Label("Delete", systemImage: "trash")
+                        }
+                        .disabled(model.activeRunChatIDs.contains(chat.id))
+                    }
+                    .contextMenu {
+                        Button(role: .destructive) {
+                            chatPendingDeletion = chat
+                        } label: {
+                            Label("Delete Chat", systemImage: "trash")
+                        }
+                        .disabled(model.activeRunChatIDs.contains(chat.id))
+                    }
                 }
                 .listStyle(.plain)
+                .alert(
+                    "Delete chat?",
+                    isPresented: Binding(
+                        get: { chatPendingDeletion != nil },
+                        set: { if !$0 { chatPendingDeletion = nil } }
+                    ),
+                    presenting: chatPendingDeletion
+                ) { chat in
+                    Button("Delete", role: .destructive) {
+                        chatPendingDeletion = nil
+                        Task { await model.deleteChat(chat) }
+                    }
+                    Button("Cancel", role: .cancel) {
+                        chatPendingDeletion = nil
+                    }
+                } message: { chat in
+                    Text("“\(chat.title)” and all of its messages will be permanently deleted.")
+                }
             }
         }
     }

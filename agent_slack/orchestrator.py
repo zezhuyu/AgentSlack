@@ -6,11 +6,32 @@ import re
 import signal
 import shutil
 import subprocess
+import urllib.request
+import urllib.error
 import threading
 from html import unescape
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
+
+
+def _send_vibebridge_audio(text: str) -> None:
+    """Best-effort local TTS handoff; never delays or breaks an agent run."""
+    text = " ".join(text.split())[:4000]
+    if not text:
+        return
+    payload = json.dumps({"text": text}).encode("utf-8")
+    request = urllib.request.Request(
+        "http://127.0.0.1:8875/integrations/agent-slack/result",
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=2):
+            pass
+    except (OSError, urllib.error.URLError):
+        pass
 from uuid import uuid4
 
 
@@ -227,6 +248,7 @@ class CliOrchestrator:
             if not task or source_tool_id in completed:
                 return []
             result = self._clean_agent_result(raw_result)
+            _send_vibebridge_audio(result)
             if is_error:
                 completed.add(source_tool_id)
                 return [{
@@ -490,6 +512,7 @@ class CliOrchestrator:
             return
 
         if final_result and not lead_text and not result_is_error:
+            _send_vibebridge_audio(final_result)
             if not lead_started:
                 yield {
                     "type": "agent_started",
@@ -551,8 +574,7 @@ class CliOrchestrator:
                 str(self.executable),
                 "exec",
                 "--ephemeral",
-                "--sandbox",
-                "workspace-write",
+                "--dangerously-bypass-approvals-and-sandbox",
                 "--skip-git-repo-check",
                 "--color",
                 "never",
@@ -568,8 +590,7 @@ class CliOrchestrator:
             "--print",
             "--output-format",
             "text",
-            "--permission-mode",
-            "dontAsk",
+            "--dangerously-skip-permissions",
             "--no-session-persistence",
         ]
         if self.model:
@@ -596,8 +617,7 @@ class CliOrchestrator:
             "--replay-user-messages",
             "--verbose",
             "--include-partial-messages",
-            "--permission-mode",
-            "dontAsk",
+            "--dangerously-skip-permissions",
             "--no-session-persistence",
         ])
         return command
@@ -622,10 +642,7 @@ class CliOrchestrator:
         objective: str | None,
     ) -> str:
         recent = transcript[-18:]
-        transcript_text = "\n".join(
-            f"[{item.get('author_label', item.get('author_id', 'unknown'))}] {item.get('body', '').strip()}"
-            for item in recent
-        )
+        transcript_text = "\n".join(self._format_transcript_item(item) for item in recent)
         direct_instruction = (
             "Handle this request directly in the project root using the project's own instructions and tools. "
             "No Agent Slack subagent roster is configured for this folder. "
@@ -636,12 +653,54 @@ class CliOrchestrator:
             "retrieve each complete result through the host's native task-result tools before the final "
             "synthesis so the client can relay each specialist response. "
         )
+        interaction_contract = self._interaction_prompt_contract()
+        skill_contract = self._skill_prompt_contract()
+        agent_contract = self._agent_definition_contract()
         return (
             f"Agent Slack conversation: {chat.get('title')}\n"
             f"Objective: {objective or 'Respond to the latest user message.'}\n\n"
             f"Recent transcript:\n{transcript_text}\n\n"
             f"{direct_instruction}"
-            "Return the final user-facing answer as Slack-ready Markdown."
+            f"{skill_contract}\n"
+            f"{agent_contract}\n"
+            "Return the final user-facing answer as Slack-ready Markdown.\n"
+            f"{interaction_contract}"
+        )
+
+    @staticmethod
+    def _skill_prompt_contract() -> str:
+        return (
+            "Keep the host CLI's native skills, plugins, MCP servers, hooks, and user configuration "
+            "enabled. Treat matching skills in project or user `.agents/skills`, `.claude/skills`, "
+            "and `.codex/skills` directories as available across runners: locate and read the complete "
+            "`SKILL.md` before acting, even when the current CLI's native skill registry does not list it. "
+        )
+
+    @staticmethod
+    def _agent_definition_contract() -> str:
+        return (
+            "The host agent system is Markdown-defined and shared across Codex and Claude runners. "
+            "Read the complete relevant definitions before using a role: `.claude/agents/*.md`, "
+            "`.claude/subagents/*/*.md`, and `.codex/agents/**/*.md`. The selected role's Markdown "
+            "instructions are included above; other specialist definitions remain available in the project "
+            "root. When a task requests a written deliverable, create the requested Markdown file in the "
+            "project using the host instructions, then return a concise summary and its path. Do not edit "
+            "agent-definition files unless the user explicitly asks for that. Codex must not assume Claude's "
+            "`--agent` flag exists; use the project's documented subagent mechanism or perform roles "
+            "sequentially when no native delegation mechanism is available."
+        )
+
+    @staticmethod
+    def _interaction_prompt_contract() -> str:
+        return (
+            "If you cannot continue without a user decision or approval, explain the context briefly, "
+            "then end your response with exactly one <agent-slack-question> block containing JSON shaped "
+            'like {"prompt":"Question for the user","multiple":false,"options":'
+            '[{"id":"stable-id","label":"User-visible choice","description":"Consequence of this choice"}]}. '
+            "Provide 2-12 task-specific options; their labels and descriptions must come from your current "
+            "decision, not a generic template. Do not invoke a native interactive question tool because "
+            "Agent Slack cannot display its terminal prompt; use this block instead. Do not emit the block "
+            "when no user decision is required."
         )
 
     @staticmethod
@@ -794,10 +853,8 @@ class CliOrchestrator:
         objective: str | None,
     ) -> str:
         recent = transcript[-18:]
-        transcript_text = "\n".join(
-            f"[{item.get('author_label', item.get('author_id', 'unknown'))}] {item.get('body', '').strip()}"
-            for item in recent
-        )
+        transcript_text = "\n".join(self._format_transcript_item(item) for item in recent)
+        agent_contract = self._agent_definition_contract()
         return f"""You are replying as one coworker in a Slack-style agent workspace for: {self.workspace_name}.
 
 Agent profile:
@@ -823,7 +880,7 @@ Recent transcript:
 
 Reply requirements:
 - Return only the message this coworker should post in the chat.
-- Write natural, Slack-ready Markdown. Do not return JSON, YAML, XML, a schema, or a serialized response envelope.
+- Write natural, Slack-ready Markdown. Do not return JSON, YAML, XML, a schema, or a serialized response envelope except for the agent question block described below.
 - Do not wrap the response in fields such as agent, status, summary, evidence, or next_tasks. Use short headings and bullets when structure helps.
 - If your agent workflow requires a structured artifact, save that artifact separately and post a human-readable summary in this chat.
 - Stay in character and focus on this agent's responsibility.
@@ -834,7 +891,31 @@ Reply requirements:
 - For a simple greeting, reply naturally without starting a research workflow.
 - For a meeting, contribute only your specialty; the lead synthesizes after participants.
 - Do not restate the transcript or discuss these instructions.
+- {self._skill_prompt_contract()}
+- {agent_contract}
+
+Interactive questions:
+- {self._interaction_prompt_contract()}
 """
+
+    @staticmethod
+    def _format_transcript_item(item: dict[str, Any]) -> str:
+        author = item.get("author_label", item.get("author_id", "unknown"))
+        rendered = f"[{author}] {item.get('body', '').strip()}"
+        attachments = (item.get("metadata") or {}).get("attachments") or []
+        if not attachments:
+            return rendered
+        paths = "\n".join(
+            f"- {attachment.get('filename', 'attachment')}: {attachment.get('path')} "
+            f"({attachment.get('content_type', 'application/octet-stream')}, "
+            f"{attachment.get('size', 0)} bytes)"
+            for attachment in attachments
+        )
+        return (
+            f"{rendered}\n"
+            "Attachments available to you at these absolute paths:\n"
+            f"{paths}"
+        )
 
     def _offline_reply(
         self,

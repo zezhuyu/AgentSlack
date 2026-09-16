@@ -94,7 +94,22 @@ Replies stream as NDJSON events:
 {"type":"run_completed","chat_id":"abc123"}
 ```
 
-A native-agent failure emits `agent_failed` and persists a visible error message. Meeting state is persisted as `running`, `completed`, or `completed_with_errors`. The backend completes and persists an active run even if the requesting stream disconnects.
+A native-agent failure emits `agent_failed` and persists a visible error message. Meeting state is persisted as `running`, `completed`, or `completed_with_errors`. The backend completes and persists an active run even if the requesting stream disconnects. An iOS background transition cancels only the client stream, suppresses the expected transport error, and reconciles the selected chat plus active-run state when the app returns to the foreground; duplicate sends remain blocked while the recovered run is active.
+
+Desktop/web and iOS clients may select up to ten files or images for a message.
+Each file is uploaded as raw bytes to the selected server before message
+posting, with a 50 MB per-file limit. Clients submit the returned opaque upload
+IDs; the server rejects unknown IDs, persists attachment metadata on the user
+message, and renders only server-resolved absolute paths into the agent
+transcript alongside the user prompt.
+
+If the lead or a native subagent needs a user decision, it may end its message
+with an `<agent-slack-question>` JSON block. Agent Slack validates and removes
+the transport block, persists the agent-authored prompt/options in
+`message.metadata.interaction`, and exposes a versioned answer endpoint.
+Clients must render the supplied choices rather than infer or hard-code
+approval labels. An answer is a persisted user turn, so the next one-shot CLI
+session receives the decision through normal transcript context.
 
 ## 5. Execution Contract
 

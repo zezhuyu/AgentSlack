@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import json
+import mimetypes
+import re
+import shutil
 from collections import Counter
 from collections.abc import Iterator
 from copy import deepcopy
@@ -10,11 +14,16 @@ from uuid import uuid4
 
 from .architecture import AgentSystemArchitecture
 from .discovery import AgentDiscovery
+from .interactions import extract_choice_interaction
 from .orchestrator import CliOrchestrator
 from .storage import AgentSlackStorage, utc_now
+from .voice import LocalVoiceBackend
 
 
 class AgentSlackApp:
+    MAX_UPLOAD_BYTES = 50 * 1024 * 1024
+    MAX_ATTACHMENTS_PER_MESSAGE = 10
+
     def __init__(
         self,
         project_root: Path,
@@ -33,7 +42,9 @@ class AgentSlackApp:
         self.runner_override = str(runner_override or "").strip().casefold() or None
         self.model_override = str(model_override or "").strip() or None
         self._run_state_lock = RLock()
+        self._chat_interaction_lock = RLock()
         self._active_run_states: dict[str, dict[str, Any]] = {}
+        self.voice = LocalVoiceBackend()
         self.reload_host_configuration()
         self.bootstrap()
 
@@ -43,8 +54,8 @@ class AgentSlackApp:
             return
         discovered = self.discovery.discover()
         project_fallback = len(discovered) == 1 and discovered[0].kind == "project"
-        runner = (
-            self.runner_override or "claude"
+        runner = self.runner_override or (
+            "claude"
             if project_fallback and self.architecture.runner == "auto"
             else self.architecture.runner
         )
@@ -79,6 +90,65 @@ class AgentSlackApp:
 
     def architecture_summary(self) -> dict[str, Any]:
         return self.architecture.summary(self.project_root)
+
+    def voice_capabilities(self) -> dict[str, Any]:
+        """Capabilities advertised to native clients and the local web panel."""
+        return {
+            "enabled": True,
+            "transport": "shared_chat_run_stream",
+            **self.voice.capabilities(),
+            "interruption": {"stop_audio": True, "cancel_agent_on_barge_in": False},
+            "files": {"upload": True, "preview": True, "max_bytes": self.MAX_UPLOAD_BYTES},
+        }
+
+    def create_voice_session(self, source_chat_id: str) -> dict[str, Any]:
+        source = self.storage.get_chat(source_chat_id)
+        if source is None:
+            raise KeyError(f"Chat not found: {source_chat_id}")
+        title = f"Voice · {source.get('title') or 'Conversation'}"
+        return self.create_chat(title, list(source.get("member_ids", [])), kind="voice")
+
+    def store_speech(self, content: bytes) -> str:
+        speech_id = uuid4().hex
+        directory = (self.data_root / "speech" / speech_id).resolve()
+        directory.mkdir(parents=True, exist_ok=False)
+        (directory / "speech.wav").write_bytes(content)
+        return speech_id
+
+    def speech_path(self, speech_id: str) -> Path | None:
+        if not re.fullmatch(r"[0-9a-f]{32}", str(speech_id or "")):
+            return None
+        path = (self.data_root / "speech" / speech_id / "speech.wav").resolve()
+        root = (self.data_root / "speech").resolve()
+        return path if path.is_file() and path.is_relative_to(root) else None
+
+    def stream_voice_turn(self, chat_id: str, audio: bytes, suffix: str, request_id: str) -> Iterator[dict[str, Any]]:
+        text = self.voice.transcribe(audio, suffix)
+        yield {"type": "voice_transcript", "text": text}
+        if not text:
+            yield {"type": "voice_turn_failed", "message": "No speech was recognized"}
+            return
+        _chat, is_new = self.submit_voice_utterance(chat_id, text, request_id)
+        if not is_new:
+            yield {"type": "voice_turn_duplicate", "request_id": request_id}
+            return
+        events = self.stream_run(chat_id=chat_id, mode="respond")
+        latest_reply = ""
+        for event in events:
+            if event.get("type") == "agent_completed":
+                latest_reply = str(event.get("message") or event.get("body") or latest_reply)
+            yield event
+        if not latest_reply:
+            chat = self.storage.get_chat(chat_id) or {}
+            latest_reply = next((str(message.get("body") or "") for message in reversed(chat.get("messages", [])) if message.get("author_type") == "agent"), "")
+        if latest_reply:
+            speech_id = self.store_speech(self.voice.synthesize(latest_reply))
+            yield {
+                "type": "speech_ready",
+                "speech_id": speech_id,
+                "url": f"/api/v1/voice/speech/{speech_id}",
+                "text": latest_reply,
+            }
 
     def list_chats(self) -> list[dict[str, Any]]:
         chats = self.storage.list_chats()
@@ -179,10 +249,16 @@ class AgentSlackApp:
             with self._run_state_lock:
                 self._active_run_states.pop(run_id, None)
 
+    def _chat_has_active_run(self, chat_id: str) -> bool:
+        with self._run_state_lock:
+            return any(run["chat_id"] == chat_id for run in self._active_run_states.values())
+
     def delete_chat(self, chat_id: str) -> dict[str, Any]:
         chat = self.storage.get_chat(chat_id)
         if chat is None:
             raise KeyError(f"Chat not found: {chat_id}")
+        if self._chat_has_active_run(chat_id):
+            raise ValueError(f"Cannot delete chat {chat_id} while a run is still active")
         agent_ids = set(chat.get("member_ids", []))
         agent_ids.update(
             message.get("author_id")
@@ -203,20 +279,282 @@ class AgentSlackApp:
         self._append_system_message(chat["chat_id"], f"Chat created for: {', '.join(member_ids)}")
         return self.storage.get_chat(chat["chat_id"]) or chat
 
-    def add_user_message(self, chat_id: str, body: str, author_label: str = "You") -> dict[str, Any]:
-        chat = self.storage.append_message(
+    def store_upload(self, filename: str, content_type: str, content: bytes) -> dict[str, Any]:
+        if not content:
+            raise ValueError("Upload is empty")
+        if len(content) > self.MAX_UPLOAD_BYTES:
+            raise ValueError("Upload exceeds the 50 MB limit")
+        safe_name = self._safe_upload_filename(filename)
+        attachment_id = uuid4().hex
+        upload_dir = (self.data_root / "uploads" / attachment_id).resolve()
+        upload_dir.mkdir(parents=True, exist_ok=False)
+        file_path = upload_dir / safe_name
+        file_path.write_bytes(content)
+        metadata = {
+            "attachment_id": attachment_id,
+            "filename": safe_name,
+            "content_type": str(content_type or "application/octet-stream").split(";", 1)[0].strip()
+            or "application/octet-stream",
+            "size": len(content),
+        }
+        (upload_dir / "metadata.json").write_text(
+            json.dumps(metadata, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        return {**metadata, "path": str(file_path.resolve())}
+
+    def get_upload_path(self, attachment_id: str) -> tuple[Path, dict[str, Any]] | None:
+        """Resolve an attachment through its opaque ID, never a client path."""
+        if not re.fullmatch(r"[0-9a-f]{32}", str(attachment_id or "")):
+            return None
+        uploads_root = (self.data_root / "uploads").resolve()
+        upload_dir = (uploads_root / attachment_id).resolve()
+        metadata_path = upload_dir / "metadata.json"
+        if not upload_dir.is_relative_to(uploads_root) or not metadata_path.is_file():
+            return None
+        try:
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            filename = self._safe_upload_filename(str(metadata["filename"]))
+        except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+            return None
+        file_path = (upload_dir / filename).resolve()
+        if not file_path.is_relative_to(upload_dir) or not file_path.is_file():
+            return None
+        return file_path, {**metadata, "filename": filename}
+
+    def store_created_artifact(self, source: Path) -> dict[str, Any] | None:
+        if not self._is_shareable_artifact(source):
+            return None
+        if source.stat().st_size > self.MAX_UPLOAD_BYTES:
+            return None
+        artifact_id = uuid4().hex
+        artifact_dir = (self.data_root / "artifacts" / artifact_id).resolve()
+        artifact_dir.mkdir(parents=True, exist_ok=False)
+        target = artifact_dir / self._safe_upload_filename(source.name)
+        shutil.copyfile(source, target)
+        content_type = mimetypes.guess_type(str(source))[0]
+        metadata = {
+            "attachment_id": artifact_id,
+            "filename": target.name,
+            "content_type": content_type or "application/octet-stream",
+            "size": target.stat().st_size,
+            "url": f"/api/artifacts/{artifact_id}",
+        }
+        (artifact_dir / "metadata.json").write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
+        return metadata
+
+    @staticmethod
+    def _is_shareable_artifact(source: Path) -> bool:
+        """Exclude hidden state and obvious secret material from automatic delivery."""
+        if not source.is_file() or any(part.startswith(".") for part in source.parts):
+            return False
+        lowered = source.name.casefold()
+        return not (
+            lowered.startswith(".env")
+            or "credential" in lowered
+            or "secret" in lowered
+            or lowered.endswith((".pem", ".key", ".p12"))
+        )
+
+    def get_artifact_path(self, artifact_id: str) -> tuple[Path, dict[str, Any]] | None:
+        if not re.fullmatch(r"[0-9a-f]{32}", str(artifact_id or "")):
+            return None
+        root = (self.data_root / "artifacts").resolve()
+        directory = (root / artifact_id).resolve()
+        metadata_path = directory / "metadata.json"
+        if not directory.is_relative_to(root) or not metadata_path.is_file():
+            return None
+        try:
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            filename = self._safe_upload_filename(str(metadata["filename"]))
+        except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+            return None
+        path = (directory / filename).resolve()
+        return (path, {**metadata, "filename": filename}) if path.is_file() and path.is_relative_to(directory) else None
+
+    def resolve_uploads(self, attachment_ids: list[str] | None) -> list[dict[str, Any]]:
+        unique_ids = list(dict.fromkeys(str(value).strip() for value in attachment_ids or [] if str(value).strip()))
+        if len(unique_ids) > self.MAX_ATTACHMENTS_PER_MESSAGE:
+            raise ValueError(f"Messages support at most {self.MAX_ATTACHMENTS_PER_MESSAGE} attachments")
+        attachments = []
+        uploads_root = (self.data_root / "uploads").resolve()
+        for attachment_id in unique_ids:
+            if not re.fullmatch(r"[0-9a-f]{32}", attachment_id):
+                raise ValueError(f"Unknown attachment: {attachment_id}")
+            upload_dir = (uploads_root / attachment_id).resolve()
+            metadata_path = upload_dir / "metadata.json"
+            if not upload_dir.is_relative_to(uploads_root) or not metadata_path.is_file():
+                raise ValueError(f"Unknown attachment: {attachment_id}")
+            try:
+                metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+                filename = self._safe_upload_filename(str(metadata["filename"]))
+                file_path = (upload_dir / filename).resolve()
+            except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError):
+                raise ValueError(f"Unknown attachment: {attachment_id}") from None
+            if not file_path.is_relative_to(upload_dir) or not file_path.is_file():
+                raise ValueError(f"Unknown attachment: {attachment_id}")
+            attachments.append(
+                {
+                    "attachment_id": attachment_id,
+                    "filename": filename,
+                    "path": str(file_path),
+                    "content_type": str(metadata.get("content_type") or "application/octet-stream"),
+                    "size": file_path.stat().st_size,
+                }
+            )
+        return attachments
+
+    @staticmethod
+    def _safe_upload_filename(filename: str) -> str:
+        leaf = Path(str(filename or "").replace("\\", "/")).name.strip()
+        leaf = re.sub(r"[\x00-\x1f\x7f]", "_", leaf)
+        leaf = re.sub(r"[:/]", "_", leaf)
+        if leaf in {"", ".", ".."}:
+            leaf = "attachment"
+        if len(leaf) > 180:
+            suffix = Path(leaf).suffix[:20]
+            leaf = f"{leaf[: max(1, 180 - len(suffix))]}{suffix}"
+        return leaf
+
+    def add_user_message(
+        self,
+        chat_id: str,
+        body: str,
+        author_label: str = "You",
+        attachment_ids: list[str] | None = None,
+        idempotency_key: str | None = None,
+    ) -> dict[str, Any]:
+        key = str(idempotency_key or "").strip()
+        with self._chat_interaction_lock:
+            if key:
+                chat = self.storage.get_chat(chat_id)
+                if chat is None:
+                    raise KeyError(f"Chat not found: {chat_id}")
+                if any((message.get("metadata") or {}).get("idempotency_key") == key for message in chat.get("messages", [])):
+                    return chat
+            attachments = self.resolve_uploads(attachment_ids)
+            metadata = {"attachments": attachments} if attachments else {}
+            if key:
+                metadata["idempotency_key"] = key
+            chat = self.storage.append_message(
+                chat_id,
+                {
+                    "author_type": "user",
+                    "author_id": "user",
+                    "author_label": author_label,
+                    "body": body.strip(),
+                    "metadata": metadata,
+                },
+            )
+        for member_id in chat.get("member_ids", []):
+            self.update_agent_memory(member_id)
+        return chat
+
+    def submit_voice_utterance(
+        self, chat_id: str, body: str, request_id: str = ""
+    ) -> tuple[dict[str, Any], bool]:
+        """Atomically append a committed utterance and report whether it is new."""
+        with self._chat_interaction_lock:
+            existing = self.find_message_by_idempotency(chat_id, request_id)
+            if existing:
+                return self.storage.get_chat(chat_id) or {}, False
+            return self.add_user_message(chat_id, body, idempotency_key=request_id), True
+
+    def find_message_by_idempotency(self, chat_id: str, key: str) -> dict[str, Any] | None:
+        key = str(key or "").strip()
+        if not key:
+            return None
+        chat = self.storage.get_chat(chat_id)
+        if chat is None:
+            raise KeyError(f"Chat not found: {chat_id}")
+        return next(
+            (message for message in chat.get("messages", [])
+             if (message.get("metadata") or {}).get("idempotency_key") == key),
+            None,
+        )
+
+    def answer_question(
+        self,
+        chat_id: str,
+        question_id: str,
+        option_ids: list[str],
+        author_label: str = "You",
+    ) -> dict[str, Any]:
+        with self._chat_interaction_lock:
+            return self._answer_question_locked(
+                chat_id,
+                question_id,
+                option_ids,
+                author_label,
+            )
+
+    def _answer_question_locked(
+        self,
+        chat_id: str,
+        question_id: str,
+        option_ids: list[str],
+        author_label: str,
+    ) -> dict[str, Any]:
+        chat = self.storage.get_chat(chat_id)
+        if chat is None:
+            raise KeyError(f"Chat not found: {chat_id}")
+        interaction = None
+        for message in reversed(chat.get("messages", [])):
+            candidate = (message.get("metadata") or {}).get("interaction")
+            if candidate and candidate.get("question_id") == question_id:
+                interaction = candidate
+                break
+        if interaction is None:
+            raise KeyError(f"Question not found: {question_id}")
+        if interaction.get("kind") != "choice":
+            raise ValueError(f"Unsupported question kind: {interaction.get('kind')}")
+        if interaction.get("status") != "pending":
+            raise ValueError("This question has already been answered")
+
+        selected_ids = list(
+            dict.fromkeys(str(value).strip() for value in option_ids if str(value).strip())
+        )
+        if interaction.get("multiple"):
+            if not selected_ids:
+                raise ValueError("Select at least one option")
+        elif len(selected_ids) != 1:
+            raise ValueError("Select exactly one option")
+
+        options = {
+            str(option.get("id")): option
+            for option in interaction.get("options", [])
+            if isinstance(option, dict) and option.get("id")
+        }
+        unknown = [option_id for option_id in selected_ids if option_id not in options]
+        if unknown:
+            raise ValueError(f"Unknown option: {unknown[0]}")
+
+        labels = [str(options[option_id].get("label") or option_id) for option_id in selected_ids]
+        interaction["status"] = "answered"
+        interaction["selected_option_ids"] = selected_ids
+        interaction["answered_at"] = utc_now()
+        self.storage.save_chat(chat)
+        prompt = str(interaction.get("prompt") or "the agent question")
+        body = f'Response to "{prompt}": {", ".join(labels)}'
+        updated = self.storage.append_message(
             chat_id,
             {
                 "author_type": "user",
                 "author_id": "user",
                 "author_label": author_label,
-                "body": body.strip(),
-                "metadata": {},
+                "body": body,
+                "metadata": {
+                    "interaction_response": {
+                        "question_id": question_id,
+                        "option_ids": selected_ids,
+                        "option_labels": labels,
+                    }
+                },
             },
         )
-        for member_id in chat.get("member_ids", []):
+        for member_id in updated.get("member_ids", []):
             self.update_agent_memory(member_id)
-        return chat
+        return updated
 
     def run_agents(self, chat_id: str, agent_ids: list[str] | None = None, objective: str | None = None) -> dict[str, Any]:
         chat = self.storage.get_chat(chat_id)
@@ -237,10 +575,26 @@ class AgentSlackApp:
         return self.storage.get_chat(chat_id) or chat
 
     def cancel_run(self, run_id: str) -> dict[str, Any]:
-        return self.orchestrator.cancel_run(run_id)
+        result = self.orchestrator.cancel_run(run_id)
+        if result.get("accepted"):
+            with self._run_state_lock:
+                run = self._active_run_states.get(run_id)
+                if run:
+                    run["status"] = "stopping"
+                    for task in run["tasks"].values():
+                        if task["status"] == "running":
+                            task["status"] = "stopping"
+        return result
 
     def cancel_task(self, run_id: str, task_id: str) -> dict[str, Any]:
-        return self.orchestrator.cancel_task(run_id, task_id)
+        result = self.orchestrator.cancel_task(run_id, task_id)
+        if result.get("accepted"):
+            with self._run_state_lock:
+                run = self._active_run_states.get(run_id)
+                task = run["tasks"].get(task_id) if run else None
+                if task and task["status"] == "running":
+                    task["status"] = "stopping"
+        return result
 
     def stream_run(
         self,
@@ -294,11 +648,16 @@ class AgentSlackApp:
             raise ValueError(f"Agent not found: {run_agent_id}")
 
         run_id = uuid4().hex
+        before_files = {
+            path for path in self.project_root.rglob("*")
+            if path.is_file() and ".git" not in path.parts
+        }
         self.orchestrator.prepare_run(run_id)
         self._begin_run_state(run_id, run_chat_id, mode, run_agent_id)
         yield {
             "type": "run_started",
             "run_id": run_id,
+            "chat_id": run_chat_id,
             "mode": mode,
             "agent_ids": selected,
             "lead_agent_id": run_agent_id,
@@ -369,6 +728,11 @@ class AgentSlackApp:
                     failed_agent_ids.append(agent_id)
                 if cancelled:
                     cancelled_agent_ids.append(agent_id)
+                interaction = None
+                if event["type"] == "agent_completed" and body:
+                    body, interaction = extract_choice_interaction(body)
+                    if interaction:
+                        event = {**event, "body": body, "interaction": interaction}
                 self._update_run_task(
                     run_id,
                     task_id,
@@ -378,6 +742,19 @@ class AgentSlackApp:
                     text=body,
                 )
                 if body:
+                    metadata = {
+                        "run_id": run_id,
+                        "objective": objective,
+                        "source": (
+                            "native_agent_error" if failed
+                            else "native_agent_cancelled" if cancelled
+                            else "native_agent_reply"
+                        ),
+                        "status": "failed" if failed else "cancelled" if cancelled else "completed",
+                        "runner": self.orchestrator.backend,
+                    }
+                    if interaction:
+                        metadata["interaction"] = interaction
                     chat = self.storage.append_message(
                         run_chat_id,
                         {
@@ -385,16 +762,7 @@ class AgentSlackApp:
                             "author_id": agent_id,
                             "author_label": label,
                             "body": body,
-                            "metadata": {
-                                "objective": objective,
-                                "source": (
-                                    "native_agent_error" if failed
-                                    else "native_agent_cancelled" if cancelled
-                                    else "native_agent_reply"
-                                ),
-                                "status": "failed" if failed else "cancelled" if cancelled else "completed",
-                                "runner": self.orchestrator.backend,
-                            },
+                            "metadata": metadata,
                         },
                     )
                     if self.get_agent(agent_id):
@@ -403,6 +771,21 @@ class AgentSlackApp:
                         except Exception:
                             pass
             yield event
+
+        created = []
+        for path in self.project_root.rglob("*"):
+            if path.is_file() and ".git" not in path.parts and path not in before_files:
+                artifact = self.store_created_artifact(path)
+                if artifact:
+                    created.append(artifact)
+        if created:
+            saved_chat = self.storage.get_chat(run_chat_id)
+            if saved_chat:
+                for message in reversed(saved_chat.get("messages", [])):
+                    if message.get("author_type") == "agent" and (message.get("metadata") or {}).get("run_id") == run_id:
+                        message.setdefault("metadata", {})["attachments"] = created
+                        self.storage.save_chat(saved_chat)
+                        break
 
         if meeting_created:
             self._update_latest_meeting(
