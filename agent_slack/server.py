@@ -187,6 +187,12 @@ class _Handler(BaseHTTPRequestHandler):
             if speech_path is None:
                 return self._json({"error": "speech not found"}, status=404)
             return self._serve_file(speech_path, filename="response.wav", inline=True)
+        if path == "/api/files":
+            raw_path = (parse_qs(parsed.query).get("path") or [""])[0]
+            file_path = self._active_app().resolve_workspace_file(raw_path)
+            if file_path is None:
+                return self._json({"error": "file not found"}, status=404)
+            return self._serve_file(file_path, filename=file_path.name, inline=True)
         if not path.startswith("/api/"):
             return self._serve_static(parsed.path)
         if path.startswith("/api/") and self.manager.active_server_id is None:

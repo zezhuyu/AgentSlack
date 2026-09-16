@@ -372,6 +372,27 @@ class AgentSlackApp:
         path = (directory / filename).resolve()
         return (path, {**metadata, "filename": filename}) if path.is_file() and path.is_relative_to(directory) else None
 
+    def resolve_workspace_file(self, raw_path: str) -> Path | None:
+        """Resolve a file an agent cited by absolute path, scoped to the active project.
+
+        Agent replies sometimes cite source files as plain filesystem paths (optionally
+        with a trailing ``:line`` locator). This lets the chat preview those without
+        exposing anything outside the workspace the agent is actually running in.
+        """
+        candidate = re.sub(r":\d+(:\d+)?$", "", str(raw_path or "").strip())
+        if not candidate:
+            return None
+        try:
+            path = Path(candidate).resolve()
+        except (OSError, ValueError):
+            return None
+        root = self.project_root.resolve()
+        if not path.is_relative_to(root) or not path.is_file():
+            return None
+        if not self._is_shareable_artifact(path):
+            return None
+        return path
+
     def resolve_uploads(self, attachment_ids: list[str] | None) -> list[dict[str, Any]]:
         unique_ids = list(dict.fromkeys(str(value).strip() for value in attachment_ids or [] if str(value).strip()))
         if len(unique_ids) > self.MAX_ATTACHMENTS_PER_MESSAGE:

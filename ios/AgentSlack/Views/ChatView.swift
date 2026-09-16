@@ -1,5 +1,7 @@
 import Foundation
 import AVFoundation
+import AVKit
+import PDFKit
 import PhotosUI
 import SwiftUI
 import UniformTypeIdentifiers
@@ -176,7 +178,7 @@ struct ChatView: View {
                                 }
                                 guard let voiceChatID else { return }
                                 for try await event in api.streamVoiceTurn(
-                                    Data(contentsOf: audioURL),
+                                    try Data(contentsOf: audioURL),
                                     chatID: voiceChatID,
                                     workspaceID: workspaceID
                                 ) {
@@ -791,12 +793,15 @@ private struct MessageRow: View {
     private var attachmentCards: some View {
         VStack(alignment: .leading, spacing: 8) {
             ForEach(attachments) { attachment in
-                if let url = fileURL(attachment) {
-                    Link(destination: url) {
+                VStack(alignment: .leading, spacing: 6) {
+                    if let url = fileURL(attachment) {
+                        Link(destination: url) {
+                            attachmentCard(attachment)
+                        }
+                        AttachmentPreview(attachment: attachment, url: url)
+                    } else {
                         attachmentCard(attachment)
                     }
-                } else {
-                    attachmentCard(attachment)
                 }
             }
         }
@@ -837,6 +842,105 @@ private struct MessageRow: View {
             return "doc.richtext"
         }
         return "paperclip"
+    }
+}
+
+private struct AttachmentPreview: View {
+    let attachment: UploadedAttachment
+    let url: URL
+    @State private var isPresentingFullScreen = false
+
+    var body: some View {
+        Group {
+            if attachment.contentType.hasPrefix("image/") {
+                AsyncImage(url: url) { phase in
+                    if let image = phase.image {
+                        image.resizable().scaledToFit()
+                    } else {
+                        Color.clear
+                    }
+                }
+                .frame(maxWidth: 280, maxHeight: 220)
+                .clipShape(RoundedRectangle(cornerRadius: 10))
+                .onTapGesture { isPresentingFullScreen = true }
+                .fullScreenCover(isPresented: $isPresentingFullScreen) {
+                    ImageLightbox(url: url) { isPresentingFullScreen = false }
+                }
+            } else if attachment.contentType.hasPrefix("video/") || attachment.contentType.hasPrefix("audio/") {
+                VideoPlayer(player: AVPlayer(url: url))
+                    .frame(maxWidth: 320, minHeight: attachment.contentType.hasPrefix("audio/") ? 60 : 200)
+                    .clipShape(RoundedRectangle(cornerRadius: 10))
+            } else if attachment.contentType == "application/pdf" {
+                PDFKitView(url: url)
+                    .frame(maxWidth: 320, minHeight: 240)
+                    .clipShape(RoundedRectangle(cornerRadius: 10))
+                    .overlay {
+                        RoundedRectangle(cornerRadius: 10).stroke(SlackTheme.divider)
+                    }
+            } else if attachment.contentType.hasPrefix("text/") || attachment.contentType == "application/json" {
+                TextFilePreview(url: url, maxBytes: attachment.size)
+            } else {
+                EmptyView()
+            }
+        }
+    }
+}
+
+private struct PDFKitView: UIViewRepresentable {
+    let url: URL
+
+    func makeUIView(context: Context) -> PDFView {
+        let view = PDFView()
+        view.autoScales = true
+        view.document = PDFDocument(url: url)
+        return view
+    }
+
+    func updateUIView(_ uiView: PDFView, context: Context) {}
+}
+
+private struct ImageLightbox: View {
+    let url: URL
+    let dismiss: () -> Void
+
+    var body: some View {
+        ZStack {
+            Color.black.ignoresSafeArea()
+            AsyncImage(url: url) { phase in
+                if let image = phase.image {
+                    image.resizable().scaledToFit()
+                } else {
+                    ProgressView().tint(.white)
+                }
+            }
+        }
+        .onTapGesture(perform: dismiss)
+    }
+}
+
+private struct TextFilePreview: View {
+    let url: URL
+    let maxBytes: Int
+    @State private var content: String?
+
+    var body: some View {
+        Group {
+            if let content {
+                Text(content)
+                    .font(.caption.monospaced())
+                    .frame(maxWidth: 320, alignment: .leading)
+                    .padding(8)
+                    .background(SlackTheme.composerField, in: RoundedRectangle(cornerRadius: 8))
+                    .frame(maxHeight: 200)
+            } else {
+                EmptyView()
+            }
+        }
+        .task {
+            guard maxBytes <= 200 * 1024 else { return }
+            guard let (data, _) = try? await URLSession.shared.data(from: url) else { return }
+            content = String(decoding: data.prefix(4000), as: UTF8.self)
+        }
     }
 }
 

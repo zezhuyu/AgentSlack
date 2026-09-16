@@ -115,6 +115,30 @@ def test_created_artifact_capture_excludes_hidden_and_secret_files(tmp_path: Pat
     assert app.store_created_artifact(secret) is None
 
 
+def test_resolve_workspace_file_previews_cited_paths_inside_the_project(tmp_path: Path, monkeypatch) -> None:
+    app = _app(tmp_path, monkeypatch)
+    cited = app.project_root / "notes" / "report.md"
+    cited.parent.mkdir(parents=True)
+    cited.write_text("findings", encoding="utf-8")
+
+    resolved = app.resolve_workspace_file(f"{cited}:122")
+
+    assert resolved == cited
+
+
+def test_resolve_workspace_file_rejects_paths_outside_the_project_or_secrets(tmp_path: Path, monkeypatch) -> None:
+    app = _app(tmp_path, monkeypatch)
+    outside = tmp_path / "outside.md"
+    outside.write_text("nope", encoding="utf-8")
+    secret = app.project_root / "credentials.pem"
+    secret.write_text("private", encoding="utf-8")
+
+    assert app.resolve_workspace_file(str(outside)) is None
+    assert app.resolve_workspace_file(str(secret)) is None
+    assert app.resolve_workspace_file("") is None
+    assert app.resolve_workspace_file(str(app.project_root / "missing.md")) is None
+
+
 def test_agent_choice_question_is_persisted_and_answered_from_dynamic_options(
     tmp_path: Path, monkeypatch
 ) -> None:

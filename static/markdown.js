@@ -14,8 +14,12 @@
 
   function safeUrl(value) {
     const url = String(value || "").trim();
-    if (/^https?:\/\//i.test(url) || /^\/(?!\/)/.test(url) || /^#/.test(url)) {
+    if (/^https?:\/\//i.test(url) || /^#/.test(url)) {
       return escapeHtml(url);
+    }
+    if (/^\/(?!\/)/.test(url)) {
+      if (url.startsWith("/api/")) return escapeHtml(url);
+      return `/api/v1/files?path=${encodeURIComponent(url)}`;
     }
     return null;
   }

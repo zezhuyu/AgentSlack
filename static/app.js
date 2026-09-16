@@ -361,11 +361,107 @@ function renderChat(chat) {
         <div class="message-content">${renderMarkdown(message.body || "")}</div>
       </div>
     `;
+    appendLocalFilePreviews(row.querySelector(".message-content"));
     appendMessageAttachments(row.querySelector(".message-body"), message);
     appendChoiceInteraction(row.querySelector(".message-body"), message);
     messages.appendChild(row);
   });
   messages.scrollTop = followLatest ? messages.scrollHeight : previousScrollTop;
+}
+
+function attachmentUrl(attachment) {
+  return attachment.url || `/api/uploads/${encodeURIComponent(attachment.attachment_id)}`;
+}
+
+function openLightbox(kind, url, label) {
+  const overlay = document.createElement("div");
+  overlay.className = "lightbox-overlay";
+  overlay.addEventListener("click", (event) => {
+    if (event.target === overlay) overlay.remove();
+  });
+  const media = kind === "video"
+    ? Object.assign(document.createElement("video"), { src: url, controls: true, autoplay: true })
+    : Object.assign(document.createElement("img"), { src: url, alt: label || "" });
+  media.className = "lightbox-media";
+  overlay.appendChild(media);
+  document.body.appendChild(overlay);
+}
+
+async function appendTextPreview(container, attachment, url) {
+  if (attachment.size > 200 * 1024) return;
+  try {
+    const response = await fetch(url);
+    if (!response.ok) return;
+    const text = await response.text();
+    const pre = document.createElement("pre");
+    pre.className = "attachment-text-preview";
+    pre.textContent = text.slice(0, 4000);
+    container.appendChild(pre);
+  } catch (_error) {
+    // No preview if the file can't be fetched; the file chip above still links to it.
+  }
+}
+
+const EXTENSION_CONTENT_TYPES = {
+  png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg", gif: "image/gif", webp: "image/webp", svg: "image/svg+xml",
+  mp4: "video/mp4", webm: "video/webm", mov: "video/quicktime",
+  mp3: "audio/mpeg", wav: "audio/wav", m4a: "audio/mp4", ogg: "audio/ogg",
+  pdf: "application/pdf",
+  txt: "text/plain", md: "text/markdown", json: "application/json", csv: "text/csv", log: "text/plain",
+  yml: "text/yaml", yaml: "text/yaml", py: "text/x-python", js: "text/javascript", ts: "text/typescript",
+};
+
+function guessContentType(filename) {
+  const extension = String(filename || "").split(".").pop()?.toLowerCase() || "";
+  return EXTENSION_CONTENT_TYPES[extension] || null;
+}
+
+function appendLocalFilePreviews(container) {
+  container.querySelectorAll('a[href^="/api/v1/files?path="], a[href^="/api/files?path="]').forEach((anchor) => {
+    const url = new URL(anchor.getAttribute("href"), window.location.origin);
+    const rawPath = decodeURIComponent(url.searchParams.get("path") || "");
+    const filename = rawPath.replace(/:\d+(:\d+)?$/, "").split("/").pop() || "file";
+    const contentType = guessContentType(filename);
+    if (!contentType) return;
+    const card = document.createElement("div");
+    card.className = "message-attachment-card";
+    appendPreviewMedia(card, { filename, content_type: contentType, size: 0 }, url.toString());
+    anchor.insertAdjacentElement("afterend", card);
+  });
+}
+
+function appendPreviewMedia(card, attachment, url) {
+  const contentType = attachment.content_type || "";
+  if (contentType.startsWith("image/")) {
+    const img = document.createElement("img");
+    img.className = "attachment-preview-media attachment-preview-image";
+    img.src = url;
+    img.alt = attachment.filename;
+    img.loading = "lazy";
+    img.addEventListener("click", () => openLightbox("image", url, attachment.filename));
+    card.appendChild(img);
+  } else if (contentType.startsWith("video/")) {
+    const video = document.createElement("video");
+    video.className = "attachment-preview-media";
+    video.src = url;
+    video.controls = true;
+    video.preload = "metadata";
+    card.appendChild(video);
+  } else if (contentType.startsWith("audio/")) {
+    const audio = document.createElement("audio");
+    audio.className = "attachment-preview-audio";
+    audio.src = url;
+    audio.controls = true;
+    audio.preload = "metadata";
+    card.appendChild(audio);
+  } else if (contentType === "application/pdf") {
+    const embed = document.createElement("iframe");
+    embed.className = "attachment-preview-pdf";
+    embed.src = url;
+    card.appendChild(embed);
+  } else if (contentType.startsWith("text/") || contentType === "application/json") {
+    void appendTextPreview(card, attachment, url);
+  }
 }
 
 function appendMessageAttachments(container, message) {
@@ -374,14 +470,23 @@ function appendMessageAttachments(container, message) {
   const list = document.createElement("div");
   list.className = "message-attachments";
   attachments.forEach((attachment) => {
-    const item = document.createElement("a");
-    item.className = "message-attachment";
-    item.href = attachment.url || `/api/uploads/${encodeURIComponent(attachment.attachment_id)}`;
-    item.target = "_blank";
-    item.rel = "noopener";
-    item.textContent = `📎 ${attachment.filename} · ${formatBytes(attachment.size)}`;
-    item.title = attachment.content_type || "File attachment";
-    list.appendChild(item);
+    const url = attachmentUrl(attachment);
+    const contentType = attachment.content_type || "";
+    const card = document.createElement("div");
+    card.className = "message-attachment-card";
+
+    const chip = document.createElement("a");
+    chip.className = "message-attachment";
+    chip.href = url;
+    chip.target = "_blank";
+    chip.rel = "noopener";
+    chip.textContent = `📎 ${attachment.filename} · ${formatBytes(attachment.size)}`;
+    chip.title = contentType || "File attachment";
+    card.appendChild(chip);
+
+    appendPreviewMedia(card, attachment, url);
+
+    list.appendChild(card);
   });
   container.appendChild(list);
 }
@@ -524,11 +629,11 @@ async function submitVoiceBlob(blob) {
     if (!response.ok) throw new Error(await response.text() || "Backend voice turn failed");
     const events = (await response.text()).split("\n").filter(Boolean).map((line) => JSON.parse(line));
     for (const event of events) {
-      if (event.type === "voice_transcript") setVoiceStatus(`Heard: "${event.text || ""}"`, true, "thinking");
+      if (event.type === "voice_transcript") setVoiceStatus("Thinking…", true, "thinking");
       if (event.type === "speech_ready" && event.url) {
         voiceState.audio?.pause();
         voiceState.audio = new Audio(new URL(event.url, window.location.origin));
-        setVoiceStatus(event.text ? `"${event.text}"` : "Responding…", true, "responding");
+        setVoiceStatus("Responding…", true, "responding");
         await voiceState.audio.play();
         await new Promise((resolve) => {
           voiceState.audio.addEventListener("ended", resolve, { once: true });
