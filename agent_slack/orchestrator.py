@@ -48,7 +48,10 @@ class CliOrchestrator:
         self.workspace_name = workspace_name
         self.project_root = project_root
         self.model = str(model or "").strip() or None
-        self.timeout_seconds = int(os.environ.get("AGENT_SLACK_CLI_TIMEOUT", "180"))
+        # Long-running project operations (renders, media generation, model
+        # exports) routinely need more than the old three-minute ceiling.
+        self.timeout_seconds = max(1, int(os.environ.get("AGENT_SLACK_CLI_TIMEOUT", "600")))
+        self.retry_count = max(0, int(os.environ.get("AGENT_SLACK_CLI_RETRIES", "2")))
         self._run_lock = threading.RLock()
         self._active_runs: dict[str, dict[str, Any]] = {}
         self.backend, self.executable = self._resolve_backend(
@@ -122,27 +125,44 @@ class CliOrchestrator:
         if self.executable is None:
             return self._offline_reply(agent, transcript, objective)
 
-        prompt = self._compose_prompt(agent, chat, transcript, memory, objective)
-        try:
-            result = subprocess.run(
-                self._command(),
-                input=prompt,
-                text=True,
-                capture_output=True,
-                cwd=self.project_root,
-                timeout=self.timeout_seconds,
-                check=False,
-            )
-        except subprocess.TimeoutExpired:
-            return self._error_reply(agent, f"timed out after {self.timeout_seconds} seconds")
-        except OSError as exc:
-            return self._error_reply(agent, str(exc))
+        base_prompt = self._compose_prompt(agent, chat, transcript, memory, objective)
+        attempts = self.retry_count + 1
+        last_detail = "no response"
+        for attempt in range(attempts):
+            prompt = base_prompt
+            if attempt:
+                prompt += (
+                    "\n\nThis is retry {attempt} of {attempts}. A previous CLI attempt timed out or failed. "
+                    "Inspect any work already produced in the project root, preserve valid outputs, and "
+                    "continue or finish the requested task instead of starting over unnecessarily."
+                ).format(attempt=attempt + 1, attempts=attempts)
+            try:
+                result = subprocess.run(
+                    self._command(),
+                    input=prompt,
+                    text=True,
+                    capture_output=True,
+                    cwd=self.project_root,
+                    timeout=self.timeout_seconds,
+                    check=False,
+                )
+            except subprocess.TimeoutExpired:
+                last_detail = f"timed out after {self.timeout_seconds} seconds"
+                continue
+            except OSError as exc:
+                last_detail = str(exc)
+                break
 
-        reply = result.stdout.strip()
-        if result.returncode == 0 and reply:
-            return reply
-        detail = result.stderr.strip() or reply or f"exited with status {result.returncode}"
-        return self._error_reply(agent, detail)
+            reply = result.stdout.strip()
+            if result.returncode == 0 and reply:
+                return reply
+            last_detail = result.stderr.strip() or reply or f"exited with status {result.returncode}"
+            # Authentication and command errors are deterministic; do not
+            # repeatedly rerun them and make the user wait for no benefit.
+            break
+        if attempts > 1 and last_detail.startswith("timed out after"):
+            last_detail = f"{last_detail} (after {attempts} attempts)"
+        return self._error_reply(agent, last_detail)
 
     def stream_agent_reply(
         self,
@@ -168,7 +188,8 @@ class CliOrchestrator:
                 "agent_label": agent["title"],
             }
             yield {"type": "delta", "agent_id": agent["agent_id"], "text": reply}
-            yield {"type": "agent_completed", "agent_id": agent["agent_id"]}
+            event_type = "agent_failed" if reply.startswith("[CLI error]") else "agent_completed"
+            yield {"type": event_type, "agent_id": agent["agent_id"], "message": reply}
             if run_id:
                 with self._run_lock:
                     self._active_runs.pop(run_id, None)

@@ -133,6 +133,44 @@ def test_reports_cli_failure_without_offline_api_message(tmp_path: Path, monkeyp
     assert reply == "[CLI error] System Coordinator could not reply through codex: login required"
 
 
+def test_codex_timeout_uses_longer_default_and_retries(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("AGENT_SLACK_CLI", "codex")
+    monkeypatch.delenv("AGENT_SLACK_CLI_TIMEOUT", raising=False)
+    monkeypatch.setenv("AGENT_SLACK_CLI_RETRIES", "1")
+    monkeypatch.setattr("agent_slack.orchestrator.shutil.which", lambda name: f"/bin/{name}")
+    calls = []
+
+    def fake_run(command, **kwargs):
+        calls.append(kwargs)
+        raise subprocess.TimeoutExpired(command, kwargs["timeout"])
+
+    monkeypatch.setattr("agent_slack.orchestrator.subprocess.run", fake_run)
+    orchestrator = CliOrchestrator("SampleProject", tmp_path)
+
+    reply = _reply(orchestrator)
+
+    assert len(calls) == 2
+    assert all(call["timeout"] == 600 for call in calls)
+    assert "after 2 attempts" in reply
+
+
+def test_codex_timeout_is_reported_as_agent_failure(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("AGENT_SLACK_CLI", "codex")
+    monkeypatch.setenv("AGENT_SLACK_CLI_RETRIES", "0")
+    monkeypatch.setattr("agent_slack.orchestrator.shutil.which", lambda name: f"/bin/{name}")
+    monkeypatch.setattr(
+        "agent_slack.orchestrator.subprocess.run",
+        lambda command, **kwargs: (_ for _ in ()).throw(subprocess.TimeoutExpired(command, kwargs["timeout"])),
+    )
+    orchestrator = CliOrchestrator("SampleProject", tmp_path)
+    events = list(orchestrator.stream_agent_reply(
+        agent={"agent_id": "coordinator", "title": "Coordinator"},
+        chat={"title": "Chat"}, transcript=[], memory={},
+    ))
+
+    assert events[-1]["type"] == "agent_failed"
+
+
 def test_host_runner_preference_is_used_without_environment_override(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.delenv("AGENT_SLACK_CLI", raising=False)
     monkeypatch.setattr("agent_slack.orchestrator.shutil.which", lambda name: f"/bin/{name}")

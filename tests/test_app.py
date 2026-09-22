@@ -52,6 +52,28 @@ def test_direct_response_runs_one_connected_agent_session(tmp_path: Path, monkey
     assert app.get_chat(chat["chat_id"])["messages"][-1]["body"] == "Final host answer."
 
 
+def test_project_task_persists_cli_failure_as_failed_not_completed(tmp_path: Path, monkeypatch) -> None:
+    app = _app(tmp_path, monkeypatch)
+    task = app.storage.create_task({
+        "workspace_key": app.workspace_key,
+        "agent_id": "coordinator",
+        "instruction": "Generate a long-running asset",
+        "status": "queued",
+        "source": "chatgpt",
+    })
+
+    def failed_stream(*_args, **_kwargs):
+        yield {"type": "run_started", "run_id": "run-timeout"}
+        yield {"type": "agent_failed", "agent_id": "coordinator", "message": "[CLI error] timed out"}
+
+    app.stream_run = failed_stream
+    app._run_project_task(task["task_id"])
+
+    updated = app.storage.get_task(task["task_id"])
+    assert updated["status"] == "failed"
+    assert "timed out" in updated["result"]
+
+
 def test_uploaded_files_are_stored_with_trusted_absolute_paths_and_attached_to_messages(
     tmp_path: Path, monkeypatch
 ) -> None:

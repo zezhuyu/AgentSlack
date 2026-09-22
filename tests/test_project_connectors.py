@@ -119,3 +119,103 @@ def test_mcp_modern_discovery_shape_is_supported(tmp_path: Path) -> None:
     assert "2026-07-28" in result["supportedVersions"]
     assert result["_meta"]["io.modelcontextprotocol/serverInfo"]["name"] == "agent-slack"
     assert result["cacheScope"] == "private"
+
+
+def test_mcp_task_artifacts_are_project_scoped_resources(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    _project(project, "one")
+    skill_dir = project / ".agents" / "skills" / "render"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text("# Render skill\nUse the included Python renderer.", encoding="utf-8")
+    (skill_dir / "render.py").write_text("print('ok')", encoding="utf-8")
+    manager = AgentServerManager(tmp_path / "app", tmp_path / "data")
+    manager.add_server(project)
+    app = manager.app_for_workspace("one")
+    source = project / "result.mp3"
+    source.write_bytes(b"fake-audio")
+    artifact = app.store_created_artifact(source)
+    task = app.storage.create_task({
+        "workspace_key": "one", "agent_id": "coordinator", "instruction": "render",
+        "status": "completed", "artifacts": [artifact],
+    })
+    adapter = AgentSlackMCP(manager)
+    listed = adapter.list_task_artifacts("one", task["task_id"])
+    assert listed[0]["filename"] == "result.mp3"
+    assert listed[0]["file_uri"]["file_id"] == artifact["attachment_id"]
+    resource_response = handle_jsonrpc(adapter, {
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": {"name": "get_task_artifact", "arguments": {
+            "workspace_key": "one", "task_id": task["task_id"],
+            "artifact_id": artifact["attachment_id"],
+        }},
+    })
+    resource = resource_response["result"]["content"][0]["resource"]
+    assert resource["mimeType"] == "audio/mpeg"
+    assert resource["name"] == "result.mp3"
+    assert resource["blob"]
+    download_response = handle_jsonrpc(adapter, {
+        "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+        "params": {"name": "download_task_artifact", "arguments": {
+            "workspace_key": "one", "task_id": task["task_id"],
+            "artifact_id": artifact["attachment_id"],
+        }},
+    })
+    file_uri = download_response["result"]["structuredContent"]["file_uri"]
+    assert file_uri["file_id"] == artifact["attachment_id"]
+    assert file_uri["download_url"].startswith("agent-slack://one/")
+    assert download_response["result"]["content"][0]["type"] == "audio"
+    assert download_response["result"]["content"][0]["data"]
+    read_response = handle_jsonrpc(adapter, {
+        "jsonrpc": "2.0", "id": 3, "method": "resources/read",
+        "params": {"uri": file_uri["download_url"]},
+    })
+    assert read_response["result"]["contents"][0]["blob"]
+    assert adapter.list_project_skills("one")[0]["skill_name"] == "render"
+    with pytest.raises(KeyError):
+        adapter.list_task_artifacts("two", task["task_id"])
+
+
+@pytest.mark.parametrize(
+    ("filename", "content_type", "native_type"),
+    [
+        ("contact-sheet.png", "image/png", "image"),
+        ("model.obj", "model/obj", None),
+        ("model.blend", "model/blend", None),
+        ("report.pdf", "application/pdf", None),
+        ("notes.md", "text/markdown", None),
+        ("manifest.json", "application/json", None),
+        ("preview.mp4", "video/mp4", None),
+    ],
+)
+def test_mcp_download_materializes_every_safe_artifact_type(
+    tmp_path: Path, filename: str, content_type: str, native_type: str | None,
+) -> None:
+    project = tmp_path / "project"
+    _project(project, "one")
+    manager = AgentServerManager(tmp_path / "app", tmp_path / "data")
+    manager.add_server(project)
+    app = manager.app_for_workspace("one")
+    source = project / filename
+    source.write_bytes(b"artifact-bytes")
+    artifact = app.store_created_artifact(source)
+    assert artifact is not None
+    artifact["content_type"] = content_type
+    task = app.storage.create_task({
+        "workspace_key": "one", "agent_id": "coordinator", "instruction": "render",
+        "status": "completed", "artifacts": [artifact],
+    })
+    adapter = AgentSlackMCP(manager)
+    response = handle_jsonrpc(adapter, {
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": {"name": "download_task_artifact", "arguments": {
+            "workspace_key": "one", "task_id": task["task_id"],
+            "artifact_id": artifact["attachment_id"],
+        }},
+    })
+    content = response["result"]["content"]
+    resource = next(item for item in content if item["type"] == "resource")
+    assert resource["resource"]["blob"]
+    assert resource["resource"]["mimeType"] == content_type
+    assert any(item["type"] == "resource_link" for item in content)
+    if native_type:
+        assert any(item["type"] == native_type for item in content)

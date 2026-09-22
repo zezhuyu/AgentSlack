@@ -23,6 +23,7 @@ from .discovery import AgentDiscovery
 from .interactions import extract_choice_interaction
 from .knowledge import ProjectKnowledge
 from .memory_search import ProjectMemorySearch
+from .project_skills import list_project_skills, resolve_project_skill
 from .shared_memory import ProjectSharedMemory
 from .orchestrator import CliOrchestrator
 from .retrieval.manager import RetrievalManager
@@ -53,6 +54,9 @@ PRIMARY_CONTENT_TYPES = {"application/pdf"}
 # and some audio formats get stored as "application/octet-stream" and never preview.
 EXTENSION_CONTENT_TYPES = {
     ".glb": "model/gltf-binary", ".gltf": "model/gltf+json",
+    ".obj": "model/obj", ".blend": "model/blend", ".fbx": "model/vnd.autodesk.fbx",
+    ".stl": "model/stl", ".usdz": "model/vnd.usdz+zip",
+    ".md": "text/markdown", ".markdown": "text/markdown", ".json": "application/json",
     ".mp3": "audio/mpeg", ".wav": "audio/wav", ".m4a": "audio/mp4", ".ogg": "audio/ogg",
     ".mid": "audio/midi", ".midi": "audio/midi",
     ".webm": "video/webm", ".mov": "video/quicktime",
@@ -66,8 +70,7 @@ def _is_noise_path(path: Path) -> bool:
 
 
 def _guess_content_type(path: Path) -> str:
-    mime = mimetypes.guess_type(str(path))[0]
-    return mime or EXTENSION_CONTENT_TYPES.get(path.suffix.lower()) or "application/octet-stream"
+    return EXTENSION_CONTENT_TYPES.get(path.suffix.lower()) or mimetypes.guess_type(str(path))[0] or "application/octet-stream"
 
 
 def _attachment_role(content_type: str) -> str:
@@ -182,13 +185,16 @@ class AgentSlackApp:
             self.storage.update_task(task_id, status="running", chat_id=chat["chat_id"])
             result = ""
             run_id = None
+            run_failed = False
             for event in self.stream_run(chat["chat_id"], mode="respond", objective=task["instruction"],
                                          agent_ids=[task["agent_id"]], lead_agent_id=task["agent_id"]):
                 if event.get("type") == "run_started":
                     run_id = event.get("run_id")
                     self.storage.update_task(task_id, run_id=run_id)
-                if event.get("type") == "agent_completed":
+                if event.get("type") in {"agent_completed", "agent_failed"}:
                     result = str(event.get("message") or event.get("body") or result)
+                if event.get("type") == "agent_failed":
+                    run_failed = True
                 if event.get("type") in {"run_cancelled", "agent_cancelled"}:
                     self.storage.update_task(task_id, status="cancelled", completed_at=utc_now(), result=result)
                     return
@@ -197,8 +203,9 @@ class AgentSlackApp:
             for message in saved_chat.get("messages", []):
                 if (message.get("metadata") or {}).get("run_id") == run_id:
                     artifacts.extend((message.get("metadata") or {}).get("attachments") or [])
-            self.storage.update_task(task_id, status="completed", completed_at=utc_now(), result=result, artifacts=artifacts)
-            if result.strip():
+            final_status = "failed" if run_failed else "completed"
+            self.storage.update_task(task_id, status=final_status, completed_at=utc_now(), result=result, artifacts=artifacts)
+            if result.strip() and not run_failed:
                 self.append_project_insight(
                     f"{task_id} completed: {result.strip()[:1200]}",
                     insight_type="implementation", source=self.orchestrator.backend, task_id=task_id,
@@ -213,6 +220,58 @@ class AgentSlackApp:
         if task.get("run_id"):
             self.cancel_run(str(task["run_id"]))
         return self.storage.update_task(task_id, status="cancelled", completed_at=utc_now())
+
+    def list_task_artifacts(self, task_id: str) -> list[dict[str, Any]]:
+        task = self.storage.get_task(task_id)
+        if task is None:
+            raise KeyError(f"Task not found: {task_id}")
+        artifacts = []
+        for item in task.get("artifacts") or []:
+            artifact_id = str(item.get("attachment_id") or "")
+            if not self.get_artifact_path(artifact_id):
+                continue
+            artifacts.append({
+                "artifact_id": artifact_id,
+                "filename": item.get("filename"),
+                "content_type": item.get("content_type", "application/octet-stream"),
+                "size": item.get("size", 0),
+                "role": item.get("role", "primary"),
+                "relative_path": item.get("relative_path"),
+                "resource_uri": f"agent-slack://{self.workspace_key}/tasks/{task_id}/artifacts/{artifact_id}",
+                # Compatibility for clients that still have the original
+                # list_task_artifacts tool cached and have not refreshed the
+                # newer download_task_artifact descriptor yet.
+                "file_uri": {
+                    "download_url": f"agent-slack://{self.workspace_key}/tasks/{task_id}/artifacts/{artifact_id}",
+                    "file_id": artifact_id,
+                    "mime_type": item.get("content_type", "application/octet-stream"),
+                    "file_name": item.get("filename"),
+                },
+            })
+        return artifacts
+
+    def get_task_artifact(self, task_id: str, artifact_id: str) -> tuple[Path, dict[str, Any]]:
+        allowed = {item["artifact_id"] for item in self.list_task_artifacts(task_id)}
+        if artifact_id not in allowed:
+            raise KeyError("Artifact is not attached to this project task")
+        artifact = self.get_artifact_path(artifact_id)
+        if artifact is None:
+            raise FileNotFoundError("Artifact not found")
+        return artifact
+
+    def list_project_skills(self) -> list[dict[str, Any]]:
+        return list_project_skills(self.project_root)
+
+    def run_project_skill(self, skill_name: str, instruction: str, agent_id: str) -> dict[str, Any]:
+        skill = resolve_project_skill(self.project_root, skill_name)
+        task_instruction = (
+            f"Use the project skill {skill['skill_name']} from {skill['path']}. "
+            "Read its complete SKILL.md before acting and follow any specified Python scripts "
+            "through the existing project runner. Do not use unrelated skills or project roots.\n\n"
+            f"User request:\n{str(instruction).strip()}"
+        )
+        task = self.create_task(agent_id, task_instruction, source="chatgpt")
+        return self.storage.update_task(task["task_id"], skill_name=skill["skill_name"])
 
     def _build_chat_provider(self):
         """Prefer a directly-configured OpenAI-compatible endpoint (no CLI bootstrap
@@ -553,7 +612,17 @@ class AgentSlackApp:
         except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
             return None
         path = (directory / filename).resolve()
-        return (path, {**metadata, "filename": filename}) if path.is_file() and path.is_relative_to(directory) else None
+        if not path.is_file() or not path.is_relative_to(directory):
+            return None
+        # Older macOS MIME tables misclassified OBJ as application/x-tgif and
+        # left BLEND as octet-stream. Normalize only these known legacy generic
+        # labels so previously-created task artifacts remain downloadable with
+        # useful type information after an app upgrade.
+        content_type = str(metadata.get("content_type") or "")
+        known_type = EXTENSION_CONTENT_TYPES.get(path.suffix.lower())
+        if known_type and content_type in {"application/x-tgif", "application/octet-stream"}:
+            metadata["content_type"] = known_type
+        return path, {**metadata, "filename": filename}
 
     def resolve_workspace_file(self, raw_path: str) -> Path | None:
         """Resolve a file an agent cited by path, scoped to the active project.
