@@ -61,7 +61,8 @@ struct ChatView: View {
                                 isStreaming: false,
                                 isStopping: false,
                                 stopAction: nil,
-                                fileURL: { model.api?.fileURL(for: $0) }
+                                fileURL: { model.api?.fileURL(for: $0) },
+                            localFileURL: { model.api?.workspaceFileURL(forCitedPath: $0) }
                             )
                             if let interaction = choiceInteraction(for: message) {
                                 QuestionInteractionCard(
@@ -95,7 +96,8 @@ struct ChatView: View {
                             stopAction: isRunning ? {
                                 Task { await model.stopAgent(taskID: reply.id) }
                             } : nil,
-                            fileURL: { model.api?.fileURL(for: $0) }
+                            fileURL: { model.api?.fileURL(for: $0) },
+                            localFileURL: { model.api?.workspaceFileURL(forCitedPath: $0) }
                         )
                         .id("stream-\(reply.id)")
                     }
@@ -723,6 +725,27 @@ private struct MessageRow: View {
     let isStopping: Bool
     let stopAction: (() -> Void)?
     let fileURL: (UploadedAttachment) -> URL?
+    let localFileURL: (String) -> URL?
+
+    private var citedFiles: [(filename: String, url: URL)] {
+        let pattern = #"\[[^\]]+\]\(([^)\s]+)\)"#
+        guard let expression = try? NSRegularExpression(pattern: pattern) else { return [] }
+        let text = messageBody as NSString
+        let matches = expression.matches(in: messageBody, range: NSRange(location: 0, length: text.length))
+        var seen = Set<String>()
+        var results: [(filename: String, url: URL)] = []
+        for match in matches {
+            guard match.numberOfRanges > 1 else { continue }
+            let rawPath = text.substring(with: match.range(at: 1))
+            guard !rawPath.contains("://"), !rawPath.hasPrefix("#"), !rawPath.hasPrefix("mailto:") else { continue }
+            guard !seen.contains(rawPath), let url = localFileURL(rawPath) else { continue }
+            seen.insert(rawPath)
+            let filename = rawPath.replacingOccurrences(of: #":\d+(:\d+)?$"#, with: "", options: .regularExpression)
+                .split(separator: "/").last.map(String.init) ?? rawPath
+            results.append((filename, url))
+        }
+        return results
+    }
 
     var body: some View {
         HStack(alignment: .top, spacing: 10) {
@@ -761,6 +784,19 @@ private struct MessageRow: View {
 
                         if !attachments.isEmpty {
                             attachmentCards
+                        }
+                        ForEach(citedFiles, id: \.url) { cited in
+                            AttachmentPreview(
+                                attachment: UploadedAttachment(
+                                    attachmentID: cited.url.absoluteString,
+                                    filename: cited.filename,
+                                    path: cited.filename,
+                                    contentType: contentType(forFilename: cited.filename),
+                                    size: 0,
+                                    url: nil
+                                ),
+                                url: cited.url
+                            )
                         }
                     }
                     .padding(11)
@@ -843,6 +879,21 @@ private struct MessageRow: View {
         }
         return "paperclip"
     }
+}
+
+private func contentType(forFilename filename: String) -> String {
+    let extensionToType: [String: String] = [
+        "png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg", "gif": "image/gif",
+        "webp": "image/webp", "svg": "image/svg+xml",
+        "mp4": "video/mp4", "webm": "video/webm", "mov": "video/quicktime",
+        "mp3": "audio/mpeg", "wav": "audio/wav", "m4a": "audio/mp4", "ogg": "audio/ogg",
+        "pdf": "application/pdf",
+        "txt": "text/plain", "md": "text/markdown", "json": "application/json", "csv": "text/csv",
+        "log": "text/plain", "yml": "text/yaml", "yaml": "text/yaml",
+        "py": "text/x-python", "js": "text/javascript", "ts": "text/typescript",
+    ]
+    let ext = (filename as NSString).pathExtension.lowercased()
+    return extensionToType[ext] ?? "application/octet-stream"
 }
 
 private struct AttachmentPreview: View {

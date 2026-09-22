@@ -15,8 +15,11 @@ class OrchestratorConfig:
 class AgentSystemArchitecture:
     schema_version: int = 1
     manifest_path: Path | None = None
+    workspace_key: str = ""
     runner: str = "auto"
     orchestrators: dict[str, OrchestratorConfig] = field(default_factory=dict)
+    knowledge_roots: tuple[str, ...] = (".",)
+    connectors: dict[str, dict[str, Any]] = field(default_factory=dict)
 
     MANIFEST_NAMES = (".agent-slack.json", "agent-slack.json")
 
@@ -47,11 +50,25 @@ class AgentSystemArchitecture:
         runner = str(payload.get("runner") or "auto").strip().casefold()
         if runner not in {"auto", "codex", "claude"}:
             runner = "auto"
+        workspace_key = str(payload.get("workspace_key") or "").strip()
+        raw_roots = (payload.get("knowledge") or {}).get("roots")
+        knowledge_roots = tuple(
+            str(root).strip() for root in (raw_roots or ["."]) if str(root).strip()
+        ) or (".",)
+        raw_connectors = payload.get("connectors") or {}
+        connectors = {
+            str(name): dict(value)
+            for name, value in raw_connectors.items()
+            if isinstance(value, dict)
+        }
         return cls(
             schema_version=int(payload.get("schema_version") or 1),
             manifest_path=manifest_path,
+            workspace_key=workspace_key,
             runner=runner,
             orchestrators=orchestrators,
+            knowledge_roots=knowledge_roots,
+            connectors=connectors,
         )
 
     @property
@@ -69,9 +86,16 @@ class AgentSystemArchitecture:
                 manifest = self.manifest_path.relative_to(project_root).as_posix()
             except ValueError:
                 manifest = str(self.manifest_path)
-        return {
+        summary = {
             "schema_version": self.schema_version,
             "manifest": manifest,
             "runner": self.runner,
             "orchestrator_ids": self.orchestrator_ids,
         }
+        if self.schema_version >= 2:
+            summary.update({
+                "workspace_key": self.workspace_key or project_root.name,
+                "knowledge": {"roots": list(self.knowledge_roots)},
+                "connectors": self.connectors,
+            })
+        return summary

@@ -87,6 +87,23 @@ test("keeps malformed JSON as escaped chat text", () => {
   assert.match(output, /&quot;summary&quot;/);
 });
 
+test("resolves angle-bracket-delimited link destinations without HTML-escaping the path first", () => {
+  // CommonMark allows [label](<path with anything>) as a link destination.
+  // escapeHtml() used to run BEFORE link extraction, so the '<'/'>' delimiters
+  // became literal &lt;/&gt; text that got baked into the resolved URL.
+  const output = markdown.render(
+    "[sheet](</Volumes/sambigdisk3/Lumina/.assets/trials/actor-reference.png>)"
+  );
+
+  assert.match(output, /href="\/api\/v1\/files\?path=%2FVolumes%2Fsambigdisk3%2FLumina%2F\.assets%2Ftrials%2Factor-reference\.png"/);
+  assert.doesNotMatch(output, /%26lt%3B|%26gt%3B|&amp;lt;|&amp;gt;/);
+});
+
+test("still resolves a plain (non-angle-bracket) local path link", () => {
+  const output = markdown.render("[notes](docs/notes.md)");
+  assert.match(output, /href="\/api\/v1\/files\?path=docs%2Fnotes\.md"/);
+});
+
 test("renders markdown incrementally while an agent is streaming", () => {
   let stream = markdown.appendStream("", "Launching **Stage");
   assert.equal(stream.text, "Launching **Stage");

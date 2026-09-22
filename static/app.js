@@ -11,6 +11,7 @@ const state = {
   openingDmAgentIds: new Set(),
   runInProgress: false,
   currentRunId: null,
+  currentRunChatId: null,
   stoppingTaskIds: new Set(),
   syncInProgress: false,
   streamAttached: false,
@@ -116,7 +117,7 @@ function renderServers() {
       button.textContent = initials(server.project_name || server.name);
     }
     button.title = server.available ? server.name : `${server.name} (folder unavailable)`;
-    button.disabled = !server.available || state.runInProgress;
+    button.disabled = !server.available;
     button.setAttribute("aria-label", `Switch to ${server.name}`);
     button.setAttribute("aria-current", server.server_id === state.activeServerId ? "true" : "false");
     button.onclick = () => switchServer(server.server_id);
@@ -125,7 +126,7 @@ function renderServers() {
 }
 
 async function switchServer(serverId) {
-  if (serverId === state.activeServerId || state.runInProgress) return;
+  if (serverId === state.activeServerId) return;
   clearPendingAttachments();
   await api(`/api/servers/${serverId}/activate`, { method: "POST", body: "{}" });
   state.activeServerId = serverId;
@@ -409,6 +410,7 @@ const EXTENSION_CONTENT_TYPES = {
   pdf: "application/pdf",
   txt: "text/plain", md: "text/markdown", json: "application/json", csv: "text/csv", log: "text/plain",
   yml: "text/yaml", yaml: "text/yaml", py: "text/x-python", js: "text/javascript", ts: "text/typescript",
+  glb: "model/gltf-binary", gltf: "model/gltf+json", blend: "model/blender", obj: "model/obj",
 };
 
 function guessContentType(filename) {
@@ -416,22 +418,245 @@ function guessContentType(filename) {
   return EXTENSION_CONTENT_TYPES[extension] || null;
 }
 
+function appendSourceReferences(container, referenceBubbles) {
+  if (!referenceBubbles.childElementCount) return;
+  const toggle = document.createElement("button");
+  toggle.type = "button";
+  toggle.className = "message-source-toggle";
+  toggle.textContent = `Show sources (${referenceBubbles.childElementCount})`;
+  toggle.setAttribute("aria-expanded", "false");
+  toggle.addEventListener("click", () => {
+    const showing = !referenceBubbles.hidden;
+    referenceBubbles.hidden = showing;
+    toggle.textContent = `${showing ? "Show" : "Hide"} sources (${referenceBubbles.childElementCount})`;
+    toggle.setAttribute("aria-expanded", String(!showing));
+  });
+  referenceBubbles.hidden = true;
+  container.appendChild(toggle);
+  container.appendChild(referenceBubbles);
+}
+
 function appendLocalFilePreviews(container) {
+  const previewCards = document.createElement("div");
+  previewCards.className = "message-inline-previews";
+  const referenceBubbles = document.createElement("div");
+  referenceBubbles.className = "message-reference-bubbles";
   container.querySelectorAll('a[href^="/api/v1/files?path="], a[href^="/api/files?path="]').forEach((anchor) => {
     const url = new URL(anchor.getAttribute("href"), window.location.origin);
     const rawPath = decodeURIComponent(url.searchParams.get("path") || "");
     const filename = rawPath.replace(/:\d+(:\d+)?$/, "").split("/").pop() || "file";
     const contentType = guessContentType(filename);
-    if (!contentType) return;
-    const card = document.createElement("div");
-    card.className = "message-attachment-card";
-    appendPreviewMedia(card, { filename, content_type: contentType, size: 0 }, url.toString());
-    anchor.insertAdjacentElement("afterend", card);
+    const listItem = anchor.closest("li");
+    if (listItem && listItem.textContent.trim() === anchor.textContent.trim()) listItem.remove();
+    else anchor.remove();
+    const supportsInlinePreview = contentType && (
+      contentType.startsWith("model/")
+      || contentType.startsWith("image/")
+      || contentType.startsWith("video/")
+      || contentType.startsWith("audio/")
+      || contentType === "application/pdf"
+    );
+    if (supportsInlinePreview) {
+      const card = document.createElement("div");
+      card.className = "message-attachment-card";
+      const chip = document.createElement("a");
+      chip.className = "message-attachment";
+      chip.href = url.toString();
+      chip.target = "_blank";
+      chip.rel = "noopener";
+      chip.title = rawPath;
+      chip.textContent = `📎 ${filename}`;
+      card.appendChild(chip);
+      appendPreviewMedia(card, { filename, content_type: contentType, size: 0 }, url.toString());
+      previewCards.appendChild(card);
+    } else {
+      const bubble = document.createElement("a");
+      bubble.className = "message-reference-bubble";
+      bubble.href = url.toString();
+      bubble.target = "_blank";
+      bubble.rel = "noopener";
+      bubble.title = rawPath;
+      bubble.textContent = `📎 ${filename}`;
+      referenceBubbles.appendChild(bubble);
+    }
   });
+  if (previewCards.childElementCount) container.appendChild(previewCards);
+  appendSourceReferences(container, referenceBubbles);
+}
+
+let modelViewerLoadPromise = null;
+function ensureModelViewerLoaded() {
+  if (customElements.get("model-viewer")) return Promise.resolve(true);
+  if (!modelViewerLoadPromise) {
+    modelViewerLoadPromise = new Promise((resolve) => {
+      const script = document.createElement("script");
+      script.type = "module";
+      script.src = "https://unpkg.com/@google/model-viewer/dist/model-viewer.min.js";
+      script.onload = () => resolve(true);
+      script.onerror = () => resolve(false);
+      document.head.appendChild(script);
+    });
+  }
+  return modelViewerLoadPromise;
+}
+
+let objViewerLoadPromise = null;
+function ensureObjViewerLoaded() {
+  if (!objViewerLoadPromise) {
+    objViewerLoadPromise = Promise.all([
+      import("https://esm.sh/three@0.180.0"),
+      import("https://esm.sh/three@0.180.0/examples/jsm/loaders/OBJLoader.js"),
+      import("https://esm.sh/three@0.180.0/examples/jsm/controls/OrbitControls.js"),
+    ]).then(([THREE, loader, controls]) => ({
+      THREE, OBJLoader: loader.OBJLoader, OrbitControls: controls.OrbitControls,
+    }))
+      .catch(() => null);
+  }
+  return objViewerLoadPromise;
+}
+
+function siblingObjUrl(url) {
+  try {
+    const resolved = new URL(url, window.location.origin);
+    const rawPath = resolved.searchParams.get("path") || "";
+    if (!/\.blend$/i.test(rawPath)) return null;
+    resolved.searchParams.set("path", rawPath.replace(/\.blend$/i, ".obj"));
+    return resolved.toString();
+  } catch (_) {
+    return null;
+  }
+}
+
+async function appendObjPreview(card, attachment, url) {
+  const objUrl = attachment.content_type === "model/obj" ? url : siblingObjUrl(url);
+  if (!objUrl) return;
+  const placeholder = document.createElement("div");
+  placeholder.className = "attachment-preview-model attachment-preview-model-loading";
+  placeholder.textContent = "Loading 3D preview…";
+  card.appendChild(placeholder);
+  const modules = await ensureObjViewerLoaded();
+  if (!modules) {
+    placeholder.textContent = "3D preview needs internet access — ";
+    const link = document.createElement("a");
+    link.href = objUrl;
+    link.target = "_blank";
+    link.rel = "noopener";
+    link.textContent = "open the OBJ export";
+    placeholder.appendChild(link);
+    return;
+  }
+  const { THREE, OBJLoader, OrbitControls } = modules;
+  const canvas = document.createElement("canvas");
+  canvas.className = "attachment-preview-model attachment-preview-obj";
+  card.replaceChild(canvas, placeholder);
+  const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: true });
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+  renderer.setClearColor(0x000000, 0);
+  const scene = new THREE.Scene();
+  scene.add(new THREE.HemisphereLight(0xffffff, 0x334155, 2.2));
+  const key = new THREE.DirectionalLight(0xffffff, 2.5);
+  key.position.set(3, 5, 4);
+  scene.add(key);
+  const camera = new THREE.PerspectiveCamera(35, 1, 0.01, 1000);
+  const group = new THREE.Group();
+  scene.add(group);
+  try {
+    const object = await new OBJLoader().loadAsync(objUrl);
+    group.add(object);
+    const bounds = new THREE.Box3().setFromObject(object);
+    const center = bounds.getCenter(new THREE.Vector3());
+    const size = bounds.getSize(new THREE.Vector3());
+    object.position.sub(center);
+    const radius = Math.max(size.x, size.y, size.z, 0.1);
+    camera.position.set(radius * 1.8, radius * 0.9, radius * 2.4);
+    const orbit = new OrbitControls(camera, canvas);
+    orbit.target.set(0, 0, 0);
+    orbit.enableDamping = true;
+    orbit.enablePan = true;
+    orbit.minDistance = radius * 0.35;
+    orbit.maxDistance = radius * 8;
+    orbit.autoRotate = true;
+    orbit.autoRotateSpeed = 1.2;
+    orbit.update();
+    const resize = () => {
+      const width = Math.max(card.clientWidth - 24, 240);
+      const height = 320;
+      renderer.setSize(width, height, false);
+      camera.aspect = width / height;
+      camera.updateProjectionMatrix();
+    };
+    resize();
+    const observer = new ResizeObserver(resize);
+    observer.observe(card);
+    const animate = () => {
+      if (!canvas.isConnected) {
+        observer.disconnect();
+        orbit.dispose();
+        renderer.dispose();
+        return;
+      }
+      orbit.update();
+      renderer.render(scene, camera);
+      requestAnimationFrame(animate);
+    };
+    animate();
+  } catch (_) {
+    canvas.remove();
+    const error = document.createElement("div");
+    error.className = "attachment-preview-model attachment-preview-model-loading";
+    error.textContent = "OBJ preview unavailable — ";
+    const link = document.createElement("a");
+    link.href = objUrl;
+    link.target = "_blank";
+    link.rel = "noopener";
+    link.textContent = "open the OBJ export";
+    error.appendChild(link);
+    card.appendChild(error);
+  }
+}
+
+function resolveContentType(attachment) {
+  // Browsers/OSes often don't know newer extensions (.glb, .gltf, ...) and
+  // report a generic type, or none at all, when a file is uploaded/dropped -
+  // fall back to our own extension map rather than trusting a blank/generic
+  // stored content_type.
+  const stored = attachment.content_type || "";
+  if (stored && stored !== "application/octet-stream") return stored;
+  return guessContentType(attachment.filename) || stored || "application/octet-stream";
 }
 
 function appendPreviewMedia(card, attachment, url) {
-  const contentType = attachment.content_type || "";
+  const contentType = resolveContentType(attachment);
+  if (contentType === "model/blender" || contentType === "model/obj") {
+    void appendObjPreview(card, attachment, url);
+    return;
+  }
+  if (contentType.startsWith("model/gltf")) {
+    const placeholder = document.createElement("div");
+    placeholder.className = "attachment-preview-model attachment-preview-model-loading";
+    placeholder.textContent = "Loading 3D preview…";
+    card.appendChild(placeholder);
+    void ensureModelViewerLoaded().then((loaded) => {
+      if (!loaded) {
+        placeholder.textContent = "3D preview needs internet access — ";
+        const link = document.createElement("a");
+        link.href = url;
+        link.target = "_blank";
+        link.rel = "noopener";
+        link.textContent = "open the model file";
+        placeholder.appendChild(link);
+        return;
+      }
+      const viewer = document.createElement("model-viewer");
+      viewer.className = "attachment-preview-model";
+      viewer.setAttribute("src", url);
+      viewer.setAttribute("camera-controls", "");
+      viewer.setAttribute("auto-rotate", "");
+      viewer.setAttribute("alt", attachment.filename);
+      card.replaceChild(viewer, placeholder);
+    });
+    return;
+  }
   if (contentType.startsWith("image/")) {
     const img = document.createElement("img");
     img.className = "attachment-preview-media attachment-preview-image";
@@ -460,7 +685,16 @@ function appendPreviewMedia(card, attachment, url) {
     embed.src = url;
     card.appendChild(embed);
   } else if (contentType.startsWith("text/") || contentType === "application/json") {
-    void appendTextPreview(card, attachment, url);
+    // "reference" attachments (docs/manifests an agent wrote to explain its own
+    // output, not the output itself) stay a plain link - no inline content dump.
+    if (attachment.role === "reference") {
+      const note = document.createElement("span");
+      note.className = "attachment-reference-note";
+      note.textContent = "Source reference — click the file above to view";
+      card.appendChild(note);
+    } else {
+      void appendTextPreview(card, attachment, url);
+    }
   }
 }
 
@@ -469,9 +703,21 @@ function appendMessageAttachments(container, message) {
   if (!attachments.length) return;
   const list = document.createElement("div");
   list.className = "message-attachments";
+  const referenceBubbles = document.createElement("div");
+  referenceBubbles.className = "message-reference-bubbles";
   attachments.forEach((attachment) => {
     const url = attachmentUrl(attachment);
-    const contentType = attachment.content_type || "";
+    if (attachment.role === "reference") {
+      const bubble = document.createElement("a");
+      bubble.className = "message-reference-bubble";
+      bubble.href = url;
+      bubble.target = "_blank";
+      bubble.rel = "noopener";
+      bubble.title = attachment.filename || "Source reference";
+      bubble.textContent = `📎 ${attachment.filename || "source"}`;
+      referenceBubbles.appendChild(bubble);
+      return;
+    }
     const card = document.createElement("div");
     card.className = "message-attachment-card";
 
@@ -481,14 +727,15 @@ function appendMessageAttachments(container, message) {
     chip.target = "_blank";
     chip.rel = "noopener";
     chip.textContent = `📎 ${attachment.filename} · ${formatBytes(attachment.size)}`;
-    chip.title = contentType || "File attachment";
+    chip.title = resolveContentType(attachment) || "File attachment";
     card.appendChild(chip);
 
     appendPreviewMedia(card, attachment, url);
 
     list.appendChild(card);
   });
-  container.appendChild(list);
+  if (list.childElementCount) container.appendChild(list);
+  appendSourceReferences(container, referenceBubbles);
 }
 
 const VOICE_STATES = ["listening", "speaking", "thinking", "responding", "error"];
@@ -766,13 +1013,14 @@ function createStreamingRow(taskId, agentId, agentLabel) {
   return state.streamingRows.get(taskId);
 }
 
-function applyActiveRun(run) {
+function applyActiveRun(run, chatId = state.currentChatId) {
   if (!run) {
-    if (state.streamAttached) return;
+    if (state.runInProgress && state.currentRunChatId && state.currentRunChatId !== chatId) return;
     state.streamingRows.forEach((stream) => stream.row.remove());
     state.streamingRows.clear();
     state.runInProgress = false;
     state.currentRunId = null;
+    state.currentRunChatId = null;
     $("stopRunBtn").hidden = true;
     $("deleteChatBtn").disabled = !state.currentChatId;
     $("sendBtn").disabled = false;
@@ -782,6 +1030,7 @@ function applyActiveRun(run) {
 
   state.runInProgress = true;
   state.currentRunId = run.run_id;
+  state.currentRunChatId = chatId;
   $("stopRunBtn").hidden = false;
   $("stopRunBtn").disabled = false;
   $("stopRunBtn").textContent = "Stop Run";
@@ -806,13 +1055,16 @@ function applyActiveRun(run) {
 }
 
 async function restoreActiveRun(chatId) {
-  if (!chatId || state.streamAttached) return;
+  if (!chatId) return;
   const payload = await api(`/api/runs/active?chat_id=${encodeURIComponent(chatId)}`);
-  if (chatId !== state.currentChatId || state.streamAttached) return;
-  applyActiveRun(chatSync.activeRunForChat(payload.runs, chatId));
+  if (chatId !== state.currentChatId) return;
+  applyActiveRun(chatSync.activeRunForChat(payload.runs, chatId), chatId);
 }
 
-async function renderStreamEvent(event) {
+async function renderStreamEvent(event, streamChatId = state.currentChatId) {
+  // The run continues in the background when the user navigates to another
+  // chat/server. Persisted state will rebuild its rows when they return.
+  if (streamChatId !== state.currentChatId) return;
   const taskId = event.task_id || event.agent_id;
   if (event.type === "run_started") {
     state.currentRunId = event.run_id;
@@ -985,6 +1237,7 @@ async function runChatStream(payload, chatId = state.currentChatId) {
   let resultChatId = chatId;
   state.runInProgress = true;
   state.streamAttached = true;
+  state.currentRunChatId = chatId;
   $("deleteChatBtn").disabled = true;
   $("sendBtn").disabled = true;
   $("sendBtn").textContent = "Working...";
@@ -997,7 +1250,7 @@ async function runChatStream(payload, chatId = state.currentChatId) {
       } else if (event.type === "run_completed" && event.chat_id) {
         resultChatId = event.chat_id;
       }
-      await renderStreamEvent(event);
+      await renderStreamEvent(event, chatId);
     });
   } catch (error) {
     console.warn("Agent Slack stream detached", error);
@@ -1006,6 +1259,7 @@ async function runChatStream(payload, chatId = state.currentChatId) {
     state.streamAttached = false;
     state.runInProgress = false;
     state.currentRunId = null;
+    state.currentRunChatId = null;
     state.stoppingTaskIds.clear();
     state.streamingRows.clear();
     $("stopRunBtn").hidden = true;
@@ -1121,7 +1375,133 @@ function openServerSettings() {
   $("serverPathLabel").hidden = true;
   $("serverPathPicker").hidden = true;
   $("serverFormError").hidden = true;
+  updateTunnelSummary();
+  updateClaudeMcpSummary();
+  updateClaudeTunnelSummary();
   $("serverDialog").showModal();
+}
+
+async function updateClaudeMcpSummary() {
+  if (!window.agentSlack?.claudeMcpInfo) return;
+  const info = await window.agentSlack.claudeMcpInfo();
+  const ready = info.installed && info.backendAvailable;
+  $("claudeMcpSummary").textContent = ready
+    ? `Ready · bundled backend · ${info.configPath}`
+    : info.installed
+      ? `Configured, but backend is unavailable · ${info.configPath}`
+      : `Not installed · ${info.configPath}`;
+  $("installClaudeMcpBtn").textContent = ready ? "Installed" : "Install";
+  $("installClaudeMcpBtn").title = ready
+    ? "Reinstall the AgentSlack MCP entry if Claude's configuration needs repair"
+    : "Install the bundled AgentSlack MCP backend";
+}
+
+async function installClaudeMcp() {
+  if (!window.agentSlack?.installClaudeMcp) {
+    $("serverFormError").textContent = "Claude MCP installation is available in the macOS app window.";
+    $("serverFormError").hidden = false;
+    return;
+  }
+  const info = await window.agentSlack.installClaudeMcp();
+  $("claudeMcpSummary").textContent = info.backendAvailable
+    ? `Ready · bundled backend · ${info.configPath}`
+    : `Configured, but backend is unavailable · ${info.configPath}`;
+  $("installClaudeMcpBtn").textContent = info.backendAvailable ? "Installed" : "Install";
+}
+
+async function updateTunnelSummary() {
+  if (!window.agentSlack?.tunnelInfo) return;
+  const info = await window.agentSlack.tunnelInfo();
+  const status = info.status?.state || "stopped";
+  $("tunnelSummary").textContent = info.tunnelId
+    ? `Tunnel ${info.tunnelId} · ${status}${info.runtimeKeyConfigured ? " · key saved" : " · key missing"}`
+    : "Not configured";
+}
+
+async function updateClaudeTunnelSummary() {
+  if (!window.agentSlack?.claudeTunnelInfo) return;
+  const info = await window.agentSlack.claudeTunnelInfo();
+  $("claudeTunnelSummary").textContent = info.url
+    ? `${info.enabled ? "Enabled" : "Stopped"} · ${info.url}${info.tokenConfigured ? " · token saved" : " · token missing"}`
+    : "Not configured";
+}
+
+async function openClaudeTunnelDialog() {
+  const info = await window.agentSlack.claudeTunnelInfo();
+  $("claudeTunnelEnabled").checked = Boolean(info.enabled);
+  $("claudeTunnelDomain").value = info.domain || "";
+  $("claudeTunnelToken").value = "";
+  $("claudeTunnelSubdomain").value = info.subdomain || "agent-slack";
+  $("claudeTunnelPath").value = info.routePath || "mcp";
+  $("claudeTunnelStatus").textContent = info.filesReady
+    ? `Files ready at ${info.root}. Upload data/ca.crt in Claude Console before starting.`
+    : "Save & Start will prepare the local tunnel files.";
+  $("claudeTunnelStatus").hidden = false;
+  $("claudeTunnelDialog").showModal();
+}
+
+async function submitClaudeTunnel() {
+  const info = await window.agentSlack.saveClaudeTunnel({
+    enabled: $("claudeTunnelEnabled").checked,
+    domain: $("claudeTunnelDomain").value,
+    token: $("claudeTunnelToken").value,
+    subdomain: $("claudeTunnelSubdomain").value,
+    routePath: $("claudeTunnelPath").value,
+  });
+  $("claudeTunnelDialog").close();
+  await updateClaudeTunnelSummary();
+  if (info.url) {
+    $("serverFormError").textContent = `Claude tunnel URL: ${info.url}. Register ${info.root}/data/ca.crt in Claude Console.`;
+    $("serverFormError").hidden = false;
+  }
+}
+
+async function openTunnelDialog() {
+  if (!window.agentSlack?.tunnelInfo) {
+    $("serverFormError").textContent = "OpenAI tunnel settings are available in the macOS app window.";
+    $("serverFormError").hidden = false;
+    return;
+  }
+  const info = await window.agentSlack.tunnelInfo();
+  $("tunnelEnabled").checked = Boolean(info.enabled);
+  $("tunnelId").value = info.tunnelId || "";
+  $("tunnelRuntimeKey").value = "";
+  $("tunnelProfile").value = info.profile || "agent-slack";
+  $("tunnelServerUrl").value = info.serverUrl || "";
+  $("tunnelExecutablePath").value = info.executablePath || "";
+  $("tunnelStatus").textContent = info.status?.message || (info.status?.state === "running" ? "Running" : "");
+  $("tunnelStatus").hidden = !$("tunnelStatus").textContent;
+  $("tunnelDialog").showModal();
+}
+
+async function downloadTunnelClient() {
+  if (!window.agentSlack?.downloadTunnelClient) return;
+  $("tunnelStatus").textContent = "Downloading the official OpenAI tunnel-client…";
+  $("tunnelStatus").hidden = false;
+  const info = await window.agentSlack.downloadTunnelClient();
+  $("tunnelExecutablePath").value = info.executablePath || "";
+  $("tunnelStatus").textContent = info.status?.message || "Tunnel-client is ready.";
+}
+
+async function browseTunnelClient() {
+  const selected = await window.agentSlack.selectTunnelClient();
+  if (selected) $("tunnelExecutablePath").value = selected;
+}
+
+async function submitTunnel() {
+  const result = await window.agentSlack.saveTunnel({
+    enabled: $("tunnelEnabled").checked,
+    tunnelId: $("tunnelId").value,
+    runtimeKey: $("tunnelRuntimeKey").value,
+    profile: $("tunnelProfile").value,
+    executablePath: $("tunnelExecutablePath").value,
+  });
+  $("tunnelDialog").close();
+  await updateTunnelSummary();
+  if (result.status?.state === "error") {
+    $("serverFormError").textContent = result.status.message;
+    $("serverFormError").hidden = false;
+  }
 }
 
 async function browseServerPath() {
@@ -1176,10 +1556,34 @@ async function submitServer() {
   }
 }
 
+async function attachPathToComposer(rawPath) {
+  const path = rawPath.trim();
+  if (!path) return;
+  try {
+    const response = await fetch(`/api/v1/files?path=${encodeURIComponent(path)}`, {
+      headers: state.activeServerId ? { "X-Agent-Slack-Server": state.activeServerId } : {},
+    });
+    if (!response.ok) throw new Error(await response.text() || `HTTP ${response.status}`);
+    const blob = await response.blob();
+    const filename = path.split("/").pop() || path;
+    selectAttachments([new File([blob], filename, { type: blob.type })]);
+  } catch (error) {
+    alert(`Could not attach "${path}": ${error.message}`);
+  }
+}
+
+const SLASH_PATH_COMMAND = /^\/path\s+(.+)$/;
+
 async function sendMessage() {
   if (!state.currentChatId || state.runInProgress) return;
   const body = $("messageInput").value.trim();
   if (!body) return;
+  const pathCommand = body.match(SLASH_PATH_COMMAND);
+  if (pathCommand) {
+    $("messageInput").value = "";
+    await attachPathToComposer(pathCommand[1]);
+    return;
+  }
   const currentChat = state.chats.find((chat) => chat.chat_id === state.currentChatId);
   $("sendBtn").disabled = true;
   $("sendBtn").textContent = state.pendingAttachments.length ? "Uploading..." : "Sending...";
@@ -1515,6 +1919,34 @@ $("newChatBtnHeader").onclick = () => {
 };
 $("addServerBtn").onclick = openServerDialog;
 $("serverSettingsBtn").onclick = openServerSettings;
+$("configureTunnelBtn").onclick = openTunnelDialog;
+$("configureClaudeTunnelBtn").onclick = () => openClaudeTunnelDialog().catch((error) => {
+  $("serverFormError").textContent = error.message;
+  $("serverFormError").hidden = false;
+});
+$("installClaudeMcpBtn").onclick = () => installClaudeMcp().catch((error) => {
+  $("serverFormError").textContent = error.message;
+  $("serverFormError").hidden = false;
+});
+$("downloadTunnelClientBtn").onclick = () => downloadTunnelClient().catch((error) => {
+  $("tunnelStatus").textContent = error.message;
+  $("tunnelStatus").hidden = false;
+});
+$("openTunnelDocsBtn").onclick = () => window.agentSlack.openTunnelDocs();
+$("openClaudeTunnelsBtn").onclick = () => window.agentSlack.openClaudeTunnels();
+$("cancelTunnelBtn").onclick = () => $("tunnelDialog").close();
+$("cancelClaudeTunnelBtn").onclick = () => $("claudeTunnelDialog").close();
+$("stopClaudeTunnelBtn").onclick = async () => {
+  await window.agentSlack.stopClaudeTunnel();
+  $("claudeTunnelStatus").textContent = "Stopped";
+  $("claudeTunnelStatus").hidden = false;
+  await updateClaudeTunnelSummary();
+};
+$("stopTunnelBtn").onclick = async () => {
+  await window.agentSlack.stopTunnel();
+  $("tunnelStatus").textContent = "Stopped";
+  $("tunnelStatus").hidden = false;
+};
 $("browseServerPathBtn").onclick = browseServerPath;
 $("browseServerLogoBtn").onclick = browseServerLogo;
 $("cancelChatBtn").onclick = () => $("chatDialog").close();
@@ -1539,6 +1971,20 @@ $("meetingForm").addEventListener("submit", (event) => {
 $("serverForm").addEventListener("submit", (event) => {
   event.preventDefault();
   submitServer();
+});
+$("tunnelForm").addEventListener("submit", (event) => {
+  event.preventDefault();
+  submitTunnel().catch((error) => {
+    $("tunnelStatus").textContent = error.message;
+    $("tunnelStatus").hidden = false;
+  });
+});
+$("claudeTunnelForm").addEventListener("submit", (event) => {
+  event.preventDefault();
+  submitClaudeTunnel().catch((error) => {
+    $("claudeTunnelStatus").textContent = error.message;
+    $("claudeTunnelStatus").hidden = false;
+  });
 });
 Object.entries(peoplePickerConfig).forEach(([key, config]) => {
   const search = $(config.search);
@@ -1569,3 +2015,8 @@ loadServers().then(loadActiveServer).catch((error) => {
 });
 
 setPeopleExpanded(false);
+
+window.AgentSlackChatMode?.init({
+  api, streamApi, renderMarkdown, $,
+  uploadAttachment, appendMessageAttachments, formatBytes,
+});

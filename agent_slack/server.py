@@ -10,10 +10,29 @@ from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 from uuid import uuid4
 
+from .realtime.protocol import ConnectionClosed, WebSocketConnection, handshake_response
+from .realtime.session import VoiceSession
+from .mcp_server import AgentSlackMCP, handle_jsonrpc
 from .servers import AgentServerManager
 
 
 API_VERSION = "1"
+
+# mimetypes.guess_type() doesn't know these on many platforms (notably .glb/.gltf,
+# never registered in the stdlib db) - without this fallback, _serve_file() sends
+# them as "text/html", which breaks <model-viewer>/<audio> entirely.
+EXTENSION_CONTENT_TYPES = {
+    ".glb": "model/gltf-binary", ".gltf": "model/gltf+json",
+    ".obj": "model/obj", ".blend": "model/blender",
+    ".mp3": "audio/mpeg", ".wav": "audio/wav", ".m4a": "audio/mp4", ".ogg": "audio/ogg",
+    ".mid": "audio/midi", ".midi": "audio/midi",
+    ".webm": "video/webm", ".mov": "video/quicktime",
+}
+
+
+def _guess_content_type(file_path: Path) -> str | None:
+    mime, _enc = mimetypes.guess_type(str(file_path))
+    return mime or EXTENSION_CONTENT_TYPES.get(file_path.suffix.lower())
 
 
 def _no_server_payload() -> dict:
@@ -98,6 +117,18 @@ def _openapi_document() -> dict:
         },
         "/chats/{chat_id}/meeting": {"post": {"summary": "Run a manual agent meeting"}},
         "/chats/{chat_id}/auto-meeting": {"post": {"summary": "Run an architecture-routed meeting"}},
+        "/chat/sessions": {
+            "get": {"summary": "List Chat mode sessions"},
+            "post": {"summary": "Create a Chat mode session (read-only, no agent execution)"},
+        },
+        "/chat/sessions/{id}": {"get": {"summary": "Get a Chat mode session and its messages"}},
+        "/chat/sessions/{id}/messages": {"post": {"summary": "Send a Chat mode message and stream NDJSON events"}},
+        "/chat/sessions/{id}/cancel": {"post": {"summary": "Cancel a Chat mode response by response_id"}},
+        "/chat/index/status": {"get": {"summary": "Local retrieval index status for the active server"}},
+        "/chat/index/build": {"post": {"summary": "(Re)build the local retrieval index for the active server"}},
+        "/chat/voice": {
+            "get": {"summary": "Full-duplex Chat mode voice session (WebSocket upgrade)"},
+        },
     }
     return {
         "openapi": "3.1.0",
@@ -131,6 +162,17 @@ class _Handler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
         path = _versioned_path(parsed.path)
+        if path == "/mcp":
+            # MCP is stateless Streamable HTTP here and accepts JSON-RPC over
+            # POST. Do not let discovery receive the web UI with a 200 response.
+            self.send_response(HTTPStatus.METHOD_NOT_ALLOWED)
+            self.send_header("Allow", "POST")
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        if path == "/api/chat/voice" and self.headers.get("Upgrade", "").lower() == "websocket":
+            return self._handle_voice_websocket()
         if path == "/api":
             return self._json(_api_document())
         if path == "/api/openapi.json":
@@ -173,14 +215,20 @@ class _Handler(BaseHTTPRequestHandler):
             if upload is None:
                 return self._json({"error": "attachment not found"}, status=404)
             file_path, metadata = upload
-            return self._serve_file(file_path, filename=metadata.get("filename"), inline=True)
+            return self._serve_file(
+                file_path, filename=metadata.get("filename"), inline=True,
+                content_type=metadata.get("content_type"),
+            )
         match = re.fullmatch(r"/api/artifacts/([0-9a-f]{32})", path)
         if match:
             artifact = self._active_app().get_artifact_path(match.group(1))
             if artifact is None:
                 return self._json({"error": "artifact not found"}, status=404)
             file_path, metadata = artifact
-            return self._serve_file(file_path, filename=metadata.get("filename"), inline=True)
+            return self._serve_file(
+                file_path, filename=metadata.get("filename"), inline=True,
+                content_type=metadata.get("content_type"),
+            )
         match = re.fullmatch(r"/api/voice/speech/([0-9a-f]{32})", path)
         if match:
             speech_path = self._active_app().speech_path(match.group(1))
@@ -216,6 +264,16 @@ class _Handler(BaseHTTPRequestHandler):
             return self._json({"runs": app.list_active_runs(chat_id)})
         if path == "/api/voice/capabilities":
             return self._json(app.voice_capabilities())
+        if path == "/api/chat/sessions":
+            return self._json({"sessions": [session.to_dict() for session in app.chat_engine.list_sessions()]})
+        if path == "/api/chat/index/status":
+            return self._json(app.retrieval.status())
+        match = re.fullmatch(r"/api/chat/sessions/([^/]+)", path)
+        if match:
+            session = app.chat_engine.get_session(match.group(1))
+            if session is None:
+                return self._json({"error": "chat session not found"}, status=404)
+            return self._json(session.to_dict())
         match = re.fullmatch(r"/api/chats/([^/]+)", path)
         if match:
             chat = app.get_chat(match.group(1))
@@ -227,6 +285,19 @@ class _Handler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
         path = _versioned_path(parsed.path)
+        if path == "/mcp":
+            try:
+                request = self._read_json_body()
+                response = handle_jsonrpc(AgentSlackMCP(self.manager), request)
+            except Exception as exc:
+                response = {"jsonrpc": "2.0", "id": None,
+                            "error": {"code": -32000, "message": str(exc)}}
+            if response is None:
+                self.send_response(HTTPStatus.ACCEPTED)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            return self._json(response)
         if path == "/api/servers":
             payload = self._read_json_body()
             project_root = str(payload.get("project_root") or "").strip()
@@ -332,6 +403,32 @@ class _Handler(BaseHTTPRequestHandler):
         if path == "/api/agents/discover":
             app.reload_host_configuration()
             return self._json({"agents": app.refresh_agents()})
+        if path == "/api/chat/index/build":
+            return self._json({"files_indexed": app.retrieval.ensure_index()})
+        if path == "/api/chat/sessions":
+            session = app.chat_engine.create_session(
+                self.manager.active_server_id or "", title=str(payload.get("title") or "New chat"),
+            )
+            return self._json(session.to_dict(), status=201)
+        match = re.fullmatch(r"/api/chat/sessions/([^/]+)/messages", path)
+        if match:
+            text = str(payload.get("text") or payload.get("body") or "").strip()
+            modality = str(payload.get("modality") or "text")
+            attachments = [item for item in (payload.get("attachments") or []) if isinstance(item, dict)]
+            if not text:
+                return self._json({"error": "text is required"}, status=400)
+            try:
+                events = app.chat_engine.stream_message(match.group(1), text, modality=modality, attachments=attachments)
+            except KeyError as exc:
+                return self._json({"error": str(exc)}, status=404)
+            return self._ndjson(events)
+        match = re.fullmatch(r"/api/chat/sessions/([^/]+)/cancel", path)
+        if match:
+            response_id = str(payload.get("response_id") or "")
+            if not response_id:
+                return self._json({"error": "response_id is required"}, status=400)
+            app.chat_engine.cancel(response_id)
+            return self._json({"accepted": True, "response_id": response_id}, status=202)
         if path == "/api/chats":
             chat = app.create_chat(
                 title=str(payload.get("title") or "Untitled chat"),
@@ -502,11 +599,66 @@ class _Handler(BaseHTTPRequestHandler):
             return self.manager.app_for(requested_server_id)
         return self.manager.active_app()
 
+    def _handle_voice_websocket(self) -> None:
+        client_key = self.headers.get("Sec-WebSocket-Key", "").strip()
+        if not client_key:
+            self.send_response(HTTPStatus.BAD_REQUEST)
+            self.end_headers()
+            return
+        try:
+            app = self._active_app()
+        except (KeyError, LookupError, ValueError):
+            self.send_response(HTTPStatus.CONFLICT)
+            self.end_headers()
+            return
+        self.connection.sendall(handshake_response(client_key))
+        self.close_connection = True
+        connection = WebSocketConnection(self.connection)
+        session = VoiceSession(connection, app.chat_engine, app.voice, self.manager.active_server_id or "")
+        try:
+            while True:
+                frame = connection.recv_message()
+                if frame.opcode == 0x1:  # text
+                    try:
+                        event = json.loads(frame.payload.decode("utf-8"))
+                    except (json.JSONDecodeError, UnicodeDecodeError):
+                        continue
+                    if not session.handle_control(event):
+                        break
+                elif frame.opcode == 0x2:  # binary audio chunk
+                    session.handle_audio_chunk(frame.payload)
+        except ConnectionClosed:
+            pass
+        finally:
+            connection.close()
+
     def _read_json_body(self) -> dict:
-        length = int(self.headers.get("Content-Length", "0"))
-        if length <= 0:
-            return {}
-        body = self.rfile.read(length)
+        if self.headers.get("Transfer-Encoding", "").lower() == "chunked":
+            chunks = bytearray()
+            while True:
+                line = self.rfile.readline(65536)
+                if not line:
+                    break
+                try:
+                    size = int(line.split(b";", 1)[0].strip(), 16)
+                except ValueError:
+                    return {}
+                if size == 0:
+                    # Consume the trailing headers, if any.
+                    while self.rfile.readline(65536).strip():
+                        pass
+                    break
+                chunks.extend(self.rfile.read(size))
+                self.rfile.readline(2)  # CRLF after the chunk body.
+            body = bytes(chunks)
+        else:
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+            except ValueError:
+                return {}
+            if length <= 0:
+                return {}
+            body = self.rfile.read(length)
         try:
             return json.loads(body.decode("utf-8"))
         except json.JSONDecodeError:
@@ -569,18 +721,47 @@ class _Handler(BaseHTTPRequestHandler):
             file_path = self.manager.static_root / "index.html"
         return self._serve_file(file_path)
 
-    def _serve_file(self, file_path: Path, filename: str | None = None, inline: bool = False) -> None:
+    def _serve_file(
+        self,
+        file_path: Path,
+        filename: str | None = None,
+        inline: bool = False,
+        content_type: str | None = None,
+    ) -> None:
         content = file_path.read_bytes()
-        mime, _enc = mimetypes.guess_type(str(file_path))
-        self.send_response(HTTPStatus.OK)
-        self.send_header("Content-Type", mime or "text/html; charset=utf-8")
-        self.send_header("Content-Length", str(len(content)))
+        total = len(content)
+        mime = content_type or _guess_content_type(file_path) or "text/html; charset=utf-8"
+
+        # Safari refuses to play <audio>/<video> (and model-viewer can stall) unless
+        # the server honors Range requests, so parse a single "bytes=start-end" spec.
+        start, end, status = 0, total - 1, HTTPStatus.OK
+        range_header = self.headers.get("Range", "")
+        if range_header.startswith("bytes="):
+            spec = range_header[len("bytes="):].split(",")[0]
+            range_start, _, range_end = spec.partition("-")
+            try:
+                start = int(range_start) if range_start else 0
+                end = int(range_end) if range_end else total - 1
+            except ValueError:
+                start, end = 0, total - 1
+            if total and 0 <= start <= end < total:
+                status = HTTPStatus.PARTIAL_CONTENT
+            else:
+                start, end = 0, total - 1
+
+        body = content[start : end + 1] if total else b""
+        self.send_response(status)
+        self.send_header("Content-Type", mime)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Accept-Ranges", "bytes")
+        if status == HTTPStatus.PARTIAL_CONTENT:
+            self.send_header("Content-Range", f"bytes {start}-{end}/{total}")
         if filename:
             disposition = "inline" if inline else "attachment"
             self.send_header("Content-Disposition", f'{disposition}; filename="{str(filename).replace(chr(34), chr(39))}"')
         self.send_header("X-Agent-Slack-Api-Version", API_VERSION)
         self.end_headers()
-        self.wfile.write(content)
+        self.wfile.write(body)
 
 
 class AgentSlackHTTPServer(ThreadingHTTPServer):

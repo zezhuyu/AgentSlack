@@ -49,36 +49,74 @@
       </aside>
 
       <main class="main-pane">
-        <header class="chat-header">
-          <div class="chat-heading">
-            <h2 id="chatTitle">Select a chat</h2>
-            <p id="chatMembers" class="muted"></p>
-          </div>
-          <div class="chat-actions">
-            <button id="mobilePeopleBtn" class="mobile-only" type="button" aria-controls="mobilePeopleDrawer" aria-expanded="false">People</button>
-            <button id="runAgentsBtn">Run Members</button>
-            <button id="autoMeetingBtn">Auto Meeting</button>
-            <button id="manualMeetingBtn">Manual Meeting</button>
-            <button id="stopRunBtn" class="danger-button" type="button" hidden>Stop Run</button>
-            <button id="deleteChatBtn" class="danger-button" disabled>Delete Chat</button>
-          </div>
-        </header>
-        <section id="messages" class="messages"></section>
-        <footer class="composer">
-          <div id="pendingAttachments" class="pending-attachments" aria-live="polite"></div>
-          <div class="message-input-row">
-            <button id="voiceBtn" class="voice-button" type="button" title="Start voice input" aria-label="Start voice input">&#127908;</button>
-            <div class="message-input-wrap">
-              <textarea id="messageInput" rows="4" placeholder="Message Agent Slack — use @ to address a person"></textarea>
-              <div id="mentionMenu" class="mention-menu" role="listbox" hidden></div>
+        <div class="mode-switch" role="tablist" aria-label="Agent Slack mode">
+          <button id="chatModeTabBtn" class="mode-tab" role="tab" aria-selected="false" type="button">Chat</button>
+          <button id="agentModeTabBtn" class="mode-tab is-active" role="tab" aria-selected="true" type="button">Agent</button>
+        </div>
+
+        <section id="agentModePane" class="mode-pane">
+          <header class="chat-header">
+            <div class="chat-heading">
+              <h2 id="chatTitle">Select a chat</h2>
+              <p id="chatMembers" class="muted"></p>
             </div>
+            <div class="chat-actions">
+              <button id="mobilePeopleBtn" class="mobile-only" type="button" aria-controls="mobilePeopleDrawer" aria-expanded="false">People</button>
+              <button id="runAgentsBtn">Run Members</button>
+              <button id="autoMeetingBtn">Auto Meeting</button>
+              <button id="manualMeetingBtn">Manual Meeting</button>
+              <button id="stopRunBtn" class="danger-button" type="button" hidden>Stop Run</button>
+              <button id="deleteChatBtn" class="danger-button" disabled>Delete Chat</button>
+            </div>
+          </header>
+          <section id="messages" class="messages"></section>
+          <footer class="composer">
+            <div id="pendingAttachments" class="pending-attachments" aria-live="polite"></div>
+            <div class="message-input-row">
+              <button id="voiceBtn" class="voice-button" type="button" title="Start voice input" aria-label="Start voice input">&#127908;</button>
+              <div class="message-input-wrap">
+                <textarea id="messageInput" rows="4" placeholder="Message Agent Slack — use @ to address a person, /path to attach a file"></textarea>
+                <div id="mentionMenu" class="mention-menu" role="listbox" hidden></div>
+              </div>
+              <button id="sendBtn" class="send-button">Send</button>
+            </div>
+            <div class="composer-actions">
+              <span id="voiceStatus" class="voice-status" aria-live="polite" hidden><span class="voice-status-dot"></span><span id="voiceStatusText"></span></span>
+              <input id="objectiveInput" placeholder="Optional objective for next agent run / meeting" />
+            </div>
+          </footer>
+        </section>
+
+        <section id="chatModePane" class="mode-pane" hidden>
+          <header class="chat-header">
+            <div class="chat-heading">
+              <h2>Chat</h2>
+              <p class="muted">Read + search + reason on this workspace — no files are changed and no commands run.</p>
+            </div>
+            <div class="chat-actions">
+              <span id="chatIndexStatus" class="section-meta"></span>
+              <button id="chatIndexBuildBtn" type="button">Build Index</button>
+              <button id="chatNewSessionBtn" type="button">New Chat</button>
+            </div>
+          </header>
+          <div class="chatmode-body">
+            <aside id="chatModeSessions" class="chatmode-sessions"></aside>
+            <section id="chatModeMessages" class="messages chatmode-messages"></section>
           </div>
-          <div class="composer-actions">
-            <span id="voiceStatus" class="voice-status" aria-live="polite" hidden><span class="voice-status-dot"></span><span id="voiceStatusText"></span></span>
-            <input id="objectiveInput" placeholder="Optional objective for next agent run / meeting" />
-            <button id="sendBtn">Send</button>
-          </div>
-        </footer>
+          <footer class="composer">
+            <div class="message-input-row">
+              <button id="chatVoiceBtn" class="voice-button" type="button" title="Start voice conversation" aria-label="Start voice conversation">&#127908;</button>
+              <div class="message-input-wrap">
+                <textarea id="chatModeInput" rows="3" placeholder="Ask about this workspace… drag a file in, or /path to attach one"></textarea>
+              </div>
+              <button id="chatSendBtn" class="send-button">Send</button>
+            </div>
+            <div class="composer-actions">
+              <span id="chatVoiceStatus" class="voice-status" aria-live="polite" hidden><span class="voice-status-dot"></span><span id="chatVoiceStatusText"></span></span>
+              <button id="chatCancelBtn" class="danger-button" type="button" hidden>Stop</button>
+            </div>
+          </footer>
+        </section>
       </main>
     </div>
 
@@ -126,9 +164,68 @@
           <button id="browseServerLogoBtn" type="button">Browse</button>
         </div>
         <p id="serverFormError" class="form-error" hidden></p>
+        <section class="integration-card">
+          <div class="integration-card-heading">
+            <div><strong>ChatGPT / OpenAI MCP Tunnel</strong><small>Agent Slack starts the local MCP server automatically.</small></div>
+            <button id="configureTunnelBtn" type="button" class="secondary-button">Configure</button>
+          </div>
+          <p id="tunnelSummary" class="muted integration-summary">Not configured</p>
+          <div class="integration-card-heading integration-card-heading-secondary">
+            <div><strong>Claude local MCP</strong><small>Install a project-scoped stdio MCP entry for Claude Desktop or Claude Code.</small></div>
+            <button id="installClaudeMcpBtn" type="button" class="secondary-button">Install</button>
+          </div>
+          <p id="claudeMcpSummary" class="muted integration-summary">Not installed · the app provides the bundled local MCP backend</p>
+          <div class="integration-card-heading integration-card-heading-secondary">
+            <div><strong>Claude MCP Tunnel</strong><small>Run Claude's mcp-proxy and cloudflared stack from this Mac.</small></div>
+            <button id="configureClaudeTunnelBtn" type="button" class="secondary-button">Configure</button>
+          </div>
+          <p id="claudeTunnelSummary" class="muted integration-summary">Not configured</p>
+        </section>
         <menu>
           <button id="cancelServerBtn" type="button">Cancel</button>
           <button id="serverSubmitBtn" value="submit">Add Server</button>
+        </menu>
+      </form>
+    </dialog>
+
+    <dialog id="claudeTunnelDialog">
+      <form method="dialog" id="claudeTunnelForm">
+        <h3>Claude MCP Tunnel</h3>
+        <p class="dialog-help">Create the tunnel in Claude Console first. Agent Slack prepares the local proxy/certificate files and starts Docker Compose automatically.</p>
+        <label class="checkbox-label"><input id="claudeTunnelEnabled" type="checkbox" /> Start Claude tunnel automatically with Agent Slack</label>
+        <label>Tunnel domain <span class="label-note">for example: abcd1234.tunnel.anthropic.com</span><input id="claudeTunnelDomain" placeholder="abcd1234.tunnel.anthropic.com" /></label>
+        <label>Tunnel token <span class="label-note">stored in macOS secure storage</span><input id="claudeTunnelToken" type="password" placeholder="eyJ..." /></label>
+        <label>Route subdomain <input id="claudeTunnelSubdomain" value="agent-slack" /></label>
+        <label>Route path <input id="claudeTunnelPath" value="mcp" /></label>
+        <p id="claudeTunnelStatus" class="form-error" hidden></p>
+        <p class="dialog-help">After preparation, upload the generated <code>ca.crt</code> to the tunnel's Certificates section in Claude Console. Claude will connect at the displayed HTTPS URL.</p>
+        <menu>
+          <button id="openClaudeTunnelsBtn" type="button" class="text-button">Open Claude Console</button>
+          <button id="stopClaudeTunnelBtn" type="button" class="danger-button">Stop</button>
+          <button id="cancelClaudeTunnelBtn" type="button">Cancel</button>
+          <button value="submit">Save &amp; Start</button>
+        </menu>
+      </form>
+    </dialog>
+
+    <dialog id="tunnelDialog">
+      <form method="dialog" id="tunnelForm">
+        <h3>OpenAI Secure MCP Tunnel</h3>
+        <p class="dialog-help">Agent Slack provides the local MCP endpoint and downloads the official OpenAI <code>tunnel-client</code> automatically for this Mac.</p>
+        <label class="checkbox-label"><input id="tunnelEnabled" type="checkbox" /> Start tunnel automatically with Agent Slack</label>
+        <label>Tunnel ID <input id="tunnelId" placeholder="tunnel_..." /></label>
+        <label>Runtime API key <span class="label-note">stored in macOS secure storage</span><input id="tunnelRuntimeKey" type="password" placeholder="sk-..." /></label>
+        <label>Profile <input id="tunnelProfile" value="agent-slack" /></label>
+        <label>Local MCP endpoint <span class="label-note">managed automatically</span><input id="tunnelServerUrl" disabled /></label>
+        <label>tunnel-client binary <span class="label-note">managed automatically</span><input id="tunnelExecutablePath" disabled /></label>
+        <button id="downloadTunnelClientBtn" type="button" class="text-button">Download / update tunnel-client</button>
+        <button id="openTunnelDocsBtn" type="button" class="text-button">Open OpenAI tunnel setup</button>
+        <p class="dialog-help">Claude Desktop and Claude Code use the local MCP configuration installed from Server Settings. Claude’s remote API connector requires an HTTPS MCP URL; it cannot connect directly to this local stdio server.</p>
+        <p id="tunnelStatus" class="form-error" hidden></p>
+        <menu>
+          <button id="cancelTunnelBtn" type="button">Cancel</button>
+          <button id="stopTunnelBtn" class="danger-button" type="button">Stop</button>
+          <button value="submit">Save &amp; Start</button>
         </menu>
       </form>
     </dialog>
@@ -163,6 +260,7 @@
     <script src="/composer.js"></script>
     <script src="/mentions.js"></script>
     <script src="/interactions.js"></script>
+    <script src="/chatmode.js"></script>
     <script src="/app.js"></script>
   </body>
 </html>

@@ -14,36 +14,47 @@
 
   function safeUrl(value) {
     const url = String(value || "").trim();
+    if (!url) return null;
     if (/^https?:\/\//i.test(url) || /^#/.test(url)) {
       return escapeHtml(url);
     }
-    if (/^\/(?!\/)/.test(url)) {
-      if (url.startsWith("/api/")) return escapeHtml(url);
-      return `/api/v1/files?path=${encodeURIComponent(url)}`;
+    if (/^[a-z][a-z0-9+.-]*:/i.test(url) || /^\/\//.test(url)) {
+      return null;
     }
-    return null;
+    if (url.startsWith("/api/")) return escapeHtml(url);
+    return `/api/v1/files?path=${encodeURIComponent(url)}`;
   }
 
   function renderInline(value) {
     const codeTokens = [];
-    let text = escapeHtml(value);
+    const linkTokens = [];
+    let text = String(value ?? "");
     text = text.replace(/`([^`\n]+)`/g, (_match, code) => {
       const token = `\u0000CODE${codeTokens.length}\u0000`;
-      codeTokens.push(`<code>${code}</code>`);
+      codeTokens.push(`<code>${escapeHtml(code)}</code>`);
       return token;
     });
-    text = text.replace(/\[([^\]]+)]\(([^)\s]+)\)/g, (_match, label, url) => {
+    text = text.replace(/\[([^\]]+)]\((?:<([^>]*)>|([^)\s]+))\)/g, (_match, label, angleUrl, bareUrl) => {
+      const url = (angleUrl ?? bareUrl ?? "").trim();
       const href = safeUrl(url);
-      return href
-        ? `<a href="${href}" target="_blank" rel="noopener noreferrer">${label}</a>`
-        : `${label} (${escapeHtml(url)})`;
+      const token = `\u0000LINK${linkTokens.length}\u0000`;
+      linkTokens.push(
+        href
+          ? `<a href="${href}" target="_blank" rel="noopener noreferrer">${escapeHtml(label)}</a>`
+          : `${escapeHtml(label)} (${escapeHtml(url)})`
+      );
+      return token;
     });
+    text = escapeHtml(text);
     text = text
       .replace(/\*\*([^*\n]+)\*\*/g, "<strong>$1</strong>")
       .replace(/__([^_\n]+)__/g, "<strong>$1</strong>")
       .replace(/~~([^~\n]+)~~/g, "<del>$1</del>")
       .replace(/(^|[^\w])\*([^*\n]+)\*/g, "$1<em>$2</em>")
       .replace(/(^|[^\w])_([^_\n]+)_/g, "$1<em>$2</em>");
+    linkTokens.forEach((html, index) => {
+      text = text.replace(`\u0000LINK${index}\u0000`, html);
+    });
     codeTokens.forEach((code, index) => {
       text = text.replace(`\u0000CODE${index}\u0000`, code);
     });

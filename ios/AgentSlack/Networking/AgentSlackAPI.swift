@@ -307,6 +307,12 @@ struct AgentSlackAPI {
         return url
     }
 
+    func workspaceFileURL(forCitedPath rawPath: String) -> URL? {
+        var components = URLComponents(url: baseURL.appendingPathComponent("api/v1/files"), resolvingAgainstBaseURL: false)
+        components?.queryItems = [URLQueryItem(name: "path", value: rawPath)]
+        return components?.url
+    }
+
     private func request<Response: Decodable, Body: Encodable>(
         path: String,
         method: String,

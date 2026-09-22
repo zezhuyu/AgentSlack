@@ -16,9 +16,13 @@ class AgentSlackStorage:
         self.root = root
         self.chats_dir = self.root / "chats"
         self.memories_dir = self.root / "memories"
+        self.tasks_dir = self.root / "tasks"
+        self.shared_memory_dir = self.root / "shared_memory"
         self.root.mkdir(parents=True, exist_ok=True)
         self.chats_dir.mkdir(parents=True, exist_ok=True)
         self.memories_dir.mkdir(parents=True, exist_ok=True)
+        self.tasks_dir.mkdir(parents=True, exist_ok=True)
+        self.shared_memory_dir.mkdir(parents=True, exist_ok=True)
         self.agents_file = self.root / "agents.json"
 
     def save_agents(self, agents: list[dict[str, Any]]) -> None:
@@ -96,6 +100,33 @@ class AgentSlackStorage:
 
     def get_memory_json(self, agent_id: str) -> dict[str, Any]:
         return self._read_json(self.memories_dir / f"{agent_id}.json", default={})
+
+    def create_task(self, task: dict[str, Any] | None = None, **fields: Any) -> dict[str, Any]:
+        item = {**(task or {}), **fields}
+        item.setdefault("task_id", uuid.uuid4().hex[:12])
+        item.setdefault("created_at", utc_now())
+        self._write_json(self.tasks_dir / f"{item['task_id']}.json", item)
+        return item
+
+    def update_task(self, task_id: str, **updates: Any) -> dict[str, Any]:
+        task = self.get_task(task_id)
+        if task is None:
+            raise KeyError(f"Task not found: {task_id}")
+        task.update({key: value for key, value in updates.items() if value is not None})
+        self._write_json(self.tasks_dir / f"{task_id}.json", task)
+        return task
+
+    def get_task(self, task_id: str) -> dict[str, Any] | None:
+        if not task_id or Path(task_id).name != task_id:
+            return None
+        path = self.tasks_dir / f"{task_id}.json"
+        return self._read_json(path, default={}) if path.exists() else None
+
+    def list_tasks(self) -> list[dict[str, Any]]:
+        tasks = [self._read_json(path, default={}) for path in self.tasks_dir.glob("*.json")]
+        tasks = [task for task in tasks if task]
+        tasks.sort(key=lambda task: task.get("created_at", ""), reverse=True)
+        return tasks
 
     def _write_json(self, path: Path, payload: dict[str, Any]) -> None:
         path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")

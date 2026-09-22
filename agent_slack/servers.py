@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from .app import AgentSlackApp
+from .architecture import AgentSystemArchitecture
 from .storage import utc_now
 
 
@@ -36,6 +37,7 @@ class AgentServerManager:
         return [
             {
                 "server_id": item["server_id"],
+                "workspace_key": self._workspace_key(item),
                 "name": item["name"],
                 "project_root": item["project_root"],
                 "project_name": Path(item["project_root"]).name or item["name"],
@@ -63,7 +65,15 @@ class AgentServerManager:
         if not root.is_dir():
             raise ValueError(f"Agent system folder does not exist: {root}")
         selected_runner = self._validate_runner(runner) if runner is not None else None
+        workspace_key = AgentSystemArchitecture.load(root).workspace_key or root.name
         with self._lock:
+            workspace_conflict = next(
+                (item for item in self._registry["servers"]
+                 if Path(item["project_root"]).resolve() != root and self._workspace_key(item) == workspace_key),
+                None,
+            )
+            if workspace_conflict is not None:
+                raise ValueError(f"Workspace key is already assigned: {workspace_key}")
             existing = next(
                 (item for item in self._registry["servers"] if Path(item["project_root"]) == root),
                 None,
@@ -72,6 +82,7 @@ class AgentServerManager:
                 server_id = uuid.uuid4().hex[:12]
                 existing = {
                     "server_id": server_id,
+                    "workspace_key": workspace_key,
                     "name": (name or root.name or "Agent System").strip(),
                     "project_root": str(root),
                     "storage_key": server_id,
@@ -82,6 +93,7 @@ class AgentServerManager:
                 self._registry["servers"].append(existing)
             elif name and name.strip():
                 existing["name"] = name.strip()
+            existing["workspace_key"] = workspace_key
             if selected_runner is not None:
                 existing["runner"] = selected_runner
             else:
@@ -156,6 +168,27 @@ class AgentServerManager:
     def app_for(self, server_id: str) -> AgentSlackApp:
         return self._app_for(server_id)
 
+    def app_for_workspace(self, workspace_key: str) -> AgentSlackApp:
+        key = str(workspace_key or "").strip()
+        item = next((item for item in self._registry["servers"] if self._workspace_key(item) == key), None)
+        if item is None:
+            raise KeyError(f"Workspace not found: {key}")
+        return self._app_for(item["server_id"])
+
+    def app_for_slack_channel(self, channel_id: str) -> AgentSlackApp:
+        channel = str(channel_id or "").strip()
+        matches = []
+        for item in self._registry["servers"]:
+            architecture = AgentSystemArchitecture.load(Path(item["project_root"]))
+            slack = architecture.connectors.get("slack", {})
+            if bool(slack.get("enabled", True)) and str(slack.get("channel_id") or "").strip() == channel:
+                matches.append(item)
+        if len(matches) == 1:
+            return self._app_for(matches[0]["server_id"])
+        if len(matches) > 1:
+            raise ValueError(f"Slack channel is assigned to multiple workspaces: {channel}")
+        raise KeyError(f"No workspace is configured for Slack channel: {channel}")
+
     def active_summary(self) -> dict[str, Any] | None:
         server_id = self.active_server_id
         if server_id is None:
@@ -184,6 +217,7 @@ class AgentServerManager:
             storage_key = "legacy" if self._has_legacy_data() and not self._registry["servers"] else server_id
             existing = {
                 "server_id": server_id,
+                "workspace_key": AgentSystemArchitecture.load(root).workspace_key or root.name,
                 "name": root.name or "Agent System",
                 "project_root": str(root),
                 "storage_key": storage_key,
@@ -215,6 +249,14 @@ class AgentServerManager:
             self._apps[server_id].reload_host_configuration()
             self._apps[server_id].refresh_agents()
         return self._apps[server_id]
+
+    @staticmethod
+    def _workspace_key(item: dict[str, Any]) -> str:
+        configured = str(item.get("workspace_key") or "").strip()
+        if configured:
+            return configured
+        manifest = AgentSystemArchitecture.load(Path(item["project_root"]))
+        return manifest.workspace_key or Path(item["project_root"]).name
 
     def _find(self, server_id: str) -> dict[str, Any] | None:
         return next((item for item in self._registry["servers"] if item["server_id"] == server_id), None)

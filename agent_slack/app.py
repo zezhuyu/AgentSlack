@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import json
 import mimetypes
+import os
 import re
 import shutil
+from threading import Thread
 from collections import Counter
 from collections.abc import Iterator
 from copy import deepcopy
@@ -13,11 +15,66 @@ from typing import Any
 from uuid import uuid4
 
 from .architecture import AgentSystemArchitecture
+from .chat.engine import ChatEngine
+from .chat.openai_provider import OpenAICompatibleChatProvider
+from .chat.provider import CliChatProvider
+from .chat.session import ChatSessionStore
 from .discovery import AgentDiscovery
 from .interactions import extract_choice_interaction
+from .knowledge import ProjectKnowledge
+from .memory_search import ProjectMemorySearch
+from .shared_memory import ProjectSharedMemory
 from .orchestrator import CliOrchestrator
+from .retrieval.manager import RetrievalManager
+from .retrieval.paths import is_shareable as is_shareable_path
+from .retrieval.paths import resolve_within as resolve_within_path
 from .storage import AgentSlackStorage, utc_now
 from .voice import LocalVoiceBackend
+
+
+# Build/dependency/cache noise an agent's working directory routinely accumulates
+# (venvs, package caches, tool scratch dirs) - never worth attaching to chat even
+# though is_shareable() (a *security* filter, not a noise filter) lets them through.
+NOISE_DIRECTORY_NAMES = {
+    "venv", ".venv", "env", ".env-dir", "__pycache__", "node_modules", ".cache",
+    "site-packages", "dist", "build", ".tox", ".mypy_cache", ".pytest_cache",
+    ".ruff_cache", "egg-info", ".eggs", ".ipynb_checkpoints",
+}
+NOISE_FILE_NAMES = {"cachedir.tag", "pyvenv.cfg", ".ds_store"}
+
+# Content types a chat attachment card should render inline (audio player, image,
+# 3D viewer, ...) because they're a primary deliverable, not incidental reference
+# material (docs/manifests/config an agent wrote to explain its own output).
+PRIMARY_CONTENT_TYPE_PREFIXES = ("image/", "audio/", "video/", "model/")
+PRIMARY_CONTENT_TYPES = {"application/pdf"}
+
+# mimetypes.guess_type() doesn't know these on many platforms (.glb/.gltf are never
+# registered in the stdlib db at all) - without this fallback, generated 3D models
+# and some audio formats get stored as "application/octet-stream" and never preview.
+EXTENSION_CONTENT_TYPES = {
+    ".glb": "model/gltf-binary", ".gltf": "model/gltf+json",
+    ".mp3": "audio/mpeg", ".wav": "audio/wav", ".m4a": "audio/mp4", ".ogg": "audio/ogg",
+    ".mid": "audio/midi", ".midi": "audio/midi",
+    ".webm": "video/webm", ".mov": "video/quicktime",
+}
+
+
+def _is_noise_path(path: Path) -> bool:
+    if any(part.lower() in NOISE_DIRECTORY_NAMES for part in path.parts):
+        return True
+    return path.name.casefold() in NOISE_FILE_NAMES
+
+
+def _guess_content_type(path: Path) -> str:
+    mime = mimetypes.guess_type(str(path))[0]
+    return mime or EXTENSION_CONTENT_TYPES.get(path.suffix.lower()) or "application/octet-stream"
+
+
+def _attachment_role(content_type: str) -> str:
+    """"primary" gets a full inline preview; "reference" gets a link-only chip."""
+    if content_type.startswith(PRIMARY_CONTENT_TYPE_PREFIXES) or content_type in PRIMARY_CONTENT_TYPES:
+        return "primary"
+    return "reference"
 
 
 class AgentSlackApp:
@@ -46,7 +103,134 @@ class AgentSlackApp:
         self._active_run_states: dict[str, dict[str, Any]] = {}
         self.voice = LocalVoiceBackend()
         self.reload_host_configuration()
+        self.retrieval = RetrievalManager(self.project_root, self.data_root / "search" / "index.sqlite")
+        self.chat_sessions = ChatSessionStore(self.data_root / "chat_sessions")
+        self.chat_provider = self._build_chat_provider()
+        self.chat_engine = ChatEngine(self.chat_sessions, self.retrieval, self.chat_provider, self.get_upload_path)
         self.bootstrap()
+
+    @property
+    def workspace_key(self) -> str:
+        return self.architecture.workspace_key or self.project_root.name
+
+    def project_knowledge(self) -> ProjectKnowledge:
+        return ProjectKnowledge(self.project_root, self.architecture.knowledge_roots)
+
+    def list_project_files(self) -> list[dict[str, Any]]:
+        return self.project_knowledge().list_project_files()
+
+    def search_project_files(self, query: str) -> list[dict[str, Any]]:
+        return self.project_knowledge().search_project_files(query)
+
+    def read_project_file(self, path: str) -> dict[str, Any]:
+        return self.project_knowledge().read_project_file(path)
+
+    def search_memory(self, query: str, sources: list[str] | None = None, limit: int = 10) -> list[dict[str, Any]]:
+        shared = ProjectSharedMemory.for_app(self).search(self.workspace_key, query, limit=limit)
+        local = ProjectMemorySearch(self.project_root, self.data_root).search_memory(query)
+        results = shared + local
+        if sources:
+            results = [item for item in results if item.get("source") in set(sources)]
+        return sorted(results, key=lambda item: (-float(item.get("score", 0)), item.get("path", "")))[:max(1, limit)]
+
+    def get_project_memory(self) -> dict[str, Any]:
+        return ProjectSharedMemory.for_app(self).get_project_memory(self.workspace_key)
+
+    def append_project_decision(self, content: str, rationale: str | None = None, source: str | None = None, **metadata: Any) -> dict[str, Any]:
+        return ProjectSharedMemory.for_app(self).append_decision(self.workspace_key, content, rationale, source, **metadata)
+
+    def append_project_insight(self, content: str, insight_type: str = "general", source: str | None = None, **metadata: Any) -> dict[str, Any]:
+        return ProjectSharedMemory.for_app(self).append_insight(self.workspace_key, content, insight_type, source, **metadata)
+
+    def update_project_summary(self, section: str, content: str, source: str | None = None) -> dict[str, Any]:
+        return ProjectSharedMemory.for_app(self).update_project_summary(self.workspace_key, section, content, source)
+
+    def list_tasks(self) -> list[dict[str, Any]]:
+        return self.storage.list_tasks()
+
+    def get_task(self, task_id: str) -> dict[str, Any] | None:
+        return self.storage.get_task(task_id)
+
+    def create_task(self, agent_id: str, instruction: str, source: str = "chatgpt") -> dict[str, Any]:
+        agent = self.get_agent(agent_id)
+        if agent is None:
+            raise ValueError(f"Agent not found: {agent_id}")
+        task = self.storage.create_task({
+            "workspace_key": self.workspace_key,
+            "agent_id": agent_id,
+            "instruction": str(instruction).strip(),
+            "status": "queued",
+            "source": source,
+            "run_id": None,
+            "result": None,
+            "artifacts": [],
+            "completed_at": None,
+        })
+        Thread(target=self._run_project_task, args=(task["task_id"],), daemon=True).start()
+        return task
+
+    def _run_project_task(self, task_id: str) -> None:
+        task = self.storage.get_task(task_id)
+        if not task:
+            return
+        try:
+            chat = self.create_chat(f"Task {task_id}", [task["agent_id"]], kind="task")
+            self.storage.append_message(chat["chat_id"], {
+                "author_type": "user", "author_id": "external", "author_label": task["source"],
+                "body": task["instruction"], "metadata": {"task_id": task_id},
+            })
+            self.storage.update_task(task_id, status="running", chat_id=chat["chat_id"])
+            result = ""
+            run_id = None
+            for event in self.stream_run(chat["chat_id"], mode="respond", objective=task["instruction"],
+                                         agent_ids=[task["agent_id"]], lead_agent_id=task["agent_id"]):
+                if event.get("type") == "run_started":
+                    run_id = event.get("run_id")
+                    self.storage.update_task(task_id, run_id=run_id)
+                if event.get("type") == "agent_completed":
+                    result = str(event.get("message") or event.get("body") or result)
+                if event.get("type") in {"run_cancelled", "agent_cancelled"}:
+                    self.storage.update_task(task_id, status="cancelled", completed_at=utc_now(), result=result)
+                    return
+            saved_chat = self.storage.get_chat(chat["chat_id"]) or {}
+            artifacts = []
+            for message in saved_chat.get("messages", []):
+                if (message.get("metadata") or {}).get("run_id") == run_id:
+                    artifacts.extend((message.get("metadata") or {}).get("attachments") or [])
+            self.storage.update_task(task_id, status="completed", completed_at=utc_now(), result=result, artifacts=artifacts)
+            if result.strip():
+                self.append_project_insight(
+                    f"{task_id} completed: {result.strip()[:1200]}",
+                    insight_type="implementation", source=self.orchestrator.backend, task_id=task_id,
+                )
+        except Exception as exc:
+            self.storage.update_task(task_id, status="failed", completed_at=utc_now(), result=str(exc))
+
+    def cancel_task_record(self, task_id: str) -> dict[str, Any]:
+        task = self.storage.get_task(task_id)
+        if task is None:
+            raise KeyError(f"Task not found: {task_id}")
+        if task.get("run_id"):
+            self.cancel_run(str(task["run_id"]))
+        return self.storage.update_task(task_id, status="cancelled", completed_at=utc_now())
+
+    def _build_chat_provider(self):
+        """Prefer a directly-configured OpenAI-compatible endpoint (no CLI bootstrap
+        per turn, so it's the fastest option) and fall back to the local Claude/Codex
+        CLI otherwise. Either way Chat mode only ever gets a system prompt + plain
+        text - never a shell or filesystem tool."""
+        base_url = os.environ.get("AGENT_SLACK_CHAT_LLM_BASE_URL", "").strip()
+        if base_url:
+            external = OpenAICompatibleChatProvider(
+                base_url=base_url,
+                api_key=os.environ.get("AGENT_SLACK_CHAT_LLM_API_KEY", "").strip() or None,
+                model=os.environ.get("AGENT_SLACK_CHAT_LLM_MODEL", "").strip(),
+            )
+            if external.available:
+                return external
+        return CliChatProvider(
+            self.orchestrator.backend, self.orchestrator.executable, self.project_root, self.orchestrator.model,
+        )
 
     def reload_host_configuration(self) -> None:
         self.architecture = AgentSystemArchitecture.load(self.project_root)
@@ -65,6 +249,9 @@ class AgentSlackApp:
             backend_preference=runner,
             model=self.model_override if project_fallback else None,
         )
+        if hasattr(self, "chat_engine"):
+            self.chat_provider = self._build_chat_provider()
+            self.chat_engine.provider = self.chat_provider
 
     def configure_runtime(self, runner: str | None, model: str | None) -> None:
         self.runner_override = str(runner or "").strip().casefold() or None
@@ -323,7 +510,7 @@ class AgentSlackApp:
         return file_path, {**metadata, "filename": filename}
 
     def store_created_artifact(self, source: Path) -> dict[str, Any] | None:
-        if not self._is_shareable_artifact(source):
+        if not self._is_shareable_artifact(source) or _is_noise_path(source):
             return None
         if source.stat().st_size > self.MAX_UPLOAD_BYTES:
             return None
@@ -332,29 +519,25 @@ class AgentSlackApp:
         artifact_dir.mkdir(parents=True, exist_ok=False)
         target = artifact_dir / self._safe_upload_filename(source.name)
         shutil.copyfile(source, target)
-        content_type = mimetypes.guess_type(str(source))[0]
+        content_type = _guess_content_type(source)
         metadata = {
             "attachment_id": artifact_id,
             "filename": target.name,
-            "content_type": content_type or "application/octet-stream",
+            "content_type": content_type,
+            "role": _attachment_role(content_type),
             "size": target.stat().st_size,
             "url": f"/api/artifacts/{artifact_id}",
         }
+        try:
+            metadata["relative_path"] = source.resolve().relative_to(self.project_root.resolve()).as_posix()
+        except ValueError:
+            return None
         (artifact_dir / "metadata.json").write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
         return metadata
 
     @staticmethod
     def _is_shareable_artifact(source: Path) -> bool:
-        """Exclude hidden state and obvious secret material from automatic delivery."""
-        if not source.is_file() or any(part.startswith(".") for part in source.parts):
-            return False
-        lowered = source.name.casefold()
-        return not (
-            lowered.startswith(".env")
-            or "credential" in lowered
-            or "secret" in lowered
-            or lowered.endswith((".pem", ".key", ".p12"))
-        )
+        return is_shareable_path(source)
 
     def get_artifact_path(self, artifact_id: str) -> tuple[Path, dict[str, Any]] | None:
         if not re.fullmatch(r"[0-9a-f]{32}", str(artifact_id or "")):
@@ -373,25 +556,14 @@ class AgentSlackApp:
         return (path, {**metadata, "filename": filename}) if path.is_file() and path.is_relative_to(directory) else None
 
     def resolve_workspace_file(self, raw_path: str) -> Path | None:
-        """Resolve a file an agent cited by absolute path, scoped to the active project.
+        """Resolve a file an agent cited by path, scoped to the active project.
 
-        Agent replies sometimes cite source files as plain filesystem paths (optionally
-        with a trailing ``:line`` locator). This lets the chat preview those without
-        exposing anything outside the workspace the agent is actually running in.
+        Agent replies sometimes cite source files as plain filesystem paths (absolute
+        or relative to the project root, optionally with a trailing ``:line`` locator).
+        This lets the chat preview those without exposing anything outside the
+        workspace the agent is actually running in.
         """
-        candidate = re.sub(r":\d+(:\d+)?$", "", str(raw_path or "").strip())
-        if not candidate:
-            return None
-        try:
-            path = Path(candidate).resolve()
-        except (OSError, ValueError):
-            return None
-        root = self.project_root.resolve()
-        if not path.is_relative_to(root) or not path.is_file():
-            return None
-        if not self._is_shareable_artifact(path):
-            return None
-        return path
+        return resolve_within_path(self.project_root, raw_path)
 
     def resolve_uploads(self, attachment_ids: list[str] | None) -> list[dict[str, Any]]:
         unique_ids = list(dict.fromkeys(str(value).strip() for value in attachment_ids or [] if str(value).strip()))

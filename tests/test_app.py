@@ -115,6 +115,63 @@ def test_created_artifact_capture_excludes_hidden_and_secret_files(tmp_path: Pat
     assert app.store_created_artifact(secret) is None
 
 
+def test_created_artifact_capture_excludes_build_and_cache_noise(tmp_path: Path, monkeypatch) -> None:
+    app = _app(tmp_path, monkeypatch)
+    cache_marker = app.project_root / ".venv" / "CACHEDIR.TAG"
+    cache_marker.parent.mkdir(parents=True, exist_ok=True)
+    cache_marker.write_text("Signature: 8a477f597d28d172789f06886806bc55", encoding="utf-8")
+    assert app.store_created_artifact(cache_marker) is None
+
+    pyvenv_cfg = app.project_root / "pyvenv.cfg"
+    pyvenv_cfg.write_text("home = /usr/bin", encoding="utf-8")
+    assert app.store_created_artifact(pyvenv_cfg) is None
+
+
+def test_created_artifact_gets_extension_fallback_content_type_and_role(tmp_path: Path, monkeypatch) -> None:
+    app = _app(tmp_path, monkeypatch)
+
+    model = app.project_root / "scene.glb"
+    model.write_bytes(b"glb-bytes")
+    model_artifact = app.store_created_artifact(model)
+    assert model_artifact is not None
+    assert model_artifact["content_type"] == "model/gltf-binary"
+    assert model_artifact["role"] == "primary"
+
+    audio = app.project_root / "track.wav"
+    audio.write_bytes(b"wav-bytes")
+    audio_artifact = app.store_created_artifact(audio)
+    assert audio_artifact is not None
+    assert audio_artifact["content_type"].startswith("audio/")
+    assert audio_artifact["role"] == "primary"
+
+    manifest = app.project_root / "track-manifest.json"
+    manifest.write_text("{}", encoding="utf-8")
+    manifest_artifact = app.store_created_artifact(manifest)
+    assert manifest_artifact is not None
+    assert manifest_artifact["content_type"] == "application/json"
+    assert manifest_artifact["role"] == "reference"
+
+
+def test_chat_provider_prefers_configured_external_llm_over_cli(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("AGENT_SLACK_CHAT_LLM_BASE_URL", "http://localhost:11434/v1")
+    monkeypatch.setenv("AGENT_SLACK_CHAT_LLM_MODEL", "local-model")
+    app = _app(tmp_path, monkeypatch)
+
+    from agent_slack.chat.openai_provider import OpenAICompatibleChatProvider
+
+    assert isinstance(app.chat_provider, OpenAICompatibleChatProvider)
+    assert app.chat_provider.base_url == "http://localhost:11434/v1"
+
+
+def test_chat_provider_falls_back_to_cli_without_external_llm_config(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.delenv("AGENT_SLACK_CHAT_LLM_BASE_URL", raising=False)
+    app = _app(tmp_path, monkeypatch)
+
+    from agent_slack.chat.provider import CliChatProvider
+
+    assert isinstance(app.chat_provider, CliChatProvider)
+
+
 def test_resolve_workspace_file_previews_cited_paths_inside_the_project(tmp_path: Path, monkeypatch) -> None:
     app = _app(tmp_path, monkeypatch)
     cited = app.project_root / "notes" / "report.md"
@@ -124,6 +181,8 @@ def test_resolve_workspace_file_previews_cited_paths_inside_the_project(tmp_path
     resolved = app.resolve_workspace_file(f"{cited}:122")
 
     assert resolved == cited
+    assert app.resolve_workspace_file("notes/report.md") == cited
+    assert app.resolve_workspace_file("notes/../notes/report.md") == cited
 
 
 def test_resolve_workspace_file_rejects_paths_outside_the_project_or_secrets(tmp_path: Path, monkeypatch) -> None:
@@ -135,6 +194,7 @@ def test_resolve_workspace_file_rejects_paths_outside_the_project_or_secrets(tmp
 
     assert app.resolve_workspace_file(str(outside)) is None
     assert app.resolve_workspace_file(str(secret)) is None
+    assert app.resolve_workspace_file("../outside.md") is None
     assert app.resolve_workspace_file("") is None
     assert app.resolve_workspace_file(str(app.project_root / "missing.md")) is None
 

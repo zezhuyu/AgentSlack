@@ -53,6 +53,60 @@ Agent replies use `AGENT_SLACK_CLI=auto` by default, preferring Codex and then C
 
 ## macOS app
 
+### ChatGPT MCP and Slack connectors
+
+The optional connectors resolve every request through `workspace_key`, then
+through the existing server registry. They cannot read another registered
+project, arbitrary absolute paths, secrets, or excluded build/dependency
+directories.
+
+Install the connector dependencies with `python3 -m pip install -r
+requirements-connectors.txt`. The macOS app starts the MCP HTTP endpoint
+automatically alongside the normal AgentSlack backend:
+
+```bash
+http://127.0.0.1:8899/mcp
+```
+
+Use the OpenAI Secure MCP Tunnel to forward that private endpoint to ChatGPT.
+The macOS app automatically downloads the matching official `tunnel-client`
+release for the Mac from OpenAI's public release channel, verifies the release
+digest when provided, stores it under app data, and starts it as needed.
+The standalone stdio adapter remains available for tunnel profiles that use a
+command instead of a local HTTP URL. Use the project instruction:
+`workspace_key: seens; use AgentSlack MCP for local project context; use
+create_task for implementation work.`
+
+From the macOS app's Server Settings, choose **Install** under **Claude local
+MCP**. This registers the already-bundled AgentSlack backend in Claude
+Desktop's `claude_desktop_config.json`, preserving a backup of any existing
+file. No separate AgentSlack MCP package is needed. Restart Claude Desktop
+after installation. Claude Desktop and Claude Code launch the packaged backend
+with `--mcp-stdio`; every tool call still requires
+`workspace_key` and remains restricted to the configured project roots.
+
+For Claude Platform MCP tunnels, use the **Claude MCP Tunnel** Configure button
+in Server Settings. Create the tunnel in Claude Console, paste its domain and
+token, and Agent Slack prepares the pinned `mcp-proxy`/`cloudflared` Docker
+Compose stack, generates the local certificates, and starts it. Upload the
+generated `data/ca.crt` in the tunnel's Certificates section in Claude Console,
+then attach the route URL shown by Agent Slack (for example
+`https://agent-slack.<domain>/mcp`) to the Claude agent. Claude's tunnel service
+is separate from OpenAI's tunnel client; a local stdio server cannot be used by
+Claude's remote API directly.
+
+For Slack Socket Mode, create a Slack app with Socket Mode enabled, subscribe
+to `app_mention`, grant `app_mentions:read`, `chat:write`, `files:write`, and
+the channel history/read scopes required by the workspace. Set
+`SLACK_BOT_TOKEN=xoxb-...` and `SLACK_APP_TOKEN=xapp-...`, then run:
+
+```bash
+python3 -m agent_slack.slack_connector --data-root "$HOME/Library/Application Support/Agent Slack/data"
+```
+
+Set the target channel ID in that project’s `.agent-slack.json` under
+`connectors.slack.channel_id`. Tokens are environment variables only.
+
 The Electron shell packages a universal2 frozen backend and static UI into an installable `Agent Slack.app`. Installed apps do not require system Python. They use the locally authenticated Codex or Claude Code CLI; credentials are never bundled and no model API is called.
 
 Local builds are ad-hoc signed so the complete bundle can be verified reproducibly on both architectures. The generated DMGs are not Apple-notarized; public distribution requires a Developer ID certificate and notarization credentials.
