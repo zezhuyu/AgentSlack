@@ -235,3 +235,6 @@ For the full integration contract, see [REQUIREMENTS.md](./REQUIREMENTS.md).
 - group chat orchestration is sequential, not concurrent
 - memory summarization remains heuristic
 - agent discovery is markdown-definition based; if a project stores agents in a different format, add a discovery adapter in this subfolder
+# Engram memory bridge (optional)
+
+Agent Slack can connect to an Engram remote MCP endpoint for shared historical recall and versioned writes. See [`docs/engram-integration.md`](docs/engram-integration.md) for workspace-bound credential configuration and limits. This integration is opt-in and leaves Agent Slack's existing project memory, task store, and tunnel support intact.

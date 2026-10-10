@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import mimetypes
+import os
 import re
 import sys
 from http import HTTPStatus
@@ -27,6 +28,10 @@ EXTENSION_CONTENT_TYPES = {
     ".mp3": "audio/mpeg", ".wav": "audio/wav", ".m4a": "audio/mp4", ".ogg": "audio/ogg",
     ".mid": "audio/midi", ".midi": "audio/midi",
     ".webm": "video/webm", ".mov": "video/quicktime",
+    ".md": "text/markdown", ".markdown": "text/markdown", ".json": "application/json",
+    ".yml": "text/yaml", ".yaml": "text/yaml", ".tex": "text/x-tex", ".latex": "text/x-tex",
+    ".pdf": "application/pdf", ".stl": "model/stl", ".usdz": "model/vnd.usdz+zip",
+    ".dae": "model/vnd.collada+xml", ".ply": "model/ply", ".scn": "model/x-scenekit",
 }
 
 
@@ -99,6 +104,9 @@ def _openapi_document() -> dict:
         "/voice/turns": {"post": {"summary": "Process one conversational voice turn with backend ASR/TTS"}},
         "/chats/{chat_id}/questions/{question_id}/answer": {
             "post": {"summary": "Answer an agent-authored dynamic choice question"},
+        },
+        "/chats/{chat_id}/ui-actions": {
+            "post": {"summary": "Request a catalog-registered, chat-scoped Agent UI action and stream its events"},
         },
         "/chats/{chat_id}/run-stream": {
             "post": {
@@ -191,6 +199,7 @@ class _Handler(BaseHTTPRequestHandler):
                     "active_server_id": self.manager.active_server_id,
                     "servers": self.manager.list_servers(),
                     "architecture": architecture,
+                    "generative_ui": os.getenv("AGENT_SLACK_GENERATIVE_UI", "1").strip().lower() not in {"0", "false", "off"},
                 }
             )
         if path == "/api/servers":
@@ -290,7 +299,7 @@ class _Handler(BaseHTTPRequestHandler):
                 request = self._read_json_body()
                 response = handle_jsonrpc(AgentSlackMCP(self.manager), request)
             except Exception as exc:
-                response = {"jsonrpc": "2.0", "id": None,
+                response = {"jsonrpc": "2.0", "id": request.get("id") if isinstance(request, dict) else None,
                             "error": {"code": -32000, "message": str(exc)}}
             if response is None:
                 self.send_response(HTTPStatus.ACCEPTED)
@@ -331,6 +340,33 @@ class _Handler(BaseHTTPRequestHandler):
             return self._json({"error": str(exc).strip("'")}, status=404)
         except (LookupError, ValueError) as exc:
             return self._json({"error": str(exc)}, status=409)
+        match = re.fullmatch(r"/api/chats/([^/]+)/ui-actions", path)
+        if match:
+            if os.getenv("AGENT_SLACK_GENERATIVE_UI", "1").strip().lower() in {"0", "false", "off"}:
+                return self._json({"error": "Generative UI is disabled"}, status=404)
+            try:
+                body_length = int(self.headers.get("Content-Length", "0"))
+            except ValueError:
+                return self._json({"error": "Invalid Content-Length"}, status=400)
+            if self.headers.get("Transfer-Encoding") or body_length <= 0 or body_length > 32_768:
+                return self._json({"error": "UI action payload must be between 1 and 32768 bytes"}, status=413)
+            origin = self.headers.get("Origin", "")
+            host = self.headers.get("Host", "")
+            if self.headers.get("X-Agent-Slack-UI-Action") != "1" or not origin or urlparse(origin).netloc != host:
+                return self._json({"error": "UI action request must come from the same AgentSlack origin"}, status=403)
+            payload = self._read_json_body()
+            try:
+                events = app.stream_ui_action(
+                    match.group(1),
+                    str(payload.get("message_id") or ""),
+                    str(payload.get("actionId") or ""),
+                    str(payload.get("node_id") or ""),
+                    payload.get("args") or {},
+                    str(payload.get("idempotency_key") or self.headers.get("Idempotency-Key") or ""),
+                )
+            except (KeyError, ValueError) as exc:
+                return self._json({"error": str(exc).strip("'")}, status=400)
+            return self._ndjson(events)
         if path == "/api/uploads":
             filename = unquote(self.headers.get("X-Agent-Slack-Filename", "")).strip()
             if not filename:

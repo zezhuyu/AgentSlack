@@ -16,6 +16,7 @@ EXTRA_TEXT_EXTENSIONS = {
     ".py": "text/x-python", ".ts": "text/typescript", ".tsx": "text/typescript",
     ".jsx": "text/javascript", ".swift": "text/x-swift", ".rs": "text/rust",
     ".log": "text/plain",
+    ".tex": "text/x-tex", ".latex": "text/x-tex",
 }
 
 

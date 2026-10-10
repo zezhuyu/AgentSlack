@@ -226,16 +226,65 @@ struct UploadedAttachment: Codable, Identifiable, Hashable {
     let contentType: String
     let size: Int
     let url: String?
+    let role: String?
 
     var id: String { attachmentID }
+
+    init(
+        attachmentID: String,
+        filename: String,
+        path: String,
+        contentType: String,
+        size: Int,
+        url: String?,
+        role: String? = nil
+    ) {
+        self.attachmentID = attachmentID
+        self.filename = filename
+        self.path = path
+        self.contentType = contentType
+        self.size = size
+        self.url = url
+        self.role = role
+    }
 
     enum CodingKeys: String, CodingKey {
         case attachmentID = "attachment_id"
         case filename
         case path
+        case relativePath = "relative_path"
         case contentType = "content_type"
         case size
         case url
+        case role
+    }
+
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        attachmentID = try values.decode(String.self, forKey: .attachmentID)
+        filename = try values.decode(String.self, forKey: .filename)
+        // Chat artifact attachments use relative_path, while upload responses
+        // historically used path. Accept both so one attachment cannot make
+        // the whole chat unreadable.
+        path = try values.decodeIfPresent(String.self, forKey: .path)
+            ?? values.decodeIfPresent(String.self, forKey: .relativePath)
+            ?? ""
+        contentType = try values.decodeIfPresent(String.self, forKey: .contentType)
+            ?? "application/octet-stream"
+        size = try values.decodeIfPresent(Int.self, forKey: .size) ?? 0
+        url = try values.decodeIfPresent(String.self, forKey: .url)
+        role = try values.decodeIfPresent(String.self, forKey: .role)
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var values = encoder.container(keyedBy: CodingKeys.self)
+        try values.encode(attachmentID, forKey: .attachmentID)
+        try values.encode(filename, forKey: .filename)
+        try values.encode(path, forKey: .path)
+        try values.encode(contentType, forKey: .contentType)
+        try values.encode(size, forKey: .size)
+        try values.encodeIfPresent(url, forKey: .url)
+        try values.encodeIfPresent(role, forKey: .role)
     }
 }
 
@@ -248,6 +297,104 @@ struct VoiceTurnEvent: Decodable {
     let text: String?
     let message: String?
     let url: String?
+}
+
+struct IOSChatSession: Codable, Identifiable, Hashable {
+    let id: String
+    let serverID: String
+    var title: String
+    let createdAt: String?
+    let updatedAt: String?
+    var messages: [IOSChatMessage]
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case serverID = "server_id"
+        case title
+        case createdAt = "created_at"
+        case updatedAt = "updated_at"
+        case messages
+    }
+}
+
+struct IOSChatMessage: Codable, Identifiable, Hashable {
+    let messageID: String
+    let role: String
+    let text: String
+    let modality: String?
+    let createdAt: String?
+    let sources: [[String: ChatJSONValue]]
+    let attachments: [UploadedAttachment]
+
+    var id: String { messageID }
+
+    enum CodingKeys: String, CodingKey {
+        case messageID = "message_id"
+        case role
+        case text
+        case modality
+        case createdAt = "created_at"
+        case sources
+        case attachments
+    }
+
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        messageID = try values.decode(String.self, forKey: .messageID)
+        role = try values.decodeIfPresent(String.self, forKey: .role) ?? "assistant"
+        text = try values.decodeIfPresent(String.self, forKey: .text) ?? ""
+        modality = try values.decodeIfPresent(String.self, forKey: .modality)
+        createdAt = try values.decodeIfPresent(String.self, forKey: .createdAt)
+        sources = try values.decodeIfPresent([[String: ChatJSONValue]].self, forKey: .sources) ?? []
+        attachments = try values.decodeIfPresent([UploadedAttachment].self, forKey: .attachments) ?? []
+    }
+}
+
+struct IOSChatEvent: Decodable {
+    let type: String
+    let responseID: String?
+    let text: String?
+    let message: String?
+    let sources: [[String: ChatJSONValue]]?
+
+    enum CodingKeys: String, CodingKey {
+        case type
+        case responseID = "response_id"
+        case text
+        case message
+        case sources
+    }
+}
+
+enum ChatJSONValue: Codable, Hashable {
+    case string(String)
+    case number(Double)
+    case bool(Bool)
+    case object([String: ChatJSONValue])
+    case array([ChatJSONValue])
+    case null
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.singleValueContainer()
+        if container.decodeNil() { self = .null }
+        else if let value = try? container.decode(String.self) { self = .string(value) }
+        else if let value = try? container.decode(Bool.self) { self = .bool(value) }
+        else if let value = try? container.decode(Double.self) { self = .number(value) }
+        else if let value = try? container.decode([String: ChatJSONValue].self) { self = .object(value) }
+        else { self = .array(try container.decode([ChatJSONValue].self)) }
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        switch self {
+        case let .string(value): try container.encode(value)
+        case let .number(value): try container.encode(value)
+        case let .bool(value): try container.encode(value)
+        case let .object(value): try container.encode(value)
+        case let .array(value): try container.encode(value)
+        case .null: try container.encodeNil()
+        }
+    }
 }
 
 struct ChatInteraction: Codable, Hashable, Identifiable {

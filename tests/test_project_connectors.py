@@ -92,6 +92,44 @@ def test_shared_memory_is_project_scoped_and_preserves_provenance(tmp_path: Path
     assert manager.app_for_workspace("two").get_project_memory()["decisions"] == []
 
 
+def test_mcp_memory_search_handles_legacy_missing_timestamps(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    _project(project, "AegisWealth")
+    manager = AgentServerManager(tmp_path / "app", tmp_path / "data")
+    manager.add_server(project)
+    adapter = AgentSlackMCP(manager)
+    adapter.update_project_summary("AegisWealth", "Summary", "portfolio")
+    adapter.append_project_decision("AegisWealth", "portfolio decision", source="test")
+
+    result = handle_jsonrpc(adapter, {
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": {"name": "search_memory", "arguments": {
+            "workspace_key": "AegisWealth", "query": "portfolio",
+        }},
+    })
+
+    assert "error" not in result
+    assert len(json.loads(result["result"]["content"][0]["text"])) >= 2
+
+
+def test_mcp_project_status_handles_tasks_with_missing_timestamps(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    _project(project, "AegisWealth")
+    manager = AgentServerManager(tmp_path / "app", tmp_path / "data")
+    manager.add_server(project)
+    app = manager.app_for_workspace("AegisWealth")
+    app.storage.create_task({"workspace_key": "AegisWealth", "created_at": None, "status": "queued"})
+    app.storage.create_task({"workspace_key": "AegisWealth", "created_at": "2026-09-26T00:00:00+00:00", "status": "queued"})
+
+    result = handle_jsonrpc(AgentSlackMCP(manager), {
+        "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+        "params": {"name": "get_project_status", "arguments": {"workspace_key": "AegisWealth"}},
+    })
+
+    assert "error" not in result
+    assert len(json.loads(result["result"]["content"][0]["text"])["tasks"]) == 2
+
+
 def test_shared_memory_summary_and_slack_write_use_same_store(tmp_path: Path) -> None:
     project = tmp_path / "project"
     _project(project, "one")
@@ -119,6 +157,26 @@ def test_mcp_modern_discovery_shape_is_supported(tmp_path: Path) -> None:
     assert "2026-07-28" in result["supportedVersions"]
     assert result["_meta"]["io.modelcontextprotocol/serverInfo"]["name"] == "agent-slack"
     assert result["cacheScope"] == "private"
+
+
+def test_mcp_status_omits_large_agent_prompts(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    _project(project, "one")
+    manager = AgentServerManager(tmp_path / "app", tmp_path / "data")
+    manager.add_server(project)
+    app = manager.app_for_workspace("one")
+    app.storage.save_agents([{
+        "agent_id": "coordinator",
+        "name": "coordinator",
+        "title": "Coordinator",
+        "summary": "Coordinates work.",
+        "system_prompt": "x" * 250_000,
+        "tools": ["Read"],
+    }])
+    value = AgentSlackMCP(manager).get_project_status("one")
+    encoded = json.dumps(value)
+    assert "system_prompt" not in encoded
+    assert len(encoded) < 20_000
 
 
 def test_mcp_task_artifacts_are_project_scoped_resources(tmp_path: Path) -> None:

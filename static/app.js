@@ -1,6 +1,7 @@
 const state = {
   servers: [],
   activeServerId: null,
+  generativeUiEnabled: true,
   agents: [],
   chats: [],
   currentChatId: null,
@@ -18,6 +19,7 @@ const state = {
   chatListSignature: "",
   streamingRows: new Map(),
   answeringQuestionIds: new Set(),
+  pendingUIActionKeys: new Set(),
   pendingAttachments: [],
   serverDialogMode: "create",
   peoplePickers: {
@@ -34,6 +36,7 @@ const chatSync = window.AgentSlackSync;
 const composerKeys = window.AgentSlackComposer;
 const mentionHelpers = window.AgentSlackMentions;
 const interactionHelpers = window.AgentSlackInteractions;
+const generativeUI = window.AgentSlackGenerativeUI;
 const voiceState = {
   recorder: null, stream: null, active: false, speaking: false, chunks: [],
   voiceChatId: null, sourceChatId: null, audio: null, audioContext: null,
@@ -58,10 +61,11 @@ async function api(path, options = {}) {
   return response.json();
 }
 
-async function streamApi(path, payload, onEvent) {
+async function streamApi(path, payload, onEvent, extraHeaders = {}) {
   const headers = {
     "Content-Type": "application/json",
     ...(state.activeServerId ? { "X-Agent-Slack-Server": state.activeServerId } : {}),
+    ...extraHeaders,
   };
   const response = await fetch(path, {
     method: "POST",
@@ -91,6 +95,7 @@ async function streamApi(path, payload, onEvent) {
 async function loadHealth() {
   const payload = await api("/api/health");
   $("workspaceLabel").textContent = payload.workspace || "Agent Slack";
+  state.generativeUiEnabled = payload.generative_ui !== false;
   state.orchestratorIds = payload.architecture?.orchestrator_ids || [];
 }
 
@@ -225,15 +230,28 @@ function renderNoChatState() {
 }
 
 async function openChat(chatId) {
-  const chat = await api(`/api/chats/${chatId}`);
-  state.currentChatId = chatId;
-  $("deleteChatBtn").disabled = state.runInProgress;
-  renderChat(chat);
-  await restoreActiveRun(chatId);
-  await loadChats({ openFirst: false });
-  renderChats();
-  renderAgents();
-  if (state.mobileSidebarOpen) setMobileSidebarOpen(false);
+  try {
+    const chat = await api(`/api/chats/${chatId}`);
+    state.currentChatId = chatId;
+    $("deleteChatBtn").disabled = state.runInProgress;
+    renderChat(chat);
+    // Run restoration and list refresh are secondary calls. They must not
+    // turn a successfully loaded conversation into an "unable to open" error.
+    try { await restoreActiveRun(chatId); } catch (error) { console.warn("Unable to restore active run", error); }
+    try { await loadChats({ openFirst: false }); } catch (error) { console.warn("Unable to refresh chat list", error); }
+    renderChats();
+    renderAgents();
+    if (state.mobileSidebarOpen) setMobileSidebarOpen(false);
+  } catch (error) {
+    console.warn("Unable to open chat", chatId, error);
+    state.currentChatId = null;
+    state.currentChatUpdatedAt = null;
+    $("deleteChatBtn").disabled = true;
+    $("chatTitle").textContent = "Unable to open chat";
+    $("chatMembers").textContent = "";
+    $("messages").innerHTML = `<div class="empty-server chat-open-error"><strong>Unable to open this chat</strong><p>${escapeHtml(error.message || "The chat could not be loaded.")}</p><button type="button" class="secondary-button" data-retry-chat="${escapeHtml(chatId)}">Retry</button></div>`;
+    $("messages").querySelector("[data-retry-chat]")?.addEventListener("click", () => openChat(chatId));
+  }
 }
 
 async function syncChatState() {
@@ -365,9 +383,61 @@ function renderChat(chat) {
     appendLocalFilePreviews(row.querySelector(".message-content"));
     appendMessageAttachments(row.querySelector(".message-body"), message);
     appendChoiceInteraction(row.querySelector(".message-body"), message);
+    const uiSpec = message.metadata?.agent_ui?.content?.ui;
+    if (uiSpec && state.generativeUiEnabled) generativeUI.append(row.querySelector(".message-content"), uiSpec, {
+      onAction: (action, args, nodeId, control) => requestAgentUIAction(chat.chat_id, message.message_id, action, args, nodeId, control),
+      isActionPending: (_action, nodeId) => state.pendingUIActionKeys.has(uiActionKey(chat.chat_id, message.message_id, nodeId)),
+      getActionStatus: (action, nodeId) => actionStatusForMessage(chat, message.message_id, nodeId, action?.type),
+    });
     messages.appendChild(row);
   });
   messages.scrollTop = followLatest ? messages.scrollHeight : previousScrollTop;
+}
+
+async function requestAgentUIAction(chatId, messageId, action, args, nodeId, control) {
+  const actionKey = uiActionKey(chatId, messageId, nodeId);
+  if (state.pendingUIActionKeys.has(actionKey)) return;
+  state.pendingUIActionKeys.add(actionKey);
+  const status = document.createElement("span");
+  status.className = "agent-ui-action-status";
+  status.setAttribute("role", "status");
+  status.textContent = "Submitting…";
+  control?.parentElement?.append(status);
+  const controls = control?.querySelectorAll ? [control, ...control.querySelectorAll("button, input, select")]
+    : control ? [control] : [];
+  controls.forEach((item) => { item.disabled = true; });
+  try {
+    await streamApi(`/api/chats/${encodeURIComponent(chatId)}/ui-actions`, {
+      message_id: messageId,
+      actionId: action.type,
+      node_id: nodeId,
+      args: args || {},
+      idempotency_key: globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(36).slice(2)}`,
+    }, async (event) => {
+      if (event.type === "ui.action.completed" && event.status === "error") {
+        throw new Error(event.message || "The action could not be completed");
+      }
+      await renderStreamEvent(event, chatId);
+    }, { "X-Agent-Slack-UI-Action": "1" });
+    status.textContent = "Completed";
+    state.pendingUIActionKeys.delete(actionKey);
+    if (state.currentChatId === chatId) await openChat(chatId);
+  } catch (error) {
+    state.pendingUIActionKeys.delete(actionKey);
+    status.textContent = error.message || "Action failed";
+    controls.forEach((item) => { item.disabled = false; });
+  }
+}
+
+function uiActionKey(chatId, messageId, nodeId) {
+  return `${chatId}:${messageId}:${nodeId}`;
+}
+
+function actionStatusForMessage(chat, messageId, nodeId, actionId) {
+  const records = Object.values(chat.ui_action_requests || {})
+    .filter((record) => record.message_id === messageId && record.node_id === nodeId && record.action_id === actionId)
+    .sort((left, right) => String(right.created_at || "").localeCompare(String(left.created_at || "")));
+  return records[0]?.status || null;
 }
 
 function attachmentUrl(attachment) {
@@ -389,18 +459,39 @@ function openLightbox(kind, url, label) {
 }
 
 async function appendTextPreview(container, attachment, url) {
-  if (attachment.size > 200 * 1024) return;
+  if (attachment.size > 200 * 1024) {
+    appendGenericFilePreview(container, attachment, url, "Text file is larger than the inline preview limit");
+    return;
+  }
   try {
     const response = await fetch(url);
-    if (!response.ok) return;
+    if (!response.ok) {
+      appendGenericFilePreview(container, attachment, url, "Inline preview unavailable");
+      return;
+    }
     const text = await response.text();
     const pre = document.createElement("pre");
     pre.className = "attachment-text-preview";
     pre.textContent = text.slice(0, 4000);
     container.appendChild(pre);
   } catch (_error) {
-    // No preview if the file can't be fetched; the file chip above still links to it.
+    appendGenericFilePreview(container, attachment, url, "Inline preview unavailable");
   }
+}
+
+function appendGenericFilePreview(container, attachment, url, reason = "Preview is not supported in this browser") {
+  const fallback = document.createElement("div");
+  fallback.className = "attachment-preview-fallback";
+  const label = document.createElement("span");
+  label.textContent = `${reason} — ${attachment.filename || "file"}`;
+  const link = document.createElement("a");
+  link.href = url;
+  link.target = "_blank";
+  link.rel = "noopener";
+  link.download = attachment.filename || "";
+  link.textContent = "Open / download";
+  fallback.append(label, link);
+  container.appendChild(fallback);
 }
 
 const EXTENSION_CONTENT_TYPES = {
@@ -411,6 +502,10 @@ const EXTENSION_CONTENT_TYPES = {
   txt: "text/plain", md: "text/markdown", json: "application/json", csv: "text/csv", log: "text/plain",
   yml: "text/yaml", yaml: "text/yaml", py: "text/x-python", js: "text/javascript", ts: "text/typescript",
   glb: "model/gltf-binary", gltf: "model/gltf+json", blend: "model/blender", obj: "model/obj",
+  usdz: "model/vnd.usdz+zip", stl: "model/stl", fbx: "model/vnd.autodesk.fbx",
+  zip: "application/zip", tar: "application/x-tar", gz: "application/gzip",
+  doc: "application/msword", docx: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  xls: "application/vnd.ms-excel", xlsx: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
 };
 
 function guessContentType(filename) {
@@ -529,7 +624,10 @@ function siblingObjUrl(url) {
 
 async function appendObjPreview(card, attachment, url) {
   const objUrl = attachment.content_type === "model/obj" ? url : siblingObjUrl(url);
-  if (!objUrl) return;
+  if (!objUrl) {
+    appendGenericFilePreview(card, attachment, url, "This 3D format has no browser renderer");
+    return;
+  }
   const placeholder = document.createElement("div");
   placeholder.className = "attachment-preview-model attachment-preview-model-loading";
   placeholder.textContent = "Loading 3D preview…";
@@ -695,6 +793,10 @@ function appendPreviewMedia(card, attachment, url) {
     } else {
       void appendTextPreview(card, attachment, url);
     }
+  } else {
+    // Never leave an attachment blank: proprietary, archive, document, and
+    // other binary types still get a safe project-scoped open/download path.
+    appendGenericFilePreview(card, attachment, url);
   }
 }
 
@@ -1009,6 +1111,11 @@ function createStreamingRow(taskId, agentId, agentLabel) {
     agentId,
     rawText: "",
     started: false,
+    messageId: null,
+    uiStarted: false,
+    uiSequence: 0,
+    uiSpec: null,
+    uiLoading: null,
   });
   return state.streamingRows.get(taskId);
 }
@@ -1050,7 +1157,18 @@ function applyActiveRun(run, chatId = state.currentChatId) {
     const stream = createStreamingRow(task.task_id, task.agent_id, task.agent_label || task.agent_id);
     stream.rawText = task.text || "";
     stream.started = Boolean(stream.rawText);
-    if (stream.rawText) stream.body.innerHTML = renderMarkdown(stream.rawText);
+    const uiFence = stream.rawText.search(/```agent-ui(?:\s*\n|$)/i);
+    stream.body.innerHTML = renderMarkdown(uiFence >= 0 ? stream.rawText.slice(0, uiFence) : stream.rawText);
+    if (uiFence >= 0) {
+      stream.uiStarted = true;
+      if (!stream.uiLoading) {
+        stream.uiLoading = document.createElement("div");
+        stream.uiLoading.className = "agent-ui-loading";
+        stream.uiLoading.setAttribute("role", "status");
+        stream.uiLoading.textContent = "Preparing interactive view…";
+      }
+      stream.body.append(stream.uiLoading);
+    }
   });
 }
 
@@ -1065,14 +1183,25 @@ async function renderStreamEvent(event, streamChatId = state.currentChatId) {
   // The run continues in the background when the user navigates to another
   // chat/server. Persisted state will rebuild its rows when they return.
   if (streamChatId !== state.currentChatId) return;
-  const taskId = event.task_id || event.agent_id;
+  const taskId = event.task_id || event.agent_id || event.taskId || event.agentId;
   if (event.type === "run_started") {
     state.currentRunId = event.run_id;
     $("stopRunBtn").hidden = false;
     $("stopRunBtn").disabled = false;
     $("stopRunBtn").textContent = "Stop Run";
   } else if (event.type === "agent_started") {
-    createStreamingRow(taskId, event.agent_id, event.agent_label);
+    const stream = createStreamingRow(taskId, event.agent_id, event.agent_label);
+    stream.messageId = event.message_id || null;
+  } else if (event.type === "ui.started" && state.generativeUiEnabled) {
+    const stream = state.streamingRows.get(taskId);
+    if (!stream) return;
+    stream.messageId = event.messageId || stream.messageId;
+    stream.uiStarted = true;
+    stream.uiLoading = document.createElement("div");
+    stream.uiLoading.className = "agent-ui-loading";
+    stream.uiLoading.setAttribute("role", "status");
+    stream.uiLoading.textContent = "Preparing interactive view…";
+    stream.body.append(stream.uiLoading);
   } else if (event.type === "delta") {
     const stream = state.streamingRows.get(taskId);
     if (!stream) return;
@@ -1081,13 +1210,61 @@ async function renderStreamEvent(event, streamChatId = state.currentChatId) {
     }
     const rendered = appendStreamMarkdown(stream.rawText, event.text);
     stream.rawText = rendered.text;
-    stream.body.innerHTML = rendered.html;
+    const fenceIndex = stream.rawText.search(/```agent-ui\s*\n/i);
+    stream.body.innerHTML = fenceIndex >= 0
+      ? renderMarkdown(stream.rawText.slice(0, fenceIndex))
+      : rendered.html;
+    if (stream.uiLoading) stream.body.append(stream.uiLoading);
     $("messages").scrollTop = $("messages").scrollHeight;
     await new Promise((resolve) => setTimeout(resolve, 14));
+  } else if (event.type === "ui.patch" && state.generativeUiEnabled) {
+    const stream = state.streamingRows.get(taskId);
+    if (!stream || Number(event.sequence) <= stream.uiSequence) return;
+    stream.uiSequence = Number(event.sequence) || stream.uiSequence + 1;
+    stream.messageId = event.messageId || stream.messageId;
+    stream.uiSpec = event.snapshot;
+    stream.uiLoading?.remove();
+    stream.uiLoading = null;
+    generativeUI.append(stream.body, stream.uiSpec, {
+      onAction: (action, args, nodeId, control) => requestAgentUIAction(
+        streamChatId, stream.messageId, action, args, nodeId, control,
+      ),
+      isActionPending: (_action, nodeId) => state.pendingUIActionKeys.has(
+        uiActionKey(streamChatId, stream.messageId, nodeId),
+      ),
+    });
+  } else if (event.type === "ui.completed") {
+    const stream = state.streamingRows.get(taskId);
+    if (stream && Number(event.sequence) >= stream.uiSequence) {
+      stream.uiSequence = Number(event.sequence) || stream.uiSequence;
+      stream.uiLoading?.remove();
+      stream.uiLoading = null;
+    }
+  } else if (event.type === "ui.error") {
+    const stream = state.streamingRows.get(taskId);
+    if (stream) {
+      stream.uiLoading?.remove();
+      stream.uiLoading = null;
+      const status = document.createElement("div");
+      status.className = "agent-ui-error";
+      status.setAttribute("role", "status");
+      status.textContent = event.message || "Interactive view unavailable.";
+      stream.body.append(status);
+    }
   } else if (event.type === "agent_completed") {
     const stream = state.streamingRows.get(taskId);
     if (stream) {
-      stream.body.innerHTML = renderMarkdown(event.body || stream.rawText);
+      stream.body.innerHTML = renderMarkdown(event.body !== undefined ? event.body : stream.rawText);
+      stream.uiLoading?.remove();
+      const finalUi = event.ui || stream.uiSpec;
+      if (finalUi && state.generativeUiEnabled) generativeUI.append(stream.body, finalUi, {
+        onAction: (action, args, nodeId, control) => requestAgentUIAction(
+          streamChatId, event.message_id || stream.messageId, action, args, nodeId, control,
+        ),
+        isActionPending: (_action, nodeId) => state.pendingUIActionKeys.has(
+          uiActionKey(streamChatId, event.message_id || stream.messageId, nodeId),
+        ),
+      });
       stream.row.classList.remove("streaming");
       stream.row.querySelector("time").textContent = "just now";
       stream.stopButton.remove();
@@ -1115,7 +1292,8 @@ async function renderStreamEvent(event, streamChatId = state.currentChatId) {
     }
     if (stream) {
       const stopped = event.message || "Stopped by user.";
-      const content = stream.rawText ? `${stream.rawText}\n\n_${stopped}_` : `_${stopped}_`;
+      const visibleText = visibleStreamText(stream.rawText);
+      const content = visibleText ? `${visibleText}\n\n_${stopped}_` : `_${stopped}_`;
       stream.body.innerHTML = renderMarkdown(content);
       stream.row.classList.remove("streaming");
       stream.row.classList.add("cancelled");
@@ -1132,6 +1310,11 @@ async function renderStreamEvent(event, streamChatId = state.currentChatId) {
     error.agentRunFailure = true;
     throw error;
   }
+}
+
+function visibleStreamText(text) {
+  const index = String(text || "").search(/```agent-ui\s*\n/i);
+  return (index >= 0 ? String(text).slice(0, index) : String(text || "")).trimEnd();
 }
 
 function runPayloadForMessage(currentChat, body, mentionedAgentIdsOverride = null) {

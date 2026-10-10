@@ -1,0 +1,26 @@
+{
+  "schema_version": 2,
+  "workspace_key": "seens",
+  "runner": "codex",
+  "orchestrators": [
+    {
+      "agent_id": "coordinator"
+    }
+  ],
+  "knowledge": {
+    "roots": [
+      "docs",
+      "knowledge",
+      "README.md"
+    ]
+  },
+  "connectors": {
+    "slack": {
+      "enabled": true,
+      "channel_id": "C123456"
+    },
+    "chatgpt": {
+      "enabled": true
+    }
+  }
+}

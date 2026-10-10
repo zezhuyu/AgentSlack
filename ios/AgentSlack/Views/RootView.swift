@@ -9,6 +9,7 @@ struct RootView: View {
     @State private var section: DirectorySection = .chats
     @State private var columnVisibility: NavigationSplitViewVisibility = .all
     @State private var preferredCompactColumn: NavigationSplitViewColumn = .sidebar
+    @State private var workspaceMode: WorkspaceMode = .agent
 
     var body: some View {
         Group {
@@ -61,9 +62,31 @@ struct RootView: View {
             DirectoryView(model: model, section: $section, showingNewChat: $showingNewChat)
                 .navigationSplitViewColumnWidth(min: 280, ideal: 330, max: 420)
         } detail: {
-            if model.selectedChat != nil {
+            if workspaceMode == .chat {
+                ChatModeView(model: model)
+                    .toolbar {
+                        ToolbarItem(placement: .principal) {
+                            Picker("Mode", selection: $workspaceMode) {
+                                ForEach(WorkspaceMode.allCases) { mode in
+                                    Text(mode.title).tag(mode)
+                                }
+                            }
+                            .pickerStyle(.segmented)
+                            .frame(width: 190)
+                        }
+                    }
+            } else if model.selectedChat != nil {
                 ChatView(model: model)
                     .toolbar {
+                        ToolbarItem(placement: .principal) {
+                            Picker("Mode", selection: $workspaceMode) {
+                                ForEach(WorkspaceMode.allCases) { mode in
+                                    Text(mode.title).tag(mode)
+                                }
+                            }
+                            .pickerStyle(.segmented)
+                            .frame(width: 190)
+                        }
                         if horizontalSizeClass == .regular {
                             ToolbarItem(placement: .topBarLeading) {
                                 Button {
@@ -83,6 +106,17 @@ struct RootView: View {
                     systemImage: "bubble.left.and.bubble.right",
                     description: Text("Open a chat or select a person to begin.")
                 )
+                .toolbar {
+                    ToolbarItem(placement: .principal) {
+                        Picker("Mode", selection: $workspaceMode) {
+                            ForEach(WorkspaceMode.allCases) { mode in
+                                Text(mode.title).tag(mode)
+                            }
+                        }
+                        .pickerStyle(.segmented)
+                        .frame(width: 190)
+                    }
+                }
             }
         }
         .sheet(isPresented: $showingAddServer) {
@@ -114,6 +148,173 @@ struct RootView: View {
             if chatID != nil {
                 preferredCompactColumn = .detail
             }
+        }
+    }
+}
+
+private enum WorkspaceMode: String, CaseIterable, Identifiable {
+    case agent
+    case chat
+
+    var id: String { rawValue }
+    var title: String { rawValue.capitalized }
+}
+
+struct ChatModeView: View {
+    @ObservedObject var model: AppModel
+    @State private var sessions: [IOSChatSession] = []
+    @State private var session: IOSChatSession?
+    @State private var draft = ""
+    @State private var isSending = false
+    @State private var errorMessage: String?
+    @FocusState private var focused: Bool
+
+    var body: some View {
+        VStack(spacing: 0) {
+            if sessions.count > 1 {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 8) {
+                        ForEach(sessions) { item in
+                            Button(item.title) {
+                                Task { await select(item) }
+                            }
+                            .buttonStyle(.bordered)
+                            .tint(item.id == session?.id ? SlackTheme.interactiveAccent : .secondary)
+                        }
+                        newSessionButton
+                    }
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 8)
+                }
+                Divider()
+            }
+            messages
+            Divider()
+            HStack(alignment: .bottom, spacing: 8) {
+                TextField("Ask a quick project question…", text: $draft, axis: .vertical)
+                    .lineLimit(1...6)
+                    .textFieldStyle(.roundedBorder)
+                    .focused($focused)
+                    .onSubmit { send() }
+                Button(action: send) {
+                    if isSending { ProgressView().tint(.white) }
+                    else { Image(systemName: "arrow.up") }
+                }
+                .frame(width: 42, height: 42)
+                .background(canSend ? SlackTheme.accent : Color.secondary.opacity(0.3), in: Circle())
+                .foregroundStyle(.white)
+                .disabled(!canSend)
+            }
+            .padding(12)
+            .background(SlackTheme.conversationBackground)
+        }
+        .background(SlackTheme.conversationBackground.ignoresSafeArea())
+        .navigationTitle("Chat")
+        .navigationBarTitleDisplayMode(.inline)
+        .task(id: model.selectedWorkspaceID) { await load() }
+        .alert("Chat", isPresented: Binding(get: { errorMessage != nil }, set: { if !$0 { errorMessage = nil } })) {
+            Button("OK") { errorMessage = nil }
+        } message: {
+            Text(errorMessage ?? "Unknown error")
+        }
+    }
+
+    private var newSessionButton: some View {
+        Button {
+            Task { await createSession() }
+        } label: {
+            Label("New", systemImage: "plus")
+        }
+        .buttonStyle(.bordered)
+    }
+
+    private var canSend: Bool {
+        !isSending && session != nil && !draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    private var messages: some View {
+        ScrollViewReader { proxy in
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 10) {
+                    ForEach(session?.messages ?? []) { message in
+                        HStack {
+                            if message.role == "user" { Spacer(minLength: 44) }
+                            VStack(alignment: .leading, spacing: 5) {
+                                Text(message.role == "user" ? "You" : "Chat")
+                                    .font(.caption.bold())
+                                    .foregroundStyle(SlackTheme.mutedText)
+                                MessageContentView(text: message.text)
+                                    .foregroundStyle(SlackTheme.conversationText)
+                            }
+                            .padding(11)
+                            .background(message.role == "user" ? SlackTheme.userBubble : SlackTheme.agentBubble, in: RoundedRectangle(cornerRadius: 12))
+                            if message.role != "user" { Spacer(minLength: 44) }
+                        }
+                        .id(message.id)
+                    }
+                    Color.clear.frame(height: 1).id("chat-mode-bottom")
+                }
+                .padding(14)
+            }
+            .onChange(of: session?.messages.count) { _, _ in
+                withAnimation(.easeOut(duration: 0.16)) { proxy.scrollTo("chat-mode-bottom", anchor: .bottom) }
+            }
+        }
+    }
+
+    @MainActor
+    private func load() async {
+        guard let api = model.api, let workspaceID = model.selectedWorkspaceID else { return }
+        do {
+            sessions = try await api.chatSessions(workspaceID: workspaceID)
+            if let first = sessions.first { await select(first) }
+            else { await createSession() }
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    @MainActor
+    private func select(_ item: IOSChatSession) async {
+        guard let api = model.api, let workspaceID = model.selectedWorkspaceID else { return }
+        do {
+            session = try await api.chatSession(item.id, workspaceID: workspaceID)
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    @MainActor
+    private func createSession() async {
+        guard let api = model.api, let workspaceID = model.selectedWorkspaceID else { return }
+        do {
+            let created = try await api.createChatSession(workspaceID: workspaceID)
+            sessions.insert(created, at: 0)
+            session = created
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    private func send() {
+        guard canSend, let sessionID = session?.id,
+              let workspaceID = model.selectedWorkspaceID,
+              let api = model.api else { return }
+        let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
+        draft = ""
+        isSending = true
+        Task { @MainActor in
+            do {
+                for try await event in api.streamChatModeMessage(text, sessionID: sessionID, workspaceID: workspaceID) {
+                    if event.type == "error" { throw APIError.server(status: 502, message: event.message ?? "Chat failed") }
+                }
+                session = try await api.chatSession(sessionID, workspaceID: workspaceID)
+                if let index = sessions.firstIndex(where: { $0.id == sessionID }) { sessions[index] = session! }
+            } catch {
+                errorMessage = error.localizedDescription
+            }
+            isSending = false
+            focused = true
         }
     }
 }

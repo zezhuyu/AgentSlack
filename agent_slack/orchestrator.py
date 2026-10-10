@@ -685,6 +685,7 @@ class CliOrchestrator:
             f"{skill_contract}\n"
             f"{agent_contract}\n"
             "Return the final user-facing answer as Slack-ready Markdown.\n"
+            f"{self._generative_ui_prompt_contract()}\n"
             f"{interaction_contract}"
         )
 
@@ -914,6 +915,7 @@ Reply requirements:
 - Do not restate the transcript or discuss these instructions.
 - {self._skill_prompt_contract()}
 - {agent_contract}
+- {self._generative_ui_prompt_contract()}
 
 Interactive questions:
 - {self._interaction_prompt_contract()}
@@ -936,6 +938,28 @@ Interactive questions:
             f"{rendered}\n"
             "Attachments available to you at these absolute paths:\n"
             f"{paths}"
+        )
+
+    @staticmethod
+    def _generative_ui_prompt_contract() -> str:
+        return (
+            "AgentSlack supports an optional, safe declarative interface in addition to Markdown. "
+            "Use it only when the user asks for a dashboard, structured form, task view, or interactive "
+            "summary; ordinary answers should remain plain Markdown. If useful, append exactly one "
+            "```agent-ui fenced block containing JSON shaped as "
+            '{"schemaVersion":"1","root":{"type":"Card","props":{},"children":[]}}. '
+            "Only use registered types: Stack, Row, Grid, Card, Divider, Tabs, Text, Heading, Badge, "
+            "Progress, Statistic, Table, LineChart, BarChart, PieChart, Button, TextInput, Select, "
+            "Checkbox, Slider, AgentStatus, TaskProgress, ToolResult, ApprovalCard, ArtifactPreview, "
+            "and Form. Charts may opt into gentle, built-in motion with animation='draw' on LineChart, "
+            "animation='grow' on BarChart, or animation='reveal' on PieChart; use motion when it helps "
+            "explain the data, avoid animating every element, and use animation='none' for static charts. "
+            "The renderer honors reduced-motion preferences. Keep data small (at most 100 rows/points). "
+            "Props contain data only; never include "
+            "HTML, JavaScript, URLs as executable code, tool names, filesystem paths, or credentials. "
+            "Buttons and forms can request only the fixed actions `run_analysis`, `submit_form`, "
+            "`answer_question`, `approve`, or `reject`; the server validates and authorizes every request. "
+            "An ApprovalCard is only a proposal and must never imply that the proposed operation already ran."
         )
 
     def _offline_reply(

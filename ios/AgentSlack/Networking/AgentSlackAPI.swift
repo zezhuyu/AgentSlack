@@ -143,7 +143,7 @@ struct AgentSlackAPI {
             attachment.filename.agentSlackPercentEncodedFilename,
             forHTTPHeaderField: "X-Agent-Slack-Filename"
         )
-        let (data, response) = try await session.data(for: request)
+        let (data, response) = try await requestBytes(request)
         try validate(response: response, data: data)
         do {
             return try JSONDecoder().decode(UploadedAttachment.self, from: data)
@@ -157,7 +157,7 @@ struct AgentSlackAPI {
         request.httpBody = data
         request.setValue("audio/wav", forHTTPHeaderField: "Content-Type")
         request.setValue(filename.agentSlackPercentEncodedFilename, forHTTPHeaderField: "X-Agent-Slack-Filename")
-        let (data, response) = try await session.data(for: request)
+        let (data, response) = try await requestBytes(request)
         try validate(response: response, data: data)
         let result = try JSONDecoder().decode(VoiceTranscriptionResponse.self, from: data)
         return result.text
@@ -280,6 +280,94 @@ struct AgentSlackAPI {
         )
     }
 
+    func chatSessions(workspaceID: String) async throws -> [IOSChatSession] {
+        let response: ChatSessionsResponse = try await request(
+            path: "chat/sessions", method: "GET", workspaceID: workspaceID, body: Optional<String>.none
+        )
+        return response.sessions
+    }
+
+    func createChatSession(title: String = "New chat", workspaceID: String) async throws -> IOSChatSession {
+        try await request(path: "chat/sessions", method: "POST", workspaceID: workspaceID, body: ["title": title])
+    }
+
+    func chatSession(_ sessionID: String, workspaceID: String) async throws -> IOSChatSession {
+        try await request(path: "chat/sessions/\(sessionID)", method: "GET", workspaceID: workspaceID, body: Optional<String>.none)
+    }
+
+    func streamChatModeMessage(
+        _ text: String,
+        sessionID: String,
+        workspaceID: String
+    ) -> AsyncThrowingStream<IOSChatEvent, Error> {
+        AsyncThrowingStream { continuation in
+            let producer = Task {
+                do {
+                    var request = try makeRequest(
+                        path: "chat/sessions/\(sessionID)/messages",
+                        method: "POST",
+                        workspaceID: workspaceID,
+                        timeoutInterval: Self.streamingTimeout
+                    )
+                    request.httpBody = try JSONEncoder().encode(["text": text, "modality": "text"])
+                    let (bytes, response) = try await session.bytes(for: request)
+                    try validate(response: response, data: nil)
+                    for try await line in bytes.lines where !line.isEmpty {
+                        guard let data = line.data(using: .utf8) else { continue }
+                        continuation.yield(try JSONDecoder().decode(IOSChatEvent.self, from: data))
+                    }
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+            continuation.onTermination = { @Sendable _ in producer.cancel() }
+        }
+    }
+
+    func cancelChatResponse(_ responseID: String, sessionID: String, workspaceID: String) async throws {
+        _ = try await request(
+            path: "chat/sessions/\(sessionID)/cancel",
+            method: "POST",
+            workspaceID: workspaceID,
+            body: ["response_id": responseID]
+        ) as CancellationResponse
+    }
+
+    func materializeFile(url: URL, filename: String, workspaceID: String) async throws -> URL {
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        request.timeoutInterval = Self.streamingTimeout
+        request.setValue("1", forHTTPHeaderField: "X-Agent-Slack-Api-Version")
+        request.setValue(workspaceID, forHTTPHeaderField: "X-Agent-Slack-Server")
+        let (data, response) = try await requestBytes(request)
+        try validate(response: response, data: data)
+        let safeName = filename.replacingOccurrences(of: "/", with: "_")
+        let destination = FileManager.default.temporaryDirectory
+            .appendingPathComponent("agent-slack-preview-\(UUID().uuidString)-\(safeName)")
+        try? FileManager.default.removeItem(at: destination)
+        try data.write(to: destination, options: .atomic)
+        return destination
+    }
+
+    private func requestBytes(_ request: URLRequest) async throws -> (Data, URLResponse) {
+        // Use the completion-handler API deliberately. The async URLSession
+        // bridge propagates SwiftUI row-task cancellation into the network
+        // request, which made visible previews fail with NSURLErrorCancelled.
+        try await withCheckedThrowingContinuation { continuation in
+            let task = session.dataTask(with: request) { data, response, error in
+                if let error {
+                    continuation.resume(throwing: error)
+                } else if let data, let response {
+                    continuation.resume(returning: (data, response))
+                } else {
+                    continuation.resume(throwing: APIError.invalidResponse)
+                }
+            }
+            task.resume()
+        }
+    }
+
     func imageURL(path: String?, revision: String? = nil) -> URL? {
         guard let path, !path.isEmpty else { return nil }
         let resolvedURL: URL?
@@ -371,6 +459,10 @@ struct AgentSlackAPI {
             throw APIError.server(status: http.statusCode, message: message)
         }
     }
+}
+
+struct ChatSessionsResponse: Decodable {
+    let sessions: [IOSChatSession]
 }
 
 private extension URLSession {

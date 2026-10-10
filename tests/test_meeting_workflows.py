@@ -112,7 +112,6 @@ def test_chat_can_be_deleted_through_versioned_api(tmp_path: Path, monkeypatch) 
             "/api/chats",
             {"title": "Delete Me", "member_ids": ["coordinator"], "kind": "direct"},
         )
-
         result = _request(
             base_url,
             server_id,
@@ -123,6 +122,48 @@ def test_chat_can_be_deleted_through_versioned_api(tmp_path: Path, monkeypatch) 
         assert result == {"deleted": True, "chat_id": chat["chat_id"]}
         listed = _request(base_url, server_id, "/api/v1/chats")["chats"]
         assert chat["chat_id"] not in {item["chat_id"] for item in listed}
+
+
+def test_ui_action_route_requires_same_origin_and_explicit_marker(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("AGENT_SLACK_CLI", "offline")
+    with _running_server(tmp_path) as (base_url, server_id):
+        chat = _request(
+            base_url, server_id, "/api/chats",
+            {"title": "UI actions", "member_ids": ["coordinator"], "kind": "direct"},
+        )
+        app = _Handler.manager.active_app()
+        spec = {"schemaVersion": "1", "root": {"type": "Button", "props": {
+            "label": "Refresh",
+            "action": {"type": "run_analysis", "agentIds": ["coordinator"], "objective": "Refresh"},
+        }}}
+        from agent_slack.generative_ui import bind_ui_capabilities
+        approvals = bind_ui_capabilities(spec)
+        message_id = "ui-route-test"
+        app.storage.append_message(chat["chat_id"], {
+            "message_id": message_id, "author_type": "agent", "author_id": "coordinator",
+            "body": "Dashboard", "metadata": {"agent_ui": {
+                "schemaVersion": "1", "messageId": message_id,
+                "workspaceId": app.workspace_key, "agentId": "coordinator",
+                "content": {"text": "Dashboard", "ui": spec, "approvals": approvals},
+                "status": "ready",
+            }},
+        })
+        node_id = spec["root"]["props"]["id"]
+        path = f"/api/chats/{chat['chat_id']}/ui-actions"
+        body = json.dumps({"message_id": message_id, "actionId": "run_analysis", "node_id": node_id,
+                           "args": {}, "idempotency_key": "http-action-key-01"}).encode()
+
+        def post(headers):
+            request = Request(f"{base_url}{path}", data=body, headers={
+                "Content-Type": "application/json", "X-Agent-Slack-Server": server_id, **headers,
+            }, method="POST")
+            try:
+                return urlopen(request, timeout=5).status
+            except HTTPError as error:
+                return error.code
+
+        assert post({"Origin": base_url}) == 403
+        assert post({"X-Agent-Slack-UI-Action": "1", "Origin": "http://evil.example"}) == 403
 
 
 def test_active_runs_endpoint_is_available_for_reconnecting_clients(tmp_path: Path, monkeypatch) -> None:

@@ -52,6 +52,34 @@ def test_direct_response_runs_one_connected_agent_session(tmp_path: Path, monkey
     assert app.get_chat(chat["chat_id"])["messages"][-1]["body"] == "Final host answer."
 
 
+def test_agent_ui_snapshot_is_streamed_and_restored_from_persisted_message(tmp_path: Path, monkeypatch) -> None:
+    app = _app(tmp_path, monkeypatch)
+    ui = '{"schemaVersion":"1","root":{"type":"Card","props":{},"children":[{"type":"Text","props":{"text":"Saved dashboard"}}]}}'
+
+    def stream(**_kwargs):
+        yield {"type": "agent_started", "agent_id": "coordinator"}
+        yield {"type": "delta", "agent_id": "coordinator", "text": f"Ready.\n\n```agent-ui\n{ui}\n```"}
+        yield {"type": "agent_completed", "agent_id": "coordinator"}
+
+    app.orchestrator.stream_agent_reply = stream
+    chat = app.create_chat("Coordinator", ["coordinator"], kind="direct")
+    events = list(app.stream_run(chat["chat_id"], mode="respond", objective="Build view"))
+    completed = next(event for event in events if event["type"] == "agent_completed")
+    assert completed["ui"]["root"]["children"][0]["props"]["text"] == "Saved dashboard"
+
+    from agent_slack.storage import AgentSlackStorage
+    restored = AgentSlackStorage(app.data_root).get_chat(chat["chat_id"])
+    message = restored["messages"][-1]
+    assert message["body"] == "Ready."
+    envelope = message["metadata"]["agent_ui"]
+    assert envelope["content"]["ui"] == completed["ui"]
+    assert envelope["messageId"] == message["message_id"] == completed["message_id"]
+    assert envelope["workspaceId"] == app.workspace_key
+    assert envelope["agentId"] == "coordinator"
+    assert envelope["runId"] == completed["run_id"]
+    assert envelope["taskId"] == completed["task_id"]
+
+
 def test_project_task_persists_cli_failure_as_failed_not_completed(tmp_path: Path, monkeypatch) -> None:
     app = _app(tmp_path, monkeypatch)
     task = app.storage.create_task({
@@ -172,6 +200,30 @@ def test_created_artifact_gets_extension_fallback_content_type_and_role(tmp_path
     assert manifest_artifact is not None
     assert manifest_artifact["content_type"] == "application/json"
     assert manifest_artifact["role"] == "reference"
+
+
+@pytest.mark.parametrize(
+    ("filename", "expected_type"),
+    [
+        ("notes.md", "text/markdown"),
+        ("config.yaml", "text/yaml"),
+        ("config.yml", "text/yaml"),
+        ("formula.tex", "text/x-tex"),
+        ("formula.latex", "text/x-tex"),
+    ],
+)
+def test_created_text_artifact_types_are_previewable(
+    tmp_path: Path, monkeypatch, filename: str, expected_type: str
+) -> None:
+    app = _app(tmp_path, monkeypatch)
+    artifact_path = app.project_root / filename
+    artifact_path.write_text("preview content", encoding="utf-8")
+
+    artifact = app.store_created_artifact(artifact_path)
+
+    assert artifact is not None
+    assert artifact["content_type"] == expected_type
+    assert artifact["role"] == "reference"
 
 
 def test_chat_provider_prefers_configured_external_llm_over_cli(tmp_path: Path, monkeypatch) -> None:

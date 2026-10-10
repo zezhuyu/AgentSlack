@@ -3,8 +3,11 @@ import AVFoundation
 import AVKit
 import PDFKit
 import PhotosUI
+import QuickLook
+import SceneKit
 import SwiftUI
 import UniformTypeIdentifiers
+import WebKit
 
 struct ChatView: View {
     @ObservedObject var model: AppModel
@@ -62,7 +65,11 @@ struct ChatView: View {
                                 isStopping: false,
                                 stopAction: nil,
                                 fileURL: { model.api?.fileURL(for: $0) },
-                            localFileURL: { model.api?.workspaceFileURL(forCitedPath: $0) }
+                                localFileURL: { model.api?.workspaceFileURL(forCitedPath: $0) },
+                                materializeFile: { url, filename in
+                                    guard let api = model.api, let workspaceID = model.selectedWorkspaceID else { throw APIError.invalidServerURL }
+                                    return try await api.materializeFile(url: url, filename: filename, workspaceID: workspaceID)
+                                }
                             )
                             if let interaction = choiceInteraction(for: message) {
                                 QuestionInteractionCard(
@@ -97,7 +104,11 @@ struct ChatView: View {
                                 Task { await model.stopAgent(taskID: reply.id) }
                             } : nil,
                             fileURL: { model.api?.fileURL(for: $0) },
-                            localFileURL: { model.api?.workspaceFileURL(forCitedPath: $0) }
+                            localFileURL: { model.api?.workspaceFileURL(forCitedPath: $0) },
+                            materializeFile: { url, filename in
+                                guard let api = model.api, let workspaceID = model.selectedWorkspaceID else { throw APIError.invalidServerURL }
+                                return try await api.materializeFile(url: url, filename: filename, workspaceID: workspaceID)
+                            }
                         )
                         .id("stream-\(reply.id)")
                     }
@@ -726,6 +737,16 @@ private struct MessageRow: View {
     let stopAction: (() -> Void)?
     let fileURL: (UploadedAttachment) -> URL?
     let localFileURL: (String) -> URL?
+    let materializeFile: (URL, String) async throws -> URL
+    @State private var showingSources = false
+
+    private var primaryAttachments: [UploadedAttachment] {
+        attachments.filter { $0.role != "reference" }
+    }
+
+    private var sourceAttachments: [UploadedAttachment] {
+        attachments.filter { $0.role == "reference" }
+    }
 
     private var citedFiles: [(filename: String, url: URL)] {
         let pattern = #"\[[^\]]+\]\(([^)\s]+)\)"#
@@ -782,21 +803,42 @@ private struct MessageRow: View {
                         MessageContentView(text: messageBody)
                             .foregroundStyle(SlackTheme.conversationText)
 
-                        if !attachments.isEmpty {
-                            attachmentCards
+                        if !primaryAttachments.isEmpty {
+                            attachmentCards(primaryAttachments)
                         }
-                        ForEach(citedFiles, id: \.url) { cited in
-                            AttachmentPreview(
-                                attachment: UploadedAttachment(
-                                    attachmentID: cited.url.absoluteString,
-                                    filename: cited.filename,
-                                    path: cited.filename,
-                                    contentType: contentType(forFilename: cited.filename),
-                                    size: 0,
-                                    url: nil
-                                ),
-                                url: cited.url
-                            )
+                        if !sourceAttachments.isEmpty || !citedFiles.isEmpty {
+                            Button {
+                                showingSources.toggle()
+                            } label: {
+                                Label(
+                                    showingSources ? "Hide sources" : "Show sources",
+                                    systemImage: showingSources ? "chevron.up" : "chevron.down"
+                                )
+                                .font(.caption)
+                            }
+                            .buttonStyle(.bordered)
+                            .controlSize(.small)
+                            .accessibilityLabel(showingSources ? "Hide source files" : "Show source files")
+                        }
+                        if showingSources {
+                            if !sourceAttachments.isEmpty {
+                                attachmentCards(sourceAttachments)
+                            }
+                            ForEach(citedFiles, id: \.url) { cited in
+                                AttachmentPreview(
+                                    attachment: UploadedAttachment(
+                                        attachmentID: cited.url.absoluteString,
+                                        filename: cited.filename,
+                                        path: cited.filename,
+                                        contentType: contentType(forFilename: cited.filename),
+                                        size: 0,
+                                        url: nil,
+                                        role: "reference"
+                                    ),
+                                    url: cited.url,
+                                    materializeFile: materializeFile
+                                )
+                            }
                         }
                     }
                     .padding(11)
@@ -826,15 +868,15 @@ private struct MessageRow: View {
         return date.formatted(date: .omitted, time: .shortened)
     }
 
-    private var attachmentCards: some View {
+    private func attachmentCards(_ items: [UploadedAttachment]) -> some View {
         VStack(alignment: .leading, spacing: 8) {
-            ForEach(attachments) { attachment in
+            ForEach(items) { attachment in
                 VStack(alignment: .leading, spacing: 6) {
                     if let url = fileURL(attachment) {
                         Link(destination: url) {
                             attachmentCard(attachment)
                         }
-                        AttachmentPreview(attachment: attachment, url: url)
+                        AttachmentPreview(attachment: attachment, url: url, materializeFile: materializeFile)
                     } else {
                         attachmentCard(attachment)
                     }
@@ -888,9 +930,15 @@ private func contentType(forFilename filename: String) -> String {
         "mp4": "video/mp4", "webm": "video/webm", "mov": "video/quicktime",
         "mp3": "audio/mpeg", "wav": "audio/wav", "m4a": "audio/mp4", "ogg": "audio/ogg",
         "pdf": "application/pdf",
-        "txt": "text/plain", "md": "text/markdown", "json": "application/json", "csv": "text/csv",
+        "txt": "text/plain", "md": "text/markdown", "markdown": "text/markdown",
+        "json": "application/json", "csv": "text/csv",
         "log": "text/plain", "yml": "text/yaml", "yaml": "text/yaml",
+        "tex": "text/x-tex", "latex": "text/x-tex",
         "py": "text/x-python", "js": "text/javascript", "ts": "text/typescript",
+        "obj": "model/obj", "blend": "model/blender", "glb": "model/gltf-binary",
+        "gltf": "model/gltf+json", "usdz": "model/vnd.usdz+zip", "stl": "model/stl",
+        "dae": "model/vnd.collada+xml", "ply": "model/ply", "scn": "model/x-scenekit",
+        "zip": "application/zip", "tar": "application/x-tar", "gz": "application/gzip",
     ]
     let ext = (filename as NSString).pathExtension.lowercased()
     return extensionToType[ext] ?? "application/octet-stream"
@@ -899,11 +947,22 @@ private func contentType(forFilename filename: String) -> String {
 private struct AttachmentPreview: View {
     let attachment: UploadedAttachment
     let url: URL
+    let materializeFile: (URL, String) async throws -> URL
     @State private var isPresentingFullScreen = false
+
+    private var normalizedContentType: String {
+        let stored = attachment.contentType
+        let extensionType = contentType(forFilename: attachment.filename)
+        let genericTypes = ["", "application/octet-stream", "application/x-tgif"]
+        if !genericTypes.contains(stored) {
+            return stored
+        }
+        return extensionType
+    }
 
     var body: some View {
         Group {
-            if attachment.contentType.hasPrefix("image/") {
+            if normalizedContentType.hasPrefix("image/") {
                 AsyncImage(url: url) { phase in
                     if let image = phase.image {
                         image.resizable().scaledToFit()
@@ -917,24 +976,339 @@ private struct AttachmentPreview: View {
                 .fullScreenCover(isPresented: $isPresentingFullScreen) {
                     ImageLightbox(url: url) { isPresentingFullScreen = false }
                 }
-            } else if attachment.contentType.hasPrefix("video/") || attachment.contentType.hasPrefix("audio/") {
-                VideoPlayer(player: AVPlayer(url: url))
-                    .frame(maxWidth: 320, minHeight: attachment.contentType.hasPrefix("audio/") ? 60 : 200)
+            } else if normalizedContentType.hasPrefix("audio/") {
+                AudioAttachmentPreview(
+                    url: url,
+                    filename: attachment.filename,
+                    materializeFile: materializeFile
+                )
+            } else if normalizedContentType.hasPrefix("video/") {
+                MediaAttachmentPreview(
+                    url: url,
+                    filename: attachment.filename,
+                    materializeFile: materializeFile
+                )
+            } else if normalizedContentType.hasPrefix("model/") {
+                ModelAttachmentPreview(
+                    attachment: attachment,
+                    url: url,
+                    materializeFile: materializeFile
+                )
+            } else if normalizedContentType == "application/pdf" {
+                MaterializedPDFPreview(url: url, filename: attachment.filename, materializeFile: materializeFile)
+            } else if normalizedContentType.hasPrefix("text/") || normalizedContentType == "application/json" {
+                TextFilePreview(
+                    url: url,
+                    filename: attachment.filename,
+                    maxBytes: attachment.size,
+                    materializeFile: materializeFile
+                )
+            } else {
+                UniversalFilePreview(attachment: attachment, url: url)
+            }
+        }
+    }
+}
+
+private struct MediaAttachmentPreview: View {
+    let url: URL
+    let filename: String
+    let materializeFile: (URL, String) async throws -> URL
+    @State private var localURL: URL?
+    @State private var errorMessage: String?
+    @State private var loadTask: Task<Void, Never>?
+
+    var body: some View {
+        Group {
+            if let localURL {
+                VideoPlayer(player: AVPlayer(url: localURL))
+                    .frame(maxWidth: 320, minHeight: 200)
                     .clipShape(RoundedRectangle(cornerRadius: 10))
-            } else if attachment.contentType == "application/pdf" {
-                PDFKitView(url: url)
-                    .frame(maxWidth: 320, minHeight: 240)
+            } else if let errorMessage {
+                Text("Unable to preview \(filename): \(errorMessage)")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .padding(10)
+            } else {
+                HStack(spacing: 8) {
+                    ProgressView().controlSize(.small)
+                    Text("Loading video preview…")
+                        .font(.caption)
+                }
+                .padding(10)
+            }
+        }
+        .onAppear {
+            guard loadTask == nil, localURL == nil else { return }
+            loadTask = Task { @MainActor in
+                await loadWithRetry()
+            }
+        }
+    }
+
+    @MainActor
+    private func loadWithRetry() async {
+        for attempt in 0..<3 {
+            do {
+                localURL = try await materializeFile(url, filename)
+                errorMessage = nil
+                return
+            } catch is CancellationError {
+                // A lazy list can cancel a transient child task while rows are
+                // being reconciled. Retry instead of exposing that lifecycle
+                // detail as a file error.
+            } catch {
+                errorMessage = error.localizedDescription
+                if attempt < 2 { try? await Task.sleep(for: .milliseconds(250)) }
+            }
+        }
+        loadTask = nil
+    }
+}
+
+private struct AudioAttachmentPreview: View {
+    let url: URL
+    let filename: String
+    let materializeFile: (URL, String) async throws -> URL
+    @State private var player: AVAudioPlayer?
+    @State private var localURL: URL?
+    @State private var isPlaying = false
+    @State private var errorMessage: String?
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Button {
+                guard let player else { return }
+                if player.isPlaying {
+                    player.pause()
+                    isPlaying = false
+                } else {
+                    let session = AVAudioSession.sharedInstance()
+                    try? session.setCategory(.playback, mode: .default, options: [.mixWithOthers])
+                    try? session.setActive(true)
+                    player.play()
+                    isPlaying = true
+                }
+            } label: {
+                Image(systemName: isPlaying ? "pause.fill" : "play.fill")
+                    .frame(width: 34, height: 34)
+                    .background(SlackTheme.interactiveAccent, in: Circle())
+                    .foregroundStyle(.white)
+            }
+            .disabled(player == nil)
+            VStack(alignment: .leading, spacing: 3) {
+                Text(filename)
+                    .font(.caption.weight(.semibold))
+                    .lineLimit(1)
+                if let errorMessage {
+                    Text("Unable to preview: \(errorMessage)")
+                        .font(.caption2)
+                        .foregroundStyle(.red)
+                } else if player == nil {
+                    Text("Loading audio preview…")
+                        .font(.caption2)
+                        .foregroundStyle(SlackTheme.mutedText)
+                } else {
+                    Text("Tap to play")
+                        .font(.caption2)
+                        .foregroundStyle(SlackTheme.mutedText)
+                }
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(10)
+        .background(SlackTheme.composerField, in: RoundedRectangle(cornerRadius: 10))
+        .overlay { RoundedRectangle(cornerRadius: 10).stroke(SlackTheme.divider) }
+        .task(id: url) {
+            do {
+                let session = AVAudioSession.sharedInstance()
+                try session.setCategory(.playback, mode: .default, options: [.mixWithOthers])
+                try session.setActive(true, options: .notifyOthersOnDeactivation)
+                let local = try await materializeFile(url, filename)
+                localURL = local
+                let audioPlayer = try AVAudioPlayer(contentsOf: local)
+                audioPlayer.prepareToPlay()
+                player = audioPlayer
+            } catch {
+                errorMessage = error.localizedDescription
+            }
+        }
+    }
+}
+
+private struct ModelAttachmentPreview: View {
+    let attachment: UploadedAttachment
+    let url: URL
+    let materializeFile: (URL, String) async throws -> URL
+    @State private var localURL: URL?
+    @State private var errorMessage: String?
+    @State private var loadTask: Task<Void, Never>?
+
+    private var usesWebRenderer: Bool {
+        ["glb", "gltf"].contains((attachment.filename as NSString).pathExtension.lowercased())
+    }
+
+    var body: some View {
+        Group {
+            if usesWebRenderer {
+                if let localURL {
+                    ModelWebPreview(url: localURL, filename: attachment.filename)
+                        .frame(maxWidth: 360, minHeight: 300)
+                        .clipShape(RoundedRectangle(cornerRadius: 10))
+                        .overlay { RoundedRectangle(cornerRadius: 10).stroke(SlackTheme.divider) }
+                } else if let errorMessage {
+                    Text("Unable to load 3D model: \(errorMessage)")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                } else {
+                    HStack(spacing: 8) {
+                        ProgressView().controlSize(.small)
+                        Text("Loading 3D preview…").font(.caption)
+                    }
+                    .padding(10)
+                }
+            } else if let localURL {
+                ModelSceneView(url: localURL)
+                    .frame(maxWidth: 320, minHeight: 300)
                     .clipShape(RoundedRectangle(cornerRadius: 10))
                     .overlay {
                         RoundedRectangle(cornerRadius: 10).stroke(SlackTheme.divider)
                     }
-            } else if attachment.contentType.hasPrefix("text/") || attachment.contentType == "application/json" {
-                TextFilePreview(url: url, maxBytes: attachment.size)
+            } else if let errorMessage {
+                UniversalFilePreview(
+                    attachment: UploadedAttachment(
+                        attachmentID: url.absoluteString,
+                        filename: attachment.filename,
+                        path: "",
+                        contentType: attachment.contentType,
+                        size: 0,
+                        url: nil
+                    ),
+                    url: url
+                )
+                Text(errorMessage)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
             } else {
-                EmptyView()
+                HStack(spacing: 8) {
+                    ProgressView().controlSize(.small)
+                    Text("Loading 3D preview…").font(.caption)
+                }
+                .padding(10)
+            }
+        }
+        .onAppear {
+            guard loadTask == nil, localURL == nil else { return }
+            loadTask = Task { @MainActor in
+                await loadWithRetry()
             }
         }
     }
+
+    @MainActor
+    private func loadWithRetry() async {
+        for attempt in 0..<3 {
+            do {
+                localURL = try await materializeFile(url, attachment.filename)
+                errorMessage = nil
+                return
+            } catch is CancellationError {
+                // Retry row-lifecycle cancellation; it is not a corrupt model.
+            } catch {
+                errorMessage = error.localizedDescription
+                if attempt < 2 { try? await Task.sleep(for: .milliseconds(250)) }
+            }
+        }
+        loadTask = nil
+    }
+}
+
+private struct ModelSceneView: UIViewRepresentable {
+    let url: URL
+
+    func makeUIView(context: Context) -> SCNView {
+        let view = SCNView()
+        view.backgroundColor = UIColor.black
+        view.allowsCameraControl = true
+        view.autoenablesDefaultLighting = true
+        view.antialiasingMode = .multisampling4X
+        if let scene = makeScene() {
+            view.scene = scene
+        } else {
+            let label = UILabel()
+            label.text = "Unable to load 3D model"
+            label.textColor = .white
+            label.textAlignment = .center
+            label.frame = view.bounds
+            label.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+            view.addSubview(label)
+        }
+        return view
+    }
+
+    func updateUIView(_ view: SCNView, context: Context) {
+        if view.scene == nil { view.scene = makeScene() }
+    }
+
+    private func makeScene() -> SCNScene? {
+        guard let scene = try? SCNScene(url: url, options: [.createNormalsIfAbsent: true]) else { return nil }
+        let contentNode = SCNNode()
+        for child in scene.rootNode.childNodes {
+            child.removeFromParentNode()
+            contentNode.addChildNode(child)
+        }
+        let (minimum, maximum) = contentNode.boundingBox
+        let center = SCNVector3(
+            (minimum.x + maximum.x) / 2,
+            (minimum.y + maximum.y) / 2,
+            (minimum.z + maximum.z) / 2
+        )
+        let size = max(maximum.x - minimum.x, maximum.y - minimum.y, maximum.z - minimum.z)
+        guard size.isFinite, size > 0 else { return nil }
+        let scale = 1.5 / size
+        contentNode.scale = SCNVector3(scale, scale, scale)
+        contentNode.position = SCNVector3(-center.x * scale, -center.y * scale, -center.z * scale)
+        scene.rootNode.addChildNode(contentNode)
+        let cameraNode = SCNNode()
+        let camera = SCNCamera()
+        cameraNode.camera = camera
+        camera.fieldOfView = 45
+        cameraNode.position = SCNVector3(0, 0, 2.8)
+        scene.rootNode.addChildNode(cameraNode)
+        return scene
+    }
+}
+
+private struct ModelWebPreview: UIViewRepresentable {
+    let url: URL
+    let filename: String
+
+    func makeUIView(context: Context) -> WKWebView {
+        let view = WKWebView(frame: .zero)
+        view.isOpaque = false
+        view.backgroundColor = .clear
+        view.scrollView.isScrollEnabled = false
+        let modelSource: String
+        if (filename as NSString).pathExtension.lowercased() == "glb",
+           let data = try? Data(contentsOf: url, options: [.mappedIfSafe]) {
+            modelSource = "data:model/gltf-binary;base64,\(data.base64EncodedString())"
+        } else {
+            modelSource = url.absoluteString
+        }
+        let modelURL = modelSource
+            .replacingOccurrences(of: "&", with: "&amp;")
+            .replacingOccurrences(of: "\"", with: "&quot;")
+        let html = """
+        <!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
+        <script type="module" src="https://unpkg.com/@google/model-viewer/dist/model-viewer.min.js"></script>
+        <style>html,body{margin:0;width:100%;height:100%;background:transparent}model-viewer{width:100%;height:300px;background:transparent}</style>
+        </head><body><model-viewer src="\(modelURL)" camera-controls auto-rotate shadow-intensity="1"></model-viewer></body></html>
+        """
+        view.loadHTMLString(html, baseURL: url)
+        return view
+    }
+
+    func updateUIView(_ view: WKWebView, context: Context) {}
 }
 
 private struct PDFKitView: UIViewRepresentable {
@@ -948,6 +1322,33 @@ private struct PDFKitView: UIViewRepresentable {
     }
 
     func updateUIView(_ uiView: PDFView, context: Context) {}
+}
+
+private struct MaterializedPDFPreview: View {
+    let url: URL
+    let filename: String
+    let materializeFile: (URL, String) async throws -> URL
+    @State private var localURL: URL?
+    @State private var errorMessage: String?
+
+    var body: some View {
+        Group {
+            if let localURL {
+                PDFKitView(url: localURL)
+                    .frame(maxWidth: 320, minHeight: 240)
+                    .clipShape(RoundedRectangle(cornerRadius: 10))
+                    .overlay { RoundedRectangle(cornerRadius: 10).stroke(SlackTheme.divider) }
+            } else if let errorMessage {
+                Text("Unable to preview PDF: \(errorMessage)").font(.caption).foregroundStyle(.secondary)
+            } else {
+                ProgressView("Loading PDF preview…").font(.caption)
+            }
+        }
+        .task(id: url) {
+            do { localURL = try await materializeFile(url, filename) }
+            catch { errorMessage = error.localizedDescription }
+        }
+    }
 }
 
 private struct ImageLightbox: View {
@@ -971,27 +1372,145 @@ private struct ImageLightbox: View {
 
 private struct TextFilePreview: View {
     let url: URL
+    let filename: String
     let maxBytes: Int
+    let materializeFile: (URL, String) async throws -> URL
     @State private var content: String?
+    @State private var errorMessage: String?
 
     var body: some View {
-        Group {
+        VStack(alignment: .leading, spacing: 0) {
             if let content {
-                Text(content)
+                ScrollView([.horizontal, .vertical]) {
+                    Text(content)
                     .font(.caption.monospaced())
                     .frame(maxWidth: 320, alignment: .leading)
                     .padding(8)
-                    .background(SlackTheme.composerField, in: RoundedRectangle(cornerRadius: 8))
-                    .frame(maxHeight: 200)
+                }
+                .background(SlackTheme.composerField, in: RoundedRectangle(cornerRadius: 8))
+                .frame(maxWidth: 320, maxHeight: 240)
+            } else if let errorMessage {
+                Text("Unable to preview text: \(errorMessage)").font(.caption).foregroundStyle(.secondary)
             } else {
-                EmptyView()
+                UniversalFilePreview(
+                    attachment: UploadedAttachment(
+                        attachmentID: "preview",
+                        filename: "text file",
+                        path: "",
+                        contentType: "text/plain",
+                        size: maxBytes,
+                        url: nil
+                    ),
+                    url: url
+                )
             }
         }
         .task {
             guard maxBytes <= 200 * 1024 else { return }
-            guard let (data, _) = try? await URLSession.shared.data(from: url) else { return }
-            content = String(decoding: data.prefix(4000), as: UTF8.self)
+            do {
+                let localURL = try await materializeFile(url, filename)
+                let data = try Data(contentsOf: localURL, options: [.mappedIfSafe])
+                content = String(decoding: data.prefix(20_000), as: UTF8.self)
+            } catch {
+                errorMessage = error.localizedDescription
+            }
         }
+    }
+}
+
+private struct UniversalFilePreview: View {
+    let attachment: UploadedAttachment
+    let url: URL
+    @State private var localURL: URL?
+    @State private var isPresented = false
+    @State private var isLoading = false
+    @State private var errorMessage: String?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Image(systemName: "doc")
+                Text(attachment.filename)
+                    .font(.caption)
+                    .lineLimit(1)
+                Spacer()
+                Button(isLoading ? "Loading…" : "Preview") {
+                    preparePreview()
+                }
+                .buttonStyle(.bordered)
+                .disabled(isLoading)
+            }
+            if let errorMessage {
+                Text(errorMessage)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .padding(10)
+        .background(SlackTheme.composerField, in: RoundedRectangle(cornerRadius: 8))
+        .sheet(isPresented: $isPresented) {
+            if let localURL {
+                QuickLookPreview(url: localURL)
+            }
+        }
+    }
+
+    private func preparePreview() {
+        guard !isLoading else { return }
+        isLoading = true
+        errorMessage = nil
+        Task {
+            do {
+                let (downloadedURL, _) = try await URLSession.shared.download(from: url)
+                let safeName = attachment.filename.replacingOccurrences(of: "/", with: "_")
+                let destination = FileManager.default.temporaryDirectory
+                    .appendingPathComponent("agent-slack-\(UUID().uuidString)-\(safeName)")
+                try? FileManager.default.removeItem(at: destination)
+                try FileManager.default.moveItem(at: downloadedURL, to: destination)
+                localURL = destination
+                isPresented = true
+            } catch {
+                errorMessage = "Unable to download this file: \(error.localizedDescription)"
+            }
+            isLoading = false
+        }
+    }
+}
+
+private struct QuickLookPreview: UIViewControllerRepresentable {
+    let url: URL
+
+    func makeCoordinator() -> Coordinator { Coordinator(url: url) }
+
+    func makeUIViewController(context: Context) -> QLPreviewController {
+        let controller = QLPreviewController()
+        controller.dataSource = context.coordinator
+        return controller
+    }
+
+    func updateUIViewController(_ controller: QLPreviewController, context: Context) {}
+
+    final class Coordinator: NSObject, QLPreviewControllerDataSource {
+        let item: PreviewItem
+
+        init(url: URL) { item = PreviewItem(url: url) }
+
+        func numberOfPreviewItems(in controller: QLPreviewController) -> Int { 1 }
+
+        func previewController(
+            _ controller: QLPreviewController,
+            previewItemAt index: Int
+        ) -> QLPreviewItem { item }
+    }
+}
+
+private final class PreviewItem: NSObject, QLPreviewItem {
+    let previewItemURL: URL?
+    let previewItemTitle: String?
+
+    init(url: URL) {
+        previewItemURL = url
+        previewItemTitle = url.lastPathComponent
     }
 }
 

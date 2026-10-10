@@ -17,6 +17,7 @@ class ProjectSharedMemory:
     """Resolve a workspace through the manager before touching its storage."""
 
     MAX_SUMMARY_CHARS = 32_000
+    MAX_SEARCH_CONTENT_CHARS = 800
 
     def __init__(self, manager: "AgentServerManager"):
         self.manager = manager
@@ -166,14 +167,14 @@ class ProjectSharedMemory:
                     continue
                 self._add_match(results, source, item.get("content", ""), f"shared_memory/{key}.json", terms,
                                  extra={key[:-1]: item})
-        return sorted(results, key=lambda item: (-item["score"], item.get("updated_at", "")))[:max(1, limit)]
+        return sorted(results, key=lambda item: (-item["score"], str(item.get("updated_at") or "")))[:max(1, limit)]
 
     @staticmethod
     def _add_match(results: list[dict[str, Any]], source: str, content: str, path: str,
                    terms: list[str], extra: dict[str, Any] | None = None) -> None:
         score = sum(str(content).casefold().count(term) for term in terms)
         if score:
-            item = {"source": source, "content": str(content)[:3000], "path": path,
+            item = {"source": source, "content": str(content)[:ProjectSharedMemory.MAX_SEARCH_CONTENT_CHARS], "path": path,
                     "score": round(min(1.0, score / max(1, len(terms) * 5)), 2),
                     "updated_at": (extra or {}).get("decision", extra or {}).get("updated_at")}
             if extra:

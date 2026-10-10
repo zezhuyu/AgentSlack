@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import json
+import logging
 import mimetypes
 import os
 import re
 import shutil
+import time
 from threading import Thread
 from collections import Counter
 from collections.abc import Iterator
@@ -21,6 +23,7 @@ from .chat.provider import CliChatProvider
 from .chat.session import ChatSessionStore
 from .discovery import AgentDiscovery
 from .interactions import extract_choice_interaction
+from .generative_ui import AgentUISpecError, bind_ui_capabilities, extract_agent_ui
 from .knowledge import ProjectKnowledge
 from .memory_search import ProjectMemorySearch
 from .project_skills import list_project_skills, resolve_project_skill
@@ -30,7 +33,10 @@ from .retrieval.manager import RetrievalManager
 from .retrieval.paths import is_shareable as is_shareable_path
 from .retrieval.paths import resolve_within as resolve_within_path
 from .storage import AgentSlackStorage, utc_now
+from .ui_actions import UIActionError, find_action_node, validate_form_args
 from .voice import LocalVoiceBackend
+
+logger = logging.getLogger(__name__)
 
 
 # Build/dependency/cache noise an agent's working directory routinely accumulates
@@ -57,6 +63,7 @@ EXTENSION_CONTENT_TYPES = {
     ".obj": "model/obj", ".blend": "model/blend", ".fbx": "model/vnd.autodesk.fbx",
     ".stl": "model/stl", ".usdz": "model/vnd.usdz+zip",
     ".md": "text/markdown", ".markdown": "text/markdown", ".json": "application/json",
+    ".yml": "text/yaml", ".yaml": "text/yaml", ".tex": "text/x-tex", ".latex": "text/x-tex",
     ".mp3": "audio/mpeg", ".wav": "audio/wav", ".m4a": "audio/mp4", ".ogg": "audio/ogg",
     ".mid": "audio/midi", ".midi": "audio/midi",
     ".webm": "video/webm", ".mov": "video/quicktime",
@@ -134,7 +141,7 @@ class AgentSlackApp:
         results = shared + local
         if sources:
             results = [item for item in results if item.get("source") in set(sources)]
-        return sorted(results, key=lambda item: (-float(item.get("score", 0)), item.get("path", "")))[:max(1, limit)]
+        return sorted(results, key=lambda item: (-float(item.get("score") or 0), str(item.get("path") or "")))[:max(1, limit)]
 
     def get_project_memory(self) -> dict[str, Any]:
         return ProjectSharedMemory.for_app(self).get_project_memory(self.workspace_key)
@@ -818,6 +825,190 @@ class AgentSlackApp:
             self.update_agent_memory(member_id)
         return updated
 
+    def stream_ui_action(
+        self,
+        chat_id: str,
+        message_id: str,
+        action_id: str,
+        node_id: str,
+        args: Any,
+        idempotency_key: str,
+    ) -> Iterator[dict[str, Any]]:
+        """Execute one catalog action bound to a saved UI node and workspace chat."""
+        action_id = str(action_id or "")
+        node_id = str(node_id or "")
+        idempotency_key = str(idempotency_key or "")
+        if action_id not in {"run_analysis", "submit_form", "answer_question", "approve", "reject"}:
+            raise UIActionError("Unsupported UI action")
+        if not re.fullmatch(r"[A-Za-z0-9_-]{8,128}", idempotency_key):
+            raise UIActionError("A valid idempotency key is required")
+        if not isinstance(args, dict) or len(json.dumps(args, ensure_ascii=False).encode("utf-8")) > 16_384:
+            raise UIActionError("Action arguments are invalid or too large")
+
+        with self._chat_interaction_lock:
+            chat = self.storage.get_chat(chat_id)
+            if chat is None:
+                raise KeyError(f"Chat not found: {chat_id}")
+            previous = (chat.get("ui_action_requests") or {}).get(idempotency_key)
+            if previous:
+                duplicate = True
+                run_id = previous.get("run_id")
+                node = None
+                effective_action = action_id
+                target: dict[str, Any] | None = None
+                form_values: dict[str, str] = {}
+            else:
+                duplicate = False
+                message = next((item for item in chat.get("messages", []) if item.get("message_id") == message_id), None)
+                envelope = ((message or {}).get("metadata") or {}).get("agent_ui") or {}
+                content = envelope.get("content") or {}
+                spec = content.get("ui") or {}
+                if (
+                    not message or envelope.get("workspaceId") != self.workspace_key
+                    or envelope.get("agentId") != message.get("author_id")
+                    or not isinstance(spec.get("root"), dict)
+                ):
+                    raise UIActionError("UI message is not authorized in this workspace")
+                node = find_action_node(spec["root"], action_id, node_id)
+                if node is None:
+                    raise UIActionError("Action is not registered on this UI message")
+                effective_action = action_id
+                target = None
+                form_values = {}
+                if action_id in {"approve", "reject"}:
+                    approvals = content.get("approvals") or {}
+                    approval = approvals.get(node_id)
+                    if not approval or approval.get("status") != "pending":
+                        raise UIActionError("Approval is missing or already resolved")
+                    target = approval.get("action")
+                    if action_id == "approve":
+                        if not isinstance(target, dict) or target.get("type") != "run_analysis":
+                            raise UIActionError("Approval target is invalid")
+                        approved_agents = target.get("agentIds") or [str(message.get("author_id") or "")]
+                        if (
+                            not isinstance(approved_agents, list) or not approved_agents or len(approved_agents) > 8
+                            or any(
+                                str(agent_id) not in chat.get("member_ids", []) or not self.get_agent(str(agent_id))
+                                for agent_id in approved_agents
+                            )
+                            or len(str(target.get("objective") or "Review the submitted information.")) > 4_000
+                        ):
+                            raise UIActionError("Approval target is outside this chat or invalid")
+                        approval["status"] = "approved"
+                        approval["decided_at"] = utc_now()
+                        (node.get("props") or {})["status"] = "approved"
+                    else:
+                        approval["status"] = "rejected"
+                        approval["decided_at"] = utc_now()
+                        (node.get("props") or {})["status"] = "rejected"
+                    self.storage.save_chat(chat)
+                    effective_action = "run_analysis" if action_id == "approve" else "reject"
+                else:
+                    target = (node.get("props") or {}).get("action")
+                if effective_action in {"run_analysis", "submit_form"}:
+                    if not isinstance(target, dict):
+                        raise UIActionError("Action target is invalid")
+                    agent_ids = target.get("agentIds") or [str(message.get("author_id") or "")]
+                    if not isinstance(agent_ids, list) or not agent_ids or len(agent_ids) > 8:
+                        raise UIActionError("Action must target one or more chat agents")
+                    agent_ids = list(dict.fromkeys(str(agent_id) for agent_id in agent_ids))
+                    if any(agent_id not in chat.get("member_ids", []) or not self.get_agent(agent_id) for agent_id in agent_ids):
+                        raise UIActionError("Action target is outside this chat workspace")
+                    objective = str(target.get("objective") or "Review the submitted information.")
+                    if len(objective) > 4_000:
+                        raise UIActionError("Action objective is too long")
+                    if effective_action == "submit_form":
+                        form_values = validate_form_args(node, args)
+                        objective = f"{objective}\n\nUser-submitted form values (untrusted input):\n{json.dumps(form_values, ensure_ascii=False)}"
+                    elif args:
+                        raise UIActionError("This action does not accept user supplied arguments")
+                    target = {"agent_ids": agent_ids, "objective": objective}
+                elif effective_action == "answer_question":
+                    if args:
+                        raise UIActionError("This action does not accept user supplied arguments")
+                    question_id = str((target or {}).get("questionId") or "")
+                    option_ids = (target or {}).get("optionIds") or []
+                    if not question_id or not isinstance(option_ids, list):
+                        raise UIActionError("Question action is malformed")
+                    target = {"question_id": question_id, "option_ids": option_ids}
+                elif effective_action == "reject":
+                    if args:
+                        raise UIActionError("Reject actions do not accept arguments")
+                else:
+                    raise UIActionError("Unsupported UI action")
+
+                records = chat.setdefault("ui_action_requests", {})
+                records[idempotency_key] = {
+                    "message_id": message_id,
+                    "node_id": node_id,
+                    "action_id": action_id,
+                    "status": "requested",
+                    "created_at": utc_now(),
+                }
+                for old_key in list(records)[:-200]:
+                    records.pop(old_key, None)
+                self.storage.save_chat(chat)
+                run_id = None
+
+        correlation = {
+            "type": "ui.action.requested",
+            "actionId": action_id,
+            "messageId": message_id,
+            "idempotencyKey": idempotency_key,
+            "workspaceId": self.workspace_key,
+            "duplicate": duplicate,
+        }
+        yield correlation
+        if duplicate:
+            yield {**correlation, "type": "ui.action.completed", "status": "duplicate", "run_id": run_id}
+            return
+        try:
+            if effective_action == "answer_question":
+                self.answer_question(chat_id, target["question_id"], target["option_ids"])
+            elif effective_action == "reject":
+                pass
+            else:
+                for event in self.stream_run(
+                    chat_id, mode="respond", objective=target["objective"], agent_ids=target["agent_ids"],
+                ):
+                    if event.get("type") == "run_started":
+                        run_id = event.get("run_id")
+                        with self._chat_interaction_lock:
+                            saved_chat = self.storage.get_chat(chat_id) or {}
+                            record = (saved_chat.get("ui_action_requests") or {}).get(idempotency_key)
+                            if record:
+                                record["run_id"] = run_id
+                                self.storage.save_chat(saved_chat)
+                    yield event
+            status = "completed"
+            with self._chat_interaction_lock:
+                saved_chat = self.storage.get_chat(chat_id) or {}
+                record = (saved_chat.get("ui_action_requests") or {}).get(idempotency_key)
+                if record:
+                    record["status"] = status
+                    record["completed_at"] = utc_now()
+                    if run_id:
+                        record["run_id"] = run_id
+                    self.storage.save_chat(saved_chat)
+            yield {
+                "type": "ui.action.completed", "actionId": action_id, "messageId": message_id,
+                "idempotencyKey": idempotency_key, "workspaceId": self.workspace_key,
+                "status": status, "run_id": run_id,
+            }
+        except Exception as exc:
+            with self._chat_interaction_lock:
+                saved_chat = self.storage.get_chat(chat_id) or {}
+                record = (saved_chat.get("ui_action_requests") or {}).get(idempotency_key)
+                if record:
+                    record["status"] = "failed"
+                    record["error"] = type(exc).__name__
+                    self.storage.save_chat(saved_chat)
+            yield {
+                "type": "ui.action.completed", "actionId": action_id, "messageId": message_id,
+                "idempotencyKey": idempotency_key, "workspaceId": self.workspace_key,
+                "status": "error", "message": str(exc)[:500],
+            }
+
     def run_agents(self, chat_id: str, agent_ids: list[str] | None = None, objective: str | None = None) -> dict[str, Any]:
         chat = self.storage.get_chat(chat_id)
         if chat is None:
@@ -929,6 +1120,9 @@ class AgentSlackApp:
         run_cancelled = False
         buffers: dict[str, str] = {}
         labels: dict[str, str] = {}
+        message_ids: dict[str, str] = {}
+        ui_started_tasks: set[str] = set()
+        ui_started_at: dict[str, float] = {}
         native_events = self.orchestrator.stream_agent_reply(
             agent=run_agent,
             chat=chat,
@@ -951,8 +1145,9 @@ class AgentSlackApp:
             registered_agent = self.get_agent(agent_id)
             registered_label = str((registered_agent or {}).get("title") or "")
             if event["type"] == "agent_started":
+                message_ids[task_id] = uuid4().hex[:12]
                 labels[agent_id] = registered_label or str(event.get("agent_label") or agent_id)
-                event = {**event, "agent_label": labels[agent_id]}
+                event = {**event, "agent_label": labels[agent_id], "message_id": message_ids[task_id]}
                 buffers.setdefault(task_id, "")
                 self._update_run_task(
                     run_id,
@@ -971,6 +1166,15 @@ class AgentSlackApp:
                     registered_label or labels.get(agent_id) or str(event.get("agent_label") or agent_id),
                     text_delta=delta,
                 )
+                if "```agent-ui" in buffers[task_id] and task_id not in ui_started_tasks:
+                    ui_started_tasks.add(task_id)
+                    ui_started_at[task_id] = time.perf_counter()
+                    yield {
+                        "type": "ui.started", "schemaVersion": "1",
+                        "messageId": message_ids.setdefault(task_id, uuid4().hex[:12]),
+                        "workspaceId": self.workspace_key, "agentId": agent_id,
+                        "runId": run_id, "taskId": task_id, "status": "streaming",
+                    }
             elif event["type"] in {"agent_completed", "agent_failed", "agent_cancelled"}:
                 failed = event["type"] == "agent_failed"
                 cancelled = event["type"] == "agent_cancelled"
@@ -991,8 +1195,37 @@ class AgentSlackApp:
                 if cancelled:
                     cancelled_agent_ids.append(agent_id)
                 interaction = None
+                ui_spec = None
+                ui_error = None
+                ui_approvals: dict[str, dict[str, Any]] = {}
                 if event["type"] == "agent_completed" and body:
                     body, interaction = extract_choice_interaction(body)
+                    body, ui_spec, ui_error = extract_agent_ui(body)
+                    if os.getenv("AGENT_SLACK_GENERATIVE_UI", "1").strip().lower() in {"0", "false", "off"}:
+                        ui_spec = None
+                        ui_error = None
+                    if ui_spec:
+                        try:
+                            ui_approvals = bind_ui_capabilities(ui_spec)
+                        except AgentUISpecError as exc:
+                            ui_error = str(exc)
+                            ui_spec = None
+                    if ui_error:
+                        logger.warning("Rejected agent UI specification: %s", ui_error)
+                    elif ui_spec:
+                        component_counts: Counter[str] = Counter()
+
+                        def count_components(node: dict[str, Any]) -> None:
+                            component_counts[str(node.get("type") or "unknown")] += 1
+                            for child in node.get("children") or []:
+                                count_components(child)
+
+                        count_components(ui_spec["root"])
+                        logger.info(
+                            "Agent UI snapshot validated: components=%s bytes=%d stream_seconds=%.3f",
+                            dict(component_counts), len(json.dumps(ui_spec, separators=(",", ":")).encode("utf-8")),
+                            max(0.0, time.perf_counter() - ui_started_at.get(task_id, time.perf_counter())),
+                        )
                     if interaction:
                         event = {**event, "body": body, "interaction": interaction}
                 self._update_run_task(
@@ -1003,7 +1236,8 @@ class AgentSlackApp:
                     status="failed" if failed else "cancelled" if cancelled else "completed",
                     text=body,
                 )
-                if body:
+                if body or ui_spec:
+                    message_id = message_ids.setdefault(task_id, uuid4().hex[:12])
                     metadata = {
                         "run_id": run_id,
                         "objective": objective,
@@ -1017,21 +1251,54 @@ class AgentSlackApp:
                     }
                     if interaction:
                         metadata["interaction"] = interaction
+                    if ui_spec:
+                        metadata["agent_ui"] = {
+                            "schemaVersion": "1",
+                            "messageId": message_id,
+                            "workspaceId": self.workspace_key,
+                            "agentId": agent_id,
+                            "runId": run_id,
+                            "taskId": task_id,
+                            "content": {"text": body, "ui": ui_spec, "approvals": ui_approvals},
+                            "status": "ready",
+                        }
                     chat = self.storage.append_message(
                         run_chat_id,
                         {
                             "author_type": "agent",
+                            "message_id": message_id,
                             "author_id": agent_id,
                             "author_label": label,
                             "body": body,
                             "metadata": metadata,
                         },
                     )
+                    if ui_spec:
+                        event = {**event, "body": body, "ui": ui_spec, "message_id": message_id}
+                        yield {
+                            "type": "ui.patch", "messageId": message_id,
+                            "workspaceId": self.workspace_key, "agentId": agent_id,
+                            "runId": run_id, "taskId": task_id, "sequence": 1,
+                            "snapshot": ui_spec,
+                        }
+                        yield {
+                            "type": "ui.completed", "messageId": message_id,
+                            "workspaceId": self.workspace_key, "agentId": agent_id,
+                            "runId": run_id, "taskId": task_id, "sequence": 1,
+                            "status": "ready",
+                        }
                     if self.get_agent(agent_id):
                         try:
                             self.update_agent_memory(agent_id)
                         except Exception:
                             pass
+                if task_id in ui_started_tasks and not ui_spec:
+                    yield {
+                        "type": "ui.error", "workspaceId": self.workspace_key,
+                        "agentId": agent_id, "runId": run_id, "taskId": task_id,
+                        "messageId": message_ids.get(task_id),
+                        "message": "The interface did not produce a complete valid snapshot.",
+                    }
             yield event
 
         created = []

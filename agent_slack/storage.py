@@ -38,7 +38,7 @@ class AgentSlackStorage:
             chat = self._read_json(path, default={})
             if chat:
                 chats.append(chat)
-        chats.sort(key=lambda item: item.get("updated_at", ""), reverse=True)
+        chats.sort(key=lambda item: str(item.get("updated_at") or ""), reverse=True)
         return chats
 
     def create_chat(self, title: str, member_ids: list[str], kind: str = "group") -> dict[str, Any]:
@@ -125,7 +125,7 @@ class AgentSlackStorage:
     def list_tasks(self) -> list[dict[str, Any]]:
         tasks = [self._read_json(path, default={}) for path in self.tasks_dir.glob("*.json")]
         tasks = [task for task in tasks if task]
-        tasks.sort(key=lambda task: task.get("created_at", ""), reverse=True)
+        tasks.sort(key=lambda task: str(task.get("created_at") or ""), reverse=True)
         return tasks
 
     def _write_json(self, path: Path, payload: dict[str, Any]) -> None:

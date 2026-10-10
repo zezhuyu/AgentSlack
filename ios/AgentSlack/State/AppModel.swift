@@ -219,20 +219,24 @@ final class AppModel: ObservableObject {
         isLoading = true
         defer { isLoading = false }
         do {
-            async let loadedAgents = api.agents(workspaceID: workspaceID)
-            async let loadedChats = api.chats(workspaceID: workspaceID)
-            async let loadedHealth = api.health(workspaceID: workspaceID)
-            async let loadedRuns = api.activeRuns(workspaceID: workspaceID)
-            let (newAgents, newChats, health, runs) = try await (
-                loadedAgents,
-                loadedChats,
-                loadedHealth,
-                loadedRuns
-            )
-            agents = newAgents
-            orchestratorIDs = health.architecture?.orchestratorIDs ?? []
+            // Chats are the primary workspace payload. Optional status
+            // endpoints must not prevent the conversation list from loading.
+            let newChats = try await api.chats(workspaceID: workspaceID)
             chats = newChats
-            activeRunChatIDs = Set(runs.map(\.chatID))
+
+            do { agents = try await api.agents(workspaceID: workspaceID) }
+            catch { agents = [] }
+            do {
+                let health = try await api.health(workspaceID: workspaceID)
+                orchestratorIDs = health.architecture?.orchestratorIDs ?? []
+            } catch { orchestratorIDs = [] }
+            do {
+                let runs = try await api.activeRuns(workspaceID: workspaceID)
+                activeRunChatIDs = Set(runs.map(\.chatID))
+            } catch {
+                activeRunChatIDs = []
+                clearRunState()
+            }
 #if DEBUG
             if ProcessInfo.processInfo.arguments.contains("--open-first-chat"),
                selectedChat == nil,
@@ -251,12 +255,18 @@ final class AppModel: ObservableObject {
     func openChat(_ summary: ChatSummary) async {
         guard let api, let workspaceID = selectedWorkspaceID else { return }
         do {
-            async let loadedChat = api.chat(summary.id, workspaceID: workspaceID)
-            async let loadedRuns = api.activeRuns(workspaceID: workspaceID)
-            selectedChat = try await loadedChat
-            let runs = try await loadedRuns
-            activeRunChatIDs = Set(runs.map(\.chatID))
-            applyActiveRun(runs.first { $0.chatID == summary.id })
+            // Opening a chat must not depend on the optional run/status poll.
+            // A stale run, temporary network failure, or server restart should
+            // never make an otherwise readable conversation appear broken.
+            selectedChat = try await api.chat(summary.id, workspaceID: workspaceID)
+            do {
+                let runs = try await api.activeRuns(workspaceID: workspaceID)
+                activeRunChatIDs = Set(runs.map(\.chatID))
+                applyActiveRun(runs.first { $0.chatID == summary.id })
+            } catch {
+                activeRunChatIDs = []
+                clearRunState()
+            }
         } catch {
             present(error)
         }

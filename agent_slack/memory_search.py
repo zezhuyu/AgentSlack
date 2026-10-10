@@ -8,6 +8,8 @@ from .knowledge import EXCLUDED_DIRS, EXCLUDED_NAMES, fnmatch
 
 
 class ProjectMemorySearch:
+    MAX_CONTENT_CHARS = 800
+
     def __init__(self, project_root: Path, storage_root: Path):
         self.project_root = project_root.resolve()
         self.storage_root = storage_root.resolve()
@@ -51,7 +53,7 @@ class ProjectMemorySearch:
                     relative = path.relative_to(self.storage_root).as_posix()
                 results.append({
                     "source": source,
-                    "content": content[:2000],
+                    "content": content[:self.MAX_CONTENT_CHARS],
                     "path": relative,
                     "score": round(min(1.0, score / max(1, len(terms) * 5)), 2),
                     "updated_at": datetime.fromtimestamp(path.stat().st_mtime, timezone.utc).isoformat(),
