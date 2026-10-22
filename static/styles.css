@@ -115,6 +115,11 @@ button, input, textarea, select {
   background: #1264a3;
 }
 
+.host-sessions-server-btn {
+  color: #9fe3c3;
+  font-size: 22px;
+}
+
 .server-btn:disabled {
   cursor: not-allowed;
   opacity: 0.4;
@@ -222,6 +227,41 @@ button, input, textarea, select {
   min-height: 0;
   padding: 14px 10px 16px 14px;
 }
+
+.all-sessions-section {
+  max-height: 38%;
+  min-height: 120px;
+  display: flex;
+  flex-direction: column;
+  padding: 0 10px 12px 14px;
+}
+.sessions-toggle {
+  display: flex;
+  justify-content: space-between;
+  width: 100%;
+  padding: 8px 4px;
+  color: var(--sidebar-ink);
+  background: transparent;
+  text-align: left;
+  font-weight: 700;
+}
+.all-sessions-list { overflow: auto; min-height: 0; }
+.all-session-row {
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  gap: 3px;
+  padding: 8px;
+  border-radius: 6px;
+  color: var(--sidebar-ink);
+  background: transparent;
+  text-align: left;
+}
+.all-session-row:hover, .all-session-row.active { background: rgba(255,255,255,.14); }
+.all-session-row:disabled { opacity: .45; }
+.all-session-row span, .all-session-row small { color: var(--sidebar-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.host-session-status { color: var(--sidebar-muted); }
+.host-session-status.is-running { color: #7ee6ad; font-weight: 800; }
 
 .section-heading {
   display: flex;

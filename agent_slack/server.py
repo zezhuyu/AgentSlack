@@ -15,6 +15,7 @@ from .realtime.protocol import ConnectionClosed, WebSocketConnection, handshake_
 from .realtime.session import VoiceSession
 from .mcp_server import AgentSlackMCP, handle_jsonrpc
 from .servers import AgentServerManager
+from .host_sessions import get_host_session, list_host_sessions, resume_host_session
 
 
 API_VERSION = "1"
@@ -252,6 +253,12 @@ class _Handler(BaseHTTPRequestHandler):
             return self._serve_file(file_path, filename=file_path.name, inline=True)
         if not path.startswith("/api/"):
             return self._serve_static(parsed.path)
+        if path == "/api/host-sessions":
+            return self._json({"sessions": list_host_sessions()})
+        match = re.fullmatch(r"/api/host-sessions/([^/]+)", path)
+        if match:
+            session = get_host_session(match.group(1))
+            return self._json(session or {"error": "host session not found"}, status=200 if session else 404)
         if path.startswith("/api/") and self.manager.active_server_id is None:
             if path == "/api/agents":
                 return self._json({"agents": []})
@@ -307,6 +314,15 @@ class _Handler(BaseHTTPRequestHandler):
                 self.end_headers()
                 return
             return self._json(response)
+        match = re.fullmatch(r"/api/host-sessions/([^/]+)/resume", path)
+        if match:
+            payload = self._read_json_body()
+            try:
+                return self._json(resume_host_session(match.group(1), str(payload.get("body") or "")))
+            except KeyError as exc:
+                return self._json({"error": str(exc).strip("'")}, status=404)
+            except ValueError as exc:
+                return self._json({"error": str(exc)}, status=400)
         if path == "/api/servers":
             payload = self._read_json_body()
             project_root = str(payload.get("project_root") or "").strip()

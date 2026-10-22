@@ -4,6 +4,9 @@ const state = {
   generativeUiEnabled: true,
   agents: [],
   chats: [],
+  hostSessions: [],
+  hostSessionId: null,
+  hostSessionsView: false,
   currentChatId: null,
   currentChatUpdatedAt: null,
   orchestratorIds: [],
@@ -108,11 +111,14 @@ async function loadServers() {
 }
 
 function renderServers() {
+  $("hostSessionsServerBtn").classList.toggle("active", state.hostSessionsView);
+  $("hostSessionsServerBtn").setAttribute("aria-current", state.hostSessionsView ? "true" : "false");
   $("serverList").innerHTML = "";
   state.servers.forEach((server) => {
     const button = document.createElement("button");
     button.type = "button";
-    button.className = `server-btn ${server.server_id === state.activeServerId ? "active" : ""}`;
+    const isActive = !state.hostSessionsView && server.server_id === state.activeServerId;
+    button.className = `server-btn ${isActive ? "active" : ""}`;
     if (server.logo_url) {
       const image = document.createElement("img");
       image.src = `${server.logo_url}?v=${encodeURIComponent(server.logo_revision || "1")}`;
@@ -124,14 +130,15 @@ function renderServers() {
     button.title = server.available ? server.name : `${server.name} (folder unavailable)`;
     button.disabled = !server.available;
     button.setAttribute("aria-label", `Switch to ${server.name}`);
-    button.setAttribute("aria-current", server.server_id === state.activeServerId ? "true" : "false");
+    button.setAttribute("aria-current", isActive ? "true" : "false");
     button.onclick = () => switchServer(server.server_id);
     $("serverList").appendChild(button);
   });
 }
 
 async function switchServer(serverId) {
-  if (serverId === state.activeServerId) return;
+  if (serverId === state.activeServerId && !state.hostSessionsView) return;
+  state.hostSessionsView = false;
   clearPendingAttachments();
   await api(`/api/servers/${serverId}/activate`, { method: "POST", body: "{}" });
   state.activeServerId = serverId;
@@ -145,6 +152,8 @@ async function switchServer(serverId) {
 }
 
 async function loadActiveServer() {
+  $("peoplePanel").hidden = false;
+  $("chatListHeading").textContent = "Direct Messages";
   if (!state.activeServerId) {
     renderEmptyServerState();
     return;
@@ -153,6 +162,108 @@ async function loadActiveServer() {
   await loadHealth();
   await loadAgents();
   await loadChats();
+}
+
+async function openHostSessionsServer() {
+  state.hostSessionsView = true;
+  state.hostSessionId = null;
+  state.currentChatId = null;
+  renderServers();
+  $("workspaceLabel").textContent = "Host Sessions";
+  $("chatListHeading").textContent = "Host Sessions";
+  $("peoplePanel").hidden = true;
+  $("serverSettingsBtn").disabled = true;
+  $("refreshAgentsBtn").disabled = true;
+  $("newChatBtnHeader").disabled = true;
+  $("runAgentsBtn").disabled = true;
+  $("autoMeetingBtn").disabled = true;
+  $("manualMeetingBtn").disabled = true;
+  $("deleteChatBtn").disabled = true;
+  $("messageInput").disabled = true;
+  $("sendBtn").disabled = true;
+  await loadAllSessions();
+  renderUnonboardedHostSessions();
+  $("chatTitle").textContent = "Select a host session";
+  $("chatMembers").textContent = "Sessions from folders not onboarded in Agent Slack";
+  $("messages").innerHTML = '<div class="empty-server"><strong>Host sessions</strong><p>Choose a Claude Code or Codex conversation from the sidebar.</p></div>';
+}
+
+function renderUnonboardedHostSessions() {
+  const onboardedRoots = new Set(state.servers.map((server) => normalizeFolder(server.project_root)));
+  const sessions = state.hostSessions
+    .filter((session) => !folderIsOnboarded(session.project_root, onboardedRoots))
+    .sort(compareHostSessions);
+  $("chatList").innerHTML = "";
+  $("chatCount").textContent = String(sessions.length);
+  sessions.forEach((session) => {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = `chat-row ${session.session_id === state.hostSessionId ? "active" : ""}`;
+    button.disabled = !session.available;
+    button.innerHTML = `<strong>${escapeHtml(session.title)}</strong><span>${escapeHtml(session.agent_type)} · ${escapeHtml(session.project_name)}</span><small><span class="host-session-status ${session.status === "Running" ? "is-running" : ""}">${escapeHtml(session.status || "History")}</span> · ${escapeHtml(session.last_message_preview || session.session_id)}</small>`;
+    button.title = `${session.project_name} · ${session.session_id}`;
+    button.onclick = () => openHostSession(session.session_id);
+    $("chatList").appendChild(button);
+  });
+}
+
+function compareHostSessions(left, right) {
+  const runningOrder = Number(right.status === "Running") - Number(left.status === "Running");
+  if (runningOrder) return runningOrder;
+  return String(right.updated_at || "").localeCompare(String(left.updated_at || ""));
+}
+
+function normalizeFolder(folder) {
+  return String(folder || "").replace(/\\/g, "/").replace(/\/+$/, "").toLocaleLowerCase();
+}
+
+function folderIsOnboarded(folder, roots) {
+  const candidate = normalizeFolder(folder);
+  return [...roots].some((root) => candidate === root || candidate.startsWith(`${root}/`));
+}
+
+async function loadAllSessions() {
+  try {
+    const payload = await api("/api/host-sessions");
+    state.hostSessions = payload.sessions || [];
+    if (state.hostSessionsView) renderUnonboardedHostSessions();
+    if (state.hostSessionId) {
+      const activeSession = state.hostSessions.find((session) => session.session_id === state.hostSessionId);
+      if (activeSession) renderHostSessionDetails(activeSession);
+    }
+  } catch (error) { console.warn("Unable to load all sessions", error); }
+}
+
+function renderHostSessionDetails(session) {
+  const status = session.status || "History";
+  $("chatMembers").textContent = `${status} · ${session.project_name} · ${session.agent_type} · ${session.session_id}`;
+}
+
+async function openHostSession(sessionId) {
+  try {
+    const session = await api(`/api/host-sessions/${encodeURIComponent(sessionId)}`);
+    state.hostSessionId = session.session_id;
+    state.currentChatId = session.session_id;
+    state.currentChatUpdatedAt = session.updated_at;
+    $("deleteChatBtn").disabled = true;
+    if (state.hostSessionsView) renderUnonboardedHostSessions();
+    $("messageInput").disabled = !session.available;
+    $("sendBtn").disabled = !session.available;
+    ["runAgentsBtn", "autoMeetingBtn", "manualMeetingBtn"].forEach((id) => { $(id).disabled = true; });
+    $("chatTitle").textContent = session.title;
+    renderHostSessionDetails(session);
+    state.streamingRows.clear();
+    $("messages").innerHTML = "";
+    (session.messages || []).forEach((message) => {
+      const row = document.createElement("article");
+      row.className = `message ${message.author_type}`;
+      row.innerHTML = `<div class="message-avatar">${initials(message.author_label)}</div><div class="message-body"><header><strong>${escapeHtml(message.author_label)}</strong></header><div class="message-content">${renderMarkdown(message.body)}</div></div>`;
+      $("messages").appendChild(row);
+    });
+    $("messages").scrollTop = $("messages").scrollHeight;
+  } catch (error) {
+    alert(`Unable to load host session: ${error.message}`);
+  }
 }
 
 function setWorkspaceAvailable(available) {
@@ -232,6 +343,10 @@ function renderNoChatState() {
 async function openChat(chatId) {
   try {
     const chat = await api(`/api/chats/${chatId}`);
+    state.hostSessionId = null;
+    ["runAgentsBtn", "autoMeetingBtn", "manualMeetingBtn"].forEach((id) => { $(id).disabled = !state.activeServerId; });
+    $("messageInput").disabled = !state.activeServerId;
+    $("sendBtn").disabled = !state.activeServerId;
     state.currentChatId = chatId;
     $("deleteChatBtn").disabled = state.runInProgress;
     renderChat(chat);
@@ -255,7 +370,7 @@ async function openChat(chatId) {
 }
 
 async function syncChatState() {
-  if (!state.activeServerId || state.streamAttached || state.syncInProgress || document.hidden) return;
+  if (state.hostSessionsView || !state.activeServerId || state.streamAttached || state.syncInProgress || document.hidden) return;
   const serverId = state.activeServerId;
   state.syncInProgress = true;
   try {
@@ -1762,6 +1877,27 @@ async function sendMessage() {
   const body = $("messageInput").value.trim();
   if (!body) return;
   const pathCommand = body.match(SLASH_PATH_COMMAND);
+  if (state.hostSessionId) {
+    if (pathCommand || state.pendingAttachments.length) {
+      alert("Attachments are not available when continuing a native host session.");
+      return;
+    }
+    $("sendBtn").disabled = true;
+    $("sendBtn").textContent = "Resuming...";
+    try {
+      await api(`/api/host-sessions/${encodeURIComponent(state.hostSessionId)}/resume`, {
+        method: "POST", body: JSON.stringify({ body }),
+      });
+      $("messageInput").value = "";
+      await openHostSession(state.hostSessionId);
+    } catch (error) {
+      alert(`Unable to continue native session: ${error.message}`);
+    } finally {
+      $("sendBtn").disabled = false;
+      $("sendBtn").textContent = "Send";
+    }
+    return;
+  }
   if (pathCommand) {
     $("messageInput").value = "";
     await attachPathToComposer(pathCommand[1]);
@@ -2090,6 +2226,15 @@ $("messageInput").addEventListener("blur", () => setTimeout(hideMentionMenu, 100
 $("runAgentsBtn").onclick = runAgents;
 $("autoMeetingBtn").onclick = autoMeeting;
 $("deleteChatBtn").onclick = deleteCurrentChat;
+$("chatInfoBtn").onclick = () => {
+  if (state.hostSessionId) {
+    const session = state.hostSessions.find((item) => item.session_id === state.hostSessionId);
+    if (session) window.alert(`Session ID: ${session.session_id}\nAgent: ${session.agent_type}\nFolder: ${session.project_name}`);
+    return;
+  }
+  const chat = state.chats.find((item) => item.chat_id === state.currentChatId);
+  if (chat) window.alert(`Chat ID: ${chat.chat_id}\nProject: ${state.servers.find((server) => server.server_id === state.activeServerId)?.project_root || ""}`);
+};
 $("stopRunBtn").onclick = stopCurrentRun;
 $("refreshAgentsBtn").onclick = async () => {
   if (state.runInProgress) return;
@@ -2101,6 +2246,7 @@ $("newChatBtnHeader").onclick = () => {
   $("chatDialog").showModal();
 };
 $("addServerBtn").onclick = openServerDialog;
+$("hostSessionsServerBtn").onclick = openHostSessionsServer;
 $("serverSettingsBtn").onclick = openServerSettings;
 $("configureTunnelBtn").onclick = openTunnelDialog;
 $("configureClaudeTunnelBtn").onclick = () => openClaudeTunnelDialog().catch((error) => {
@@ -2191,6 +2337,9 @@ window.addEventListener("resize", () => {
   if (!window.matchMedia("(max-width: 900px)").matches) setMobileSidebarOpen(false);
 });
 window.setInterval(syncChatState, 2000);
+window.setInterval(() => {
+  if (state.hostSessionsView && !document.hidden) loadAllSessions();
+}, 15000);
 
 loadServers().then(loadActiveServer).catch((error) => {
   console.error(error);

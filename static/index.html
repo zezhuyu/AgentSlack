@@ -11,6 +11,7 @@
     <div class="shell">
       <aside class="workspace-rail">
         <div class="workspace-badge"><img src="/logo.png" alt="Agent Slack" /></div>
+        <button id="hostSessionsServerBtn" class="server-btn host-sessions-server-btn" type="button" title="Host sessions outside onboarded projects" aria-label="Host sessions outside onboarded projects">&#9673;</button>
         <div id="serverList" class="workspace-stack server-stack"></div>
         <button id="addServerBtn" class="rail-btn add-server-btn" title="Add agent system">+</button>
       </aside>
@@ -29,7 +30,7 @@
         </div>
         <section class="sidebar-section">
           <div class="section-heading">
-            <h2>Direct Messages</h2>
+            <h2 id="chatListHeading">Direct Messages</h2>
             <span id="chatCount" class="section-meta">0</span>
           </div>
           <div id="chatList" class="list"></div>
@@ -67,6 +68,7 @@
               <button id="manualMeetingBtn">Manual Meeting</button>
               <button id="stopRunBtn" class="danger-button" type="button" hidden>Stop Run</button>
               <button id="deleteChatBtn" class="danger-button" disabled>Delete Chat</button>
+              <button id="chatInfoBtn" class="icon-btn chat-info-btn" type="button" title="Chat information" aria-label="Chat information">&#9432;</button>
             </div>
           </header>
           <section id="messages" class="messages"></section>
