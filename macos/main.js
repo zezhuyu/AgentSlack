@@ -582,6 +582,9 @@ async function startBackend() {
   fs.mkdirSync(dataRoot, { recursive: true });
   fs.mkdirSync(logRoot, { recursive: true });
   const log = fs.openSync(path.join(logRoot, 'backend.log'), 'a');
+  const staticRoot = app.isPackaged
+    ? path.join(process.resourcesPath, 'static')
+    : path.resolve(__dirname, '..', 'static');
   const pathValue = [
     '/opt/homebrew/bin',
     '/usr/local/bin',
@@ -592,6 +595,7 @@ async function startBackend() {
     ...launch.args,
     '--host', bindHost(),
     '--port', String(port),
+    '--static-root', staticRoot,
     '--data-root', dataRoot,
   ], {
     cwd: launch.cwd,

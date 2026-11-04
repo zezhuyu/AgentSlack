@@ -15,6 +15,7 @@ def main() -> None:
     parser.add_argument("--project-root", default=None, help="Optional initial agent-system folder")
     parser.add_argument("--data-root", default=None, help="Writable Agent Slack application data folder")
     parser.add_argument("--app-root", default=None, help="Application/repository root used for project discovery")
+    parser.add_argument("--static-root", default=None, help="Static web assets folder (defaults to <app-root>/static)")
     parser.add_argument("--mcp-stdio", action="store_true", help="Run the project-scoped MCP server over stdio")
     parser.add_argument(
         "--host",
@@ -42,6 +43,7 @@ def main() -> None:
         data_root=data_root,
         host=args.host,
         port=args.port,
+        static_root=Path(args.static_root).expanduser().resolve() if args.static_root else None,
     )
 
 

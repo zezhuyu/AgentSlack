@@ -55,6 +55,10 @@
       {
         "from": "assets/menu-icon.png",
         "to": "menu-icon.png"
+      },
+      {
+        "from": "../static",
+        "to": "static"
       }
     ],
     "directories": {

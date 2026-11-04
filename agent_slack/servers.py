@@ -15,10 +15,16 @@ from .storage import utc_now
 class AgentServerManager:
     SCHEMA_VERSION = 1
 
-    def __init__(self, app_root: Path, data_root: Path, initial_project_root: Path | None = None):
+    def __init__(
+        self,
+        app_root: Path,
+        data_root: Path,
+        initial_project_root: Path | None = None,
+        static_root: Path | None = None,
+    ):
         self.app_root = app_root.resolve()
         self.data_root = data_root.expanduser().resolve()
-        self.static_root = self.app_root / "static"
+        self.static_root = static_root.resolve() if static_root else self.app_root / "static"
         self.registry_file = self.data_root / "servers.json"
         self._lock = threading.RLock()
         self._apps: dict[str, AgentSlackApp] = {}

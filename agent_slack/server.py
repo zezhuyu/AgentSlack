@@ -821,7 +821,13 @@ class AgentSlackHTTPServer(ThreadingHTTPServer):
     daemon_threads = True
 
 
-def run_server(project_root: Path | None, host: str, port: int, data_root: Path | None = None) -> None:
+def run_server(
+    project_root: Path | None,
+    host: str,
+    port: int,
+    data_root: Path | None = None,
+    static_root: Path | None = None,
+) -> None:
     # PyInstaller extracts bundled static assets beside the frozen executable
     # under _MEIPASS; source runs keep the repository root as before.
     app_root = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent.parent))
@@ -829,7 +835,10 @@ def run_server(project_root: Path | None, host: str, port: int, data_root: Path 
         app_root=app_root,
         data_root=data_root or app_root / "data",
         initial_project_root=project_root,
+        static_root=static_root,
     )
+    if not (manager.static_root / "index.html").is_file():
+        raise FileNotFoundError(f"Static web entry point not found: {manager.static_root / 'index.html'}")
     _Handler.manager = manager
     server = AgentSlackHTTPServer((host, port), _Handler)
     print(f"Agent Slack running at http://{host}:{port}")

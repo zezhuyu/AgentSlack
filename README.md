@@ -41,6 +41,19 @@ Then open:
 http://127.0.0.1:8899
 ```
 
+Set `AGENT_SLACK_IP` and `AGENT_SLACK_PORT` to choose the listener address and
+port. `AGENT_SLACK_HOST` is also accepted as an alias for `AGENT_SLACK_IP`.
+For example, to listen on all network interfaces at port 9000:
+
+```bash
+AGENT_SLACK_IP=0.0.0.0 AGENT_SLACK_PORT=9000 python run.py
+```
+
+The web UI and API share this listener. From another device on the same
+network, open `http://<this-computer-lan-ip>:9000` (find the computer's LAN IP
+in its network settings). Command-line `--host` and `--port` options take
+precedence over the environment variables.
+
 The browser UI and API have no built-in token authentication. The daemon binds
 to `0.0.0.0` by default so trusted LAN clients can connect. Because agent
 runners have unrestricted terminal-equivalent access, any client that can
