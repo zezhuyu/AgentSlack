@@ -145,7 +145,7 @@ The host owns agent definitions, the architecture manifest, domain data, tools, 
 
 ## 7. Network Contract
 
-The service has no built-in authentication and binds to `0.0.0.0:8899` by default. `AGENT_SLACK_IP` and `AGENT_SLACK_PORT` are the global bind overrides. The desktop menu can restrict the service to loopback and can register the app as a macOS login item. Internet exposure requires an authenticated reverse proxy or private tunnel.
+The web/API surface requires the password configured on first macOS app launch. Browser clients receive an HTTP-only session; each iOS installation has a separate revocable bearer token. macOS desktop traffic remains authenticated by a private local credential. The service binds to `0.0.0.0:8899` by default. `AGENT_SLACK_IP` and `AGENT_SLACK_PORT` are the global bind overrides. The desktop menu can restrict the service to loopback and can register the app as a macOS login item. Internet exposure requires an authenticated reverse proxy or private tunnel.
 
 Mobile and external clients must use the versioned `/api/v1` surface. Existing
 `/api/*` paths remain compatibility aliases for the bundled web client. Clients

@@ -8,6 +8,16 @@
     <link rel="stylesheet" href="/styles.css" />
   </head>
   <body>
+    <dialog id="authDialog" class="auth-dialog">
+      <form id="authForm">
+        <h2 id="authTitle">Sign in to Agent Slack</h2>
+        <p id="authHelp" class="dialog-help">Enter the password configured in the macOS app.</p>
+        <label id="authPasswordLabel">Password<input id="authPassword" type="password" autocomplete="current-password" required /></label>
+        <label id="authConfirmLabel" hidden>Confirm password<input id="authConfirm" type="password" autocomplete="new-password" /></label>
+        <p id="authError" class="form-error" hidden></p>
+        <button id="authSubmit" type="submit">Sign in</button>
+      </form>
+    </dialog>
     <div class="shell">
       <aside class="workspace-rail">
         <div class="workspace-badge"><img src="/logo.png" alt="Agent Slack" /></div>
@@ -26,6 +36,13 @@
             <button id="serverSettingsBtn" class="icon-btn" title="Server Settings">&#9881;</button>
             <button id="refreshAgentsBtn" class="icon-btn" title="Refresh Agents">&#8635;</button>
             <button id="newChatBtnHeader" class="icon-btn" title="New Chat">+</button>
+            <button id="signOutBtn" class="icon-btn" type="button" title="Sign out" aria-label="Sign out" hidden>
+              <svg aria-hidden="true" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4" />
+                <path d="m16 17 5-5-5-5" />
+                <path d="M21 12H9" />
+              </svg>
+            </button>
           </div>
         </div>
         <section class="sidebar-section">
@@ -166,6 +183,14 @@
           <button id="browseServerLogoBtn" type="button">Browse</button>
         </div>
         <p id="serverFormError" class="form-error" hidden></p>
+        <section class="integration-card">
+          <div class="integration-card-heading"><div><strong>Account password</strong><small>Protects browser and iOS access. The macOS app stays signed in.</small></div></div>
+          <label>Current password<input id="currentPassword" type="password" autocomplete="current-password" /></label>
+          <label>New password<input id="newPassword" type="password" autocomplete="new-password" minlength="10" /></label>
+          <button id="changePasswordBtn" type="button" class="secondary-button">Change password</button>
+          <button id="revokeDevicesBtn" type="button" class="danger-button">Sign out all iOS devices</button>
+          <p id="passwordSettingsStatus" class="muted" role="status"></p>
+        </section>
         <section class="integration-card">
           <div class="integration-card-heading">
             <div><strong>ChatGPT / OpenAI MCP Tunnel</strong><small>Agent Slack starts the local MCP server automatically.</small></div>

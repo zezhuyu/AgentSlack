@@ -1,9 +1,11 @@
 import Foundation
 import SwiftUI
+import UIKit
 
 enum StartupConnectionState: Equatable {
     case checking
     case needsConnection(message: String?)
+    case needsAuthentication(message: String?)
     case connected
 }
 
@@ -17,6 +19,9 @@ final class AppModel: ObservableObject {
     @Published private(set) var orchestratorIDs: [String] = []
     @Published private(set) var chats: [ChatSummary] = []
     @Published var selectedChat: Chat?
+    @Published private(set) var hostSessions: [HostSession] = []
+    @Published private(set) var selectedHostSession: HostSession?
+    @Published private(set) var isLoadingHostSessions = false
     @Published private(set) var streamingReplies: [StreamingReply] = []
     @Published private(set) var activeRunID: String?
     @Published private(set) var activeRunChatID: String?
@@ -63,7 +68,7 @@ final class AppModel: ObservableObject {
     }
 
     var api: AgentSlackAPI? {
-        selectedConnection.map { AgentSlackAPI(baseURL: $0.baseURL) }
+        selectedConnection.map { AgentSlackAPI(baseURL: $0.baseURL, bearerToken: DeviceTokenStore.token(for: $0.baseURL)) }
     }
 
     var canStartRun: Bool {
@@ -85,6 +90,7 @@ final class AppModel: ObservableObject {
             _ = try? await task.value
         }
         isSending = false
+        if !hostSessions.isEmpty || selectedHostSession != nil { await loadHostSessions() }
         await refreshSelectedChat()
     }
 
@@ -96,10 +102,26 @@ final class AppModel: ObservableObject {
         startupConnectionState = .checking
         do {
             _ = try await api.verify()
+            let auth = try await api.authStatus()
+            if !auth.passwordSet {
+                startupConnectionState = .needsAuthentication(message: "Set the password in the macOS app first, then sign in here.")
+                return
+            }
+            if auth.passwordSet && DeviceTokenStore.token(for: api.baseURL) == nil {
+                startupConnectionState = .needsAuthentication(message: nil)
+                return
+            }
+            if auth.passwordSet { try await api.verifyAuthentication() }
             startupConnectionState = .connected
             await loadWorkspaces()
         } catch {
             clearWorkspaceState()
+            if case APIError.server(status: 401, message: _) = error,
+               let connection = selectedConnection {
+                DeviceTokenStore.remove(for: connection.baseURL)
+                startupConnectionState = .needsAuthentication(message: "This device was signed out. Enter the password again.")
+                return
+            }
             startupConnectionState = .needsConnection(message: connectionMessage(for: error))
         }
     }
@@ -107,7 +129,13 @@ final class AppModel: ObservableObject {
     func connectFromStartup(address: String) async -> Bool {
         do {
             let url = try ServerEndpoint.normalize(address)
-            _ = try await AgentSlackAPI(baseURL: url).verify()
+            let client = AgentSlackAPI(baseURL: url, bearerToken: DeviceTokenStore.token(for: url))
+            _ = try await client.verify()
+            let auth = try await client.authStatus()
+            if !auth.passwordSet {
+                startupConnectionState = .needsAuthentication(message: "Set the password in the macOS app first, then sign in here.")
+                return true
+            }
             if let selectedConnectionID,
                let index = connections.firstIndex(where: { $0.id == selectedConnectionID }) {
                 connections[index].baseURL = url
@@ -117,12 +145,39 @@ final class AppModel: ObservableObject {
                 selectedConnectionID = connection.id
             }
             persistConnections()
+            if auth.passwordSet && DeviceTokenStore.token(for: url) == nil {
+                startupConnectionState = .needsAuthentication(message: nil)
+                return true
+            }
+            if auth.passwordSet { try await client.verifyAuthentication() }
             startupConnectionState = .connected
             clearWorkspaceState()
             await loadWorkspaces()
             return true
         } catch {
+            if case APIError.server(status: 401, message: _) = error,
+               let connection = selectedConnection {
+                DeviceTokenStore.remove(for: connection.baseURL)
+                startupConnectionState = .needsAuthentication(message: "This device was signed out. Enter the password again.")
+                return true
+            }
             startupConnectionState = .needsConnection(message: connectionMessage(for: error))
+            return false
+        }
+    }
+
+    func authenticate(password: String) async -> Bool {
+        guard let connection = selectedConnection else { return false }
+        do {
+            let client = AgentSlackAPI(baseURL: connection.baseURL)
+            let token = try await client.login(password: password, deviceName: UIDevice.current.name)
+            DeviceTokenStore.save(token, for: connection.baseURL)
+            startupConnectionState = .connected
+            clearWorkspaceState()
+            await loadWorkspaces()
+            return true
+        } catch {
+            startupConnectionState = .needsAuthentication(message: connectionMessage(for: error))
             return false
         }
     }
@@ -155,6 +210,7 @@ final class AppModel: ObservableObject {
     }
 
     func removeConnection(_ connection: SavedConnection) {
+        DeviceTokenStore.remove(for: connection.baseURL)
         connections.removeAll { $0.id == connection.id }
         if selectedConnectionID == connection.id {
             selectedConnectionID = connections.first?.id
@@ -198,6 +254,14 @@ final class AppModel: ObservableObject {
                 clearRunState()
             }
         } catch {
+            if case APIError.server(status: 401, message: _) = error,
+               let connection = selectedConnection {
+                DeviceTokenStore.remove(for: connection.baseURL)
+                clearWorkspaceState()
+                startupConnectionState = .needsAuthentication(message: "This device was signed out. Enter the password again.")
+                isLoading = false
+                return
+            }
             present(error)
         }
     }
@@ -254,6 +318,7 @@ final class AppModel: ObservableObject {
 
     func openChat(_ summary: ChatSummary) async {
         guard let api, let workspaceID = selectedWorkspaceID else { return }
+        selectedHostSession = nil
         do {
             // Opening a chat must not depend on the optional run/status poll.
             // A stale run, temporary network failure, or server restart should
@@ -270,6 +335,43 @@ final class AppModel: ObservableObject {
         } catch {
             present(error)
         }
+    }
+
+    func loadHostSessions() async {
+        guard let api else { return }
+        isLoadingHostSessions = true
+        defer { isLoadingHostSessions = false }
+        do {
+            let sessions = try await api.hostSessions()
+            hostSessions = sessions.sorted {
+                if ($0.status == "Running") != ($1.status == "Running") { return $0.status == "Running" }
+                return $0.updatedAt > $1.updatedAt
+            }
+            if let selectedID = selectedHostSession?.id {
+                if let refreshed = hostSessions.first(where: { $0.id == selectedID }) {
+                    selectedHostSession = try? await api.hostSession(refreshed.id)
+                } else {
+                    selectedHostSession = nil
+                }
+            }
+        } catch {
+            hostSessions = []
+            selectedHostSession = nil
+        }
+    }
+
+    func openHostSession(_ summary: HostSession) async {
+        guard let api else { return }
+        do {
+            selectedHostSession = try await api.hostSession(summary.id)
+            selectedChat = nil
+        } catch {
+            present(error)
+        }
+    }
+
+    func closeHostSession() {
+        selectedHostSession = nil
     }
 
     func openDirectMessage(with agent: AgentProfile) async {
@@ -574,6 +676,8 @@ final class AppModel: ObservableObject {
         orchestratorIDs = []
         chats = []
         selectedChat = nil
+        hostSessions = []
+        selectedHostSession = nil
         activeRunChatIDs = []
         clearRunState()
     }

@@ -18,6 +18,8 @@ struct RootView: View {
                 StartupCheckingView(address: model.selectedConnection?.baseURL.absoluteString)
             case let .needsConnection(message):
                 StartupConnectionView(model: model, message: message)
+            case let .needsAuthentication(message):
+                StartupAuthenticationView(model: model, message: message)
             case .connected:
                 workspace
             }
@@ -62,7 +64,20 @@ struct RootView: View {
             DirectoryView(model: model, section: $section, showingNewChat: $showingNewChat)
                 .navigationSplitViewColumnWidth(min: 280, ideal: 330, max: 420)
         } detail: {
-            if workspaceMode == .chat {
+            if let hostSession = model.selectedHostSession {
+                HostSessionDetailView(session: hostSession)
+                    .toolbar {
+                        ToolbarItem(placement: .principal) {
+                            Picker("Mode", selection: $workspaceMode) {
+                                ForEach(WorkspaceMode.allCases) { mode in
+                                    Text(mode.title).tag(mode)
+                                }
+                            }
+                            .pickerStyle(.segmented)
+                            .frame(width: 190)
+                        }
+                    }
+            } else if workspaceMode == .chat {
                 ChatModeView(model: model)
                     .toolbar {
                         ToolbarItem(placement: .principal) {
@@ -119,6 +134,7 @@ struct RootView: View {
                 }
             }
         }
+        .navigationSplitViewStyle(.balanced)
         .sheet(isPresented: $showingAddServer) {
             AddServerView(model: model)
         }
@@ -148,6 +164,52 @@ struct RootView: View {
             if chatID != nil {
                 preferredCompactColumn = .detail
             }
+        }
+    }
+}
+
+private struct StartupAuthenticationView: View {
+    @ObservedObject var model: AppModel
+    let message: String?
+    @State private var password = ""
+    @State private var isSigningIn = false
+    @FocusState private var passwordFocused: Bool
+
+    var body: some View {
+        ZStack {
+            SlackTheme.sidebar.ignoresSafeArea()
+            VStack(spacing: 22) {
+                Image("AppLogo").resizable().scaledToFit().frame(width: 82, height: 82)
+                    .clipShape(RoundedRectangle(cornerRadius: 18))
+                Text("Sign in to Agent Slack").font(.largeTitle.bold())
+                Text("Use the password set in the macOS app. This iPhone will receive its own secure device token.")
+                    .multilineTextAlignment(.center).foregroundStyle(.white.opacity(0.75))
+                SecureField("Password", text: $password)
+                    .textContentType(.password).focused($passwordFocused)
+                    .padding(14).background(Color(uiColor: .systemBackground), in: RoundedRectangle(cornerRadius: 11))
+                    .foregroundStyle(Color(uiColor: .label))
+                    .onSubmit { signIn() }
+                if let message {
+                    Text(message).font(.footnote).foregroundStyle(Color(red: 1, green: 0.82, blue: 0.45))
+                }
+                Button(action: signIn) {
+                    HStack { if isSigningIn { ProgressView() }; Text(isSigningIn ? "Signing In…" : "Sign In") }
+                        .fontWeight(.semibold).frame(maxWidth: .infinity).padding(.vertical, 12)
+                }
+                .buttonStyle(.borderedProminent).tint(.white).foregroundStyle(SlackTheme.interactiveAccent)
+                .disabled(password.isEmpty || isSigningIn)
+            }
+            .foregroundStyle(.white).padding(28).frame(maxWidth: 460)
+        }
+    }
+
+    private func signIn() {
+        guard !isSigningIn, !password.isEmpty else { return }
+        isSigningIn = true
+        Task {
+            _ = await model.authenticate(password: password)
+            password = ""
+            isSigningIn = false
         }
     }
 }
@@ -477,6 +539,7 @@ private struct StartupConnectionView: View {
 enum DirectorySection: String, CaseIterable, Identifiable {
     case chats = "Chats"
     case people = "People"
+    case sessions = "Sessions"
     var id: String { rawValue }
 }
 
@@ -580,8 +643,10 @@ private struct ServerAvatar: View {
 
     var body: some View {
         Group {
-            if let url = api?.imageURL(path: workspace.logoURL, revision: workspace.logoRevision) {
-                AsyncImage(url: url) { image in image.resizable().scaledToFill() } placeholder: { fallback }
+            if let url = api?.imageURL(path: workspace.logoURL, revision: workspace.logoRevision), let api {
+                AuthenticatedImage(url: url, load: { try await api.authenticatedData(url: $0) }) { image in
+                    image.resizable().scaledToFill()
+                }
             } else {
                 fallback
             }
@@ -595,6 +660,32 @@ private struct ServerAvatar: View {
         ZStack {
             SlackTheme.selection
             Text(workspace.name.initials).font(.caption.bold()).foregroundStyle(.white)
+        }
+    }
+}
+
+struct AuthenticatedImage<Content: View>: View {
+    let url: URL
+    let load: (URL) async throws -> Data
+    private let content: (Image) -> Content
+    @State private var data: Data?
+
+    init(url: URL, load: @escaping (URL) async throws -> Data, @ViewBuilder content: @escaping (Image) -> Content) {
+        self.url = url
+        self.load = load
+        self.content = content
+    }
+
+    var body: some View {
+        Group {
+            if let data, let image = UIImage(data: data) {
+                content(Image(uiImage: image))
+            } else {
+                ProgressView()
+            }
+        }
+        .task(id: url) {
+            data = try? await load(url)
         }
     }
 }
@@ -613,7 +704,9 @@ struct DirectoryView: View {
             .pickerStyle(.segmented)
             .padding()
 
-            if model.selectedWorkspace == nil {
+            if section == .sessions {
+                hostSessions
+            } else if model.selectedWorkspace == nil {
                 ContentUnavailableView("Choose a workspace", systemImage: "square.grid.2x2")
             } else if model.isLoading && model.chats.isEmpty && model.agents.isEmpty {
                 ProgressView("Loading workspace…")
@@ -624,12 +717,65 @@ struct DirectoryView: View {
                 people
             }
         }
+        .onChange(of: section) { _, newSection in
+            if newSection == .sessions {
+                Task { await model.loadHostSessions() }
+            } else {
+                model.closeHostSession()
+            }
+        }
         .navigationTitle(model.selectedWorkspace?.name ?? "Agent Slack")
         .toolbar {
-            ToolbarItem(placement: .primaryAction) {
+            if section == .chats {
+                ToolbarItem(placement: .primaryAction) {
                 Button { showingNewChat = true } label: { Image(systemName: "square.and.pencil") }
                     .disabled(model.agents.isEmpty)
                     .accessibilityLabel("New group chat")
+                }
+            } else if section == .sessions {
+                ToolbarItem(placement: .primaryAction) {
+                    Button { Task { await model.loadHostSessions() } } label: { Image(systemName: "arrow.clockwise") }
+                        .accessibilityLabel("Refresh host sessions")
+                }
+            }
+        }
+    }
+
+    private var hostSessions: some View {
+        Group {
+            if model.hostSessions.isEmpty {
+                if model.isLoadingHostSessions {
+                    ProgressView("Loading sessions…")
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                } else {
+                    ContentUnavailableView(
+                        "No host sessions",
+                        systemImage: "terminal",
+                        description: Text("Claude Code and Codex sessions on the Mac will appear here.")
+                    )
+                }
+            } else {
+                List(model.hostSessions) { session in
+                    Button { Task { await model.openHostSession(session) } } label: {
+                        VStack(alignment: .leading, spacing: 5) {
+                            HStack {
+                                Text(session.title).font(.headline).foregroundStyle(.primary).lineLimit(2)
+                                Spacer(minLength: 8)
+                                Label(session.status, systemImage: session.status == "Running" ? "circle.fill" : "clock")
+                                    .font(.caption)
+                                    .foregroundStyle(session.status == "Running" ? SlackTheme.green : Color.secondary)
+                            }
+                            Text("\(session.agentType.capitalized) · \(session.projectName)")
+                                .font(.subheadline).foregroundStyle(.secondary).lineLimit(1)
+                            Text(session.lastMessagePreview)
+                                .font(.caption).foregroundStyle(.secondary).lineLimit(2)
+                        }
+                        .padding(.vertical, 3)
+                    }
+                    .disabled(!session.available)
+                    .listRowBackground(session.id == model.selectedHostSession?.id ? SlackTheme.selection.opacity(0.12) : Color.clear)
+                }
+                .listStyle(.plain)
             }
         }
     }
@@ -735,6 +881,36 @@ struct AvatarView: View {
             .frame(width: 38, height: 38)
             .background(color.gradient, in: RoundedRectangle(cornerRadius: 9))
             .accessibilityHidden(true)
+    }
+}
+
+private struct HostSessionDetailView: View {
+    let session: HostSession
+
+    var body: some View {
+        ScrollView {
+            LazyVStack(alignment: .leading, spacing: 18) {
+                VStack(alignment: .leading, spacing: 5) {
+                    Text(session.title).font(.title2.bold())
+                    Text("\(session.status) · \(session.agentType.capitalized) · \(session.projectName)")
+                        .font(.subheadline).foregroundStyle(.secondary)
+                    Text(session.projectRoot).font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
+                }
+                Divider()
+                ForEach(session.messages ?? []) { message in
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text(message.authorLabel).font(.caption.bold()).foregroundStyle(.secondary)
+                        Text(message.body).textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    .padding(12)
+                    .background(message.authorType == "user" ? SlackTheme.selection.opacity(0.10) : Color.clear,
+                                in: RoundedRectangle(cornerRadius: 12))
+                }
+            }
+            .padding()
+        }
+        .navigationTitle("Host Session")
+        .navigationBarTitleDisplayMode(.inline)
     }
 }
 

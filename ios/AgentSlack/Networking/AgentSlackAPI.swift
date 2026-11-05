@@ -1,4 +1,5 @@
 import Foundation
+import Security
 
 enum APIError: LocalizedError {
     case invalidServerURL
@@ -49,6 +50,7 @@ struct AgentSlackAPI {
     static let streamingTimeout: TimeInterval = 6 * 60 * 60
 
     let baseURL: URL
+    var bearerToken: String? = nil
     var session: URLSession = .agentSlack
 
     func verify() async throws -> ServiceDocument {
@@ -63,6 +65,23 @@ struct AgentSlackAPI {
             throw APIError.incompatibleService
         }
         return document
+    }
+
+    func authStatus() async throws -> AuthStatusResponse {
+        try await request(path: "auth/status", method: "GET", workspaceID: nil, body: Optional<String>.none)
+    }
+
+    func verifyAuthentication() async throws {
+        let _: EmptyResponse = try await request(path: "auth/verify", method: "GET", workspaceID: nil, body: Optional<String>.none)
+    }
+
+    func login(password: String, deviceName: String) async throws -> String {
+        let result: DeviceLoginResponse = try await request(
+            path: "auth/login", method: "POST", workspaceID: nil,
+            body: ["password": password, "device_name": deviceName]
+        )
+        guard let token = result.token, !token.isEmpty else { throw APIError.invalidResponse }
+        return token
     }
 
     func servers() async throws -> ServerListResponse {
@@ -81,6 +100,19 @@ struct AgentSlackAPI {
     func chats(workspaceID: String) async throws -> [ChatSummary] {
         let response: ChatsResponse = try await request(path: "chats", method: "GET", workspaceID: workspaceID, body: Optional<String>.none)
         return response.chats
+    }
+
+    func hostSessions() async throws -> [HostSession] {
+        let response: HostSessionsResponse = try await request(
+            path: "host-sessions", method: "GET", workspaceID: nil, body: Optional<String>.none
+        )
+        return response.sessions
+    }
+
+    func hostSession(_ sessionID: String) async throws -> HostSession {
+        try await request(
+            path: "host-sessions/\(sessionID)", method: "GET", workspaceID: nil, body: Optional<String>.none
+        )
     }
 
     func chat(_ chatID: String, workspaceID: String) async throws -> Chat {
@@ -205,7 +237,19 @@ struct AgentSlackAPI {
 
     func speechData(path: String) async throws -> Data {
         guard let url = URL(string: path, relativeTo: baseURL)?.absoluteURL else { throw APIError.invalidResponse }
-        let (data, response) = try await session.data(from: url)
+        var request = URLRequest(url: url)
+        if let bearerToken { request.setValue("Bearer \(bearerToken)", forHTTPHeaderField: "Authorization") }
+        let (data, response) = try await session.data(for: request)
+        try validate(response: response, data: data)
+        return data
+    }
+
+    func authenticatedData(url: URL) async throws -> Data {
+        var request = URLRequest(url: url)
+        request.timeoutInterval = Self.streamingTimeout
+        request.setValue("1", forHTTPHeaderField: "X-Agent-Slack-Api-Version")
+        if let bearerToken { request.setValue("Bearer \(bearerToken)", forHTTPHeaderField: "Authorization") }
+        let (data, response) = try await requestBytes(request)
         try validate(response: response, data: data)
         return data
     }
@@ -339,6 +383,7 @@ struct AgentSlackAPI {
         request.httpMethod = "GET"
         request.timeoutInterval = Self.streamingTimeout
         request.setValue("1", forHTTPHeaderField: "X-Agent-Slack-Api-Version")
+        if let bearerToken { request.setValue("Bearer \(bearerToken)", forHTTPHeaderField: "Authorization") }
         request.setValue(workspaceID, forHTTPHeaderField: "X-Agent-Slack-Server")
         let (data, response) = try await requestBytes(request)
         try validate(response: response, data: data)
@@ -439,6 +484,7 @@ struct AgentSlackAPI {
         request.timeoutInterval = timeoutInterval
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue("1", forHTTPHeaderField: "X-Agent-Slack-Api-Version")
+        if let bearerToken { request.setValue("Bearer \(bearerToken)", forHTTPHeaderField: "Authorization") }
         if let workspaceID {
             request.setValue(workspaceID, forHTTPHeaderField: "X-Agent-Slack-Server")
         }
@@ -458,6 +504,55 @@ struct AgentSlackAPI {
             }
             throw APIError.server(status: http.statusCode, message: message)
         }
+    }
+}
+
+struct AuthStatusResponse: Decodable {
+    let passwordSet: Bool
+    enum CodingKeys: String, CodingKey { case passwordSet = "password_set" }
+}
+
+private struct EmptyResponse: Decodable { let ok: Bool }
+
+private struct DeviceLoginResponse: Decodable { let token: String? }
+
+enum DeviceTokenStore {
+    private static let service = "com.agentslack.ios.device-token"
+
+    static func token(for url: URL) -> String? {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: key(for: url),
+            kSecReturnData as String: true,
+            kSecMatchLimit as String: kSecMatchLimitOne,
+        ]
+        var result: CFTypeRef?
+        guard SecItemCopyMatching(query as CFDictionary, &result) == errSecSuccess,
+              let data = result as? Data else { return nil }
+        return String(data: data, encoding: .utf8)
+    }
+
+    static func save(_ token: String, for url: URL) {
+        let account = key(for: url)
+        let query: [String: Any] = [kSecClass as String: kSecClassGenericPassword,
+                                    kSecAttrService as String: service,
+                                    kSecAttrAccount as String: account]
+        SecItemDelete(query as CFDictionary)
+        var attributes = query
+        attributes[kSecValueData as String] = Data(token.utf8)
+        attributes[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+        SecItemAdd(attributes as CFDictionary, nil)
+    }
+
+    static func remove(for url: URL) {
+        SecItemDelete([kSecClass as String: kSecClassGenericPassword,
+                       kSecAttrService as String: service,
+                       kSecAttrAccount as String: key(for: url)] as CFDictionary)
+    }
+
+    private static func key(for url: URL) -> String {
+        "\(url.scheme ?? "")://\(url.host ?? ""):\(url.port ?? 0)"
     }
 }
 

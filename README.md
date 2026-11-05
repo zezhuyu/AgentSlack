@@ -54,11 +54,11 @@ network, open `http://<this-computer-lan-ip>:9000` (find the computer's LAN IP
 in its network settings). Command-line `--host` and `--port` options take
 precedence over the environment variables.
 
-The browser UI and API have no built-in token authentication. The daemon binds
-to `0.0.0.0` by default so trusted LAN clients can connect. Because agent
-runners have unrestricted terminal-equivalent access, any client that can
-reach this API can cause commands to run with the desktop user's permissions.
-Expose it only to clients and networks you fully trust.
+The web UI and API require the password configured on first launch in the
+macOS app. Browser sessions use an HTTP-only cookie; each iOS installation gets
+its own revocable device token. macOS app traffic uses a private local desktop
+credential and remains signed in. Keep LAN access on trusted networks and use
+a VPN or authenticated tunnel for remote access.
 
 Omit `--project-root` to start with an empty server registry, then use the `+` button in the workspace rail and enter an agent-system folder. Use `--data-root <folder>` to move the server registry, chats, and memories out of the source tree.
 

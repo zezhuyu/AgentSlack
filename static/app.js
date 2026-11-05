@@ -32,6 +32,9 @@ const state = {
   },
 };
 
+let authSetupToken = null;
+let desktopClient = Boolean(window.agentSlack);
+
 const $ = (id) => document.getElementById(id);
 const renderMarkdown = (value) => window.AgentSlackMarkdown.render(value);
 const appendStreamMarkdown = (currentText, delta) => window.AgentSlackMarkdown.appendStream(currentText, delta);
@@ -58,11 +61,97 @@ async function api(path, options = {}) {
     ...options,
   });
   if (!response.ok) {
+    if (response.status === 401) showAuthDialog(false, null);
     const text = await response.text();
     throw new Error(text || `HTTP ${response.status}`);
   }
   return response.json();
 }
+
+function showAuthDialog(setup, setupToken) {
+  authSetupToken = setupToken;
+  $("authTitle").textContent = setup ? "Set your web password" : "Sign in to Agent Slack";
+  $("authHelp").textContent = setup
+    ? "Create a password for browser and iOS access. The macOS app remains signed in."
+    : "Enter the password configured in the macOS app.";
+  $("authConfirmLabel").hidden = !setup;
+  $("authPasswordLabel").firstChild.textContent = setup ? "New password" : "Password";
+  $("authPassword").autocomplete = setup ? "new-password" : "current-password";
+  $("authSubmit").textContent = setup ? "Set password" : "Sign in";
+  $("authError").hidden = true;
+  if (!$("authDialog").open) $("authDialog").showModal();
+}
+
+async function initializeAuth() {
+  $("signOutBtn").hidden = desktopClient;
+  const status = await fetch("/api/v1/auth/status").then((response) => response.json());
+  if (!status.password_set) {
+    if (desktopClient && status.setup_token) {
+      showAuthDialog(true, status.setup_token);
+      return false;
+    }
+    $("authHelp").textContent = "Password setup is available in the Agent Slack macOS app. Open it on the host Mac, set a password, then sign in here.";
+    showAuthDialog(false, null);
+    $("authSubmit").disabled = true;
+    return false;
+  }
+  if (!desktopClient) {
+    const response = await fetch("/api/v1/servers");
+    if (response.status === 401) {
+      showAuthDialog(false, null);
+      return false;
+    }
+  }
+  return true;
+}
+
+$("authForm").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const password = $("authPassword").value;
+  const setup = Boolean(authSetupToken);
+  try {
+    if (setup) {
+      if (password !== $("authConfirm").value) throw new Error("Passwords do not match");
+      const response = await fetch("/api/v1/auth/setup", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ password, setup_token: authSetupToken }),
+      });
+      if (!response.ok) throw new Error((await response.json()).error || "Could not set password");
+      authSetupToken = null;
+      $("authPassword").value = "";
+      if (desktopClient) {
+        $("authDialog").close();
+        await loadServers().then(loadActiveServer);
+        return;
+      }
+      showAuthDialog(false, null);
+      $("authSubmit").disabled = false;
+      $("authError").textContent = "Password set. Sign in to continue.";
+      $("authError").hidden = false;
+      return;
+    }
+    const response = await fetch("/api/v1/auth/login", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ password }),
+    });
+    if (!response.ok) throw new Error((await response.json()).error || "Sign in failed");
+    $("authDialog").close();
+    $("authPassword").value = "";
+    await loadServers().then(loadActiveServer);
+  } catch (error) {
+    $("authError").textContent = error.message;
+    $("authError").hidden = false;
+  }
+});
+
+$("signOutBtn").addEventListener("click", async () => {
+  try {
+    const response = await fetch("/api/v1/auth/logout", { method: "POST" });
+    if (!response.ok) throw new Error(`Sign out failed (HTTP ${response.status})`);
+    window.location.reload();
+  } catch (error) {
+    alert(error.message);
+  }
+});
 
 async function streamApi(path, payload, onEvent, extraHeaders = {}) {
   const headers = {
@@ -2248,6 +2337,23 @@ $("newChatBtnHeader").onclick = () => {
 $("addServerBtn").onclick = openServerDialog;
 $("hostSessionsServerBtn").onclick = openHostSessionsServer;
 $("serverSettingsBtn").onclick = openServerSettings;
+$("changePasswordBtn").onclick = async () => {
+  const status = $("passwordSettingsStatus");
+  try {
+    await api("/api/v1/auth/password", { method: "POST", body: JSON.stringify({
+      current_password: $("currentPassword").value, new_password: $("newPassword").value,
+    }) });
+    $("currentPassword").value = ""; $("newPassword").value = "";
+    status.textContent = "Password changed.";
+  } catch (error) { status.textContent = error.message; }
+};
+$("revokeDevicesBtn").onclick = async () => {
+  const status = $("passwordSettingsStatus");
+  try {
+    const result = await api("/api/v1/auth/revoke-devices", { method: "POST" });
+    status.textContent = `Signed out ${result.revoked} iOS device${result.revoked === 1 ? "" : "s"}.`;
+  } catch (error) { status.textContent = error.message; }
+};
 $("configureTunnelBtn").onclick = openTunnelDialog;
 $("configureClaudeTunnelBtn").onclick = () => openClaudeTunnelDialog().catch((error) => {
   $("serverFormError").textContent = error.message;
@@ -2341,7 +2447,7 @@ window.setInterval(() => {
   if (state.hostSessionsView && !document.hidden) loadAllSessions();
 }, 15000);
 
-loadServers().then(loadActiveServer).catch((error) => {
+initializeAuth().then((ready) => ready && loadServers().then(loadActiveServer)).catch((error) => {
   console.error(error);
   alert(`Failed to initialize Agent Slack: ${error.message}`);
 });

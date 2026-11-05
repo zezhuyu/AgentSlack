@@ -4,6 +4,7 @@ import json
 import mimetypes
 import os
 import re
+import secrets
 import sys
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -14,6 +15,7 @@ from uuid import uuid4
 from .realtime.protocol import ConnectionClosed, WebSocketConnection, handshake_response
 from .realtime.session import VoiceSession
 from .mcp_server import AgentSlackMCP, handle_jsonrpc
+from .auth import AuthStore
 from .servers import AgentServerManager
 from .host_sessions import get_host_session, list_host_sessions, resume_host_session
 
@@ -73,6 +75,11 @@ def _api_document() -> dict:
 
 def _openapi_document() -> dict:
     paths = {
+        "/auth/status": {"get": {"summary": "Return whether the account password has been configured"}},
+        "/auth/login": {"post": {"summary": "Sign in to the web UI or enroll an iOS device"}},
+        "/auth/verify": {"get": {"summary": "Validate the current browser or device credential"}},
+        "/auth/password": {"post": {"summary": "Change the account password"}},
+        "/auth/revoke-devices": {"post": {"summary": "Sign out all registered iOS devices"}},
         "/health": {"get": {"summary": "Service health and active agent system"}},
         "/servers": {
             "get": {"summary": "List registered agent systems"},
@@ -167,10 +174,23 @@ def _versioned_path(path: str) -> str:
 
 class _Handler(BaseHTTPRequestHandler):
     manager: AgentServerManager
+    auth: AuthStore
+    desktop_secret: str | None = None
 
     def do_GET(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
         path = _versioned_path(parsed.path)
+        if path == "/api/auth/verify":
+            if not self._request_authorized():
+                return self._json({"error": "Authentication required"}, status=401)
+            return self._json({"ok": True})
+        if path == "/api/auth/status":
+            result = self.auth.status()
+            if self._is_desktop_request() and not result["password_set"]:
+                result["setup_token"] = self.auth.data.get("setup_token")
+            return self._json(result)
+        if path.startswith("/api/") and not path.startswith("/api/auth/") and not self._request_authorized():
+            return self._json({"error": "Authentication required", "code": "authentication_required"}, status=401)
         if path == "/mcp":
             # MCP is stateless Streamable HTTP here and accepts JSON-RPC over
             # POST. Do not let discovery receive the web UI with a 200 response.
@@ -301,6 +321,46 @@ class _Handler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
         path = _versioned_path(parsed.path)
+        if path == "/api/auth/setup":
+            payload = self._read_json_body()
+            if not self._is_desktop_request():
+                return self._json({"error": "Set the password from the macOS app"}, status=403)
+            try:
+                created = self.auth.setup(str(payload.get("password") or ""), str(payload.get("setup_token") or ""))
+            except ValueError as exc:
+                return self._json({"error": str(exc)}, status=400)
+            return self._json({"ok": created}, status=200 if created else 403)
+        if path == "/api/auth/login":
+            payload = self._read_json_body()
+            device_name = str(payload.get("device_name") or "").strip() or None
+            try:
+                token, is_device = self.auth.login(str(payload.get("password") or ""), device_name)
+            except PermissionError as exc:
+                return self._json({"error": str(exc)}, status=401)
+            if is_device:
+                return self._json({"token": token, "device": True})
+            return self._json({"ok": True}, headers={"Set-Cookie": f"agent_slack_session={token}; HttpOnly; SameSite=Strict; Path=/; Max-Age=1209600"})
+        if path == "/api/auth/logout":
+            cookie = self._cookie_token()
+            self.auth.sessions.pop(cookie or "", None)
+            return self._json({"ok": True}, headers={"Set-Cookie": "agent_slack_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0"})
+        if path == "/api/auth/password":
+            if not self._request_authorized():
+                return self._json({"error": "Authentication required"}, status=401)
+            payload = self._read_json_body()
+            try:
+                self.auth.change_password(str(payload.get("current_password") or ""), str(payload.get("new_password") or ""))
+            except PermissionError as exc:
+                return self._json({"error": str(exc)}, status=401)
+            except ValueError as exc:
+                return self._json({"error": str(exc)}, status=400)
+            return self._json({"ok": True})
+        if path == "/api/auth/revoke-devices":
+            if not self._request_authorized():
+                return self._json({"error": "Authentication required"}, status=401)
+            return self._json({"revoked": self.auth.revoke_devices()})
+        if path.startswith("/api/") and not path.startswith("/api/auth/") and not self._request_authorized():
+            return self._json({"error": "Authentication required", "code": "authentication_required"}, status=401)
         if path == "/mcp":
             try:
                 request = self._read_json_body()
@@ -618,6 +678,8 @@ class _Handler(BaseHTTPRequestHandler):
     def do_DELETE(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
         path = _versioned_path(parsed.path)
+        if path.startswith("/api/") and not path.startswith("/api/auth/") and not self._request_authorized():
+            return self._json({"error": "Authentication required", "code": "authentication_required"}, status=401)
         if path.startswith("/api/") and self.manager.active_server_id is None:
             return self._json(_no_server_payload(), status=409)
         match = re.fullmatch(r"/api/chats/([^/]+)", path)
@@ -716,14 +778,33 @@ class _Handler(BaseHTTPRequestHandler):
         except json.JSONDecodeError:
             return {}
 
-    def _json(self, payload: dict, status: int = 200) -> None:
+    def _json(self, payload: dict, status: int = 200, headers: dict[str, str] | None = None) -> None:
         raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(raw)))
         self.send_header("X-Agent-Slack-Api-Version", API_VERSION)
+        for key, value in (headers or {}).items():
+            self.send_header(key, value)
         self.end_headers()
         self.wfile.write(raw)
+
+    def _is_desktop_request(self) -> bool:
+        secret = self.desktop_secret
+        supplied = self.headers.get("X-Agent-Slack-Desktop", "")
+        return bool(secret and supplied and secrets.compare_digest(secret, supplied))
+
+    def _cookie_token(self) -> str | None:
+        for item in self.headers.get("Cookie", "").split(";"):
+            key, _, value = item.strip().partition("=")
+            if key == "agent_slack_session":
+                return value
+        return None
+
+    def _request_authorized(self) -> bool:
+        authorization = self.headers.get("Authorization", "")
+        bearer = authorization[7:].strip() if authorization.lower().startswith("bearer ") else None
+        return self.auth.authorized(bearer, self._cookie_token(), self.headers.get("X-Agent-Slack-Desktop"), self.desktop_secret)
 
     def _audio(self, content: bytes, content_type: str) -> None:
         self.send_response(HTTPStatus.OK)
@@ -840,8 +921,12 @@ def run_server(
     if not (manager.static_root / "index.html").is_file():
         raise FileNotFoundError(f"Static web entry point not found: {manager.static_root / 'index.html'}")
     _Handler.manager = manager
+    _Handler.auth = AuthStore(manager.data_root)
+    _Handler.desktop_secret = os.getenv("AGENT_SLACK_DESKTOP_SECRET") or None
     server = AgentSlackHTTPServer((host, port), _Handler)
     print(f"Agent Slack running at http://{host}:{port}")
+    if not _Handler.auth.status()["password_set"]:
+        print("First-run password setup is available in the Agent Slack macOS app.")
     try:
         server.serve_forever()
     except KeyboardInterrupt:

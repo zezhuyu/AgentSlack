@@ -69,6 +69,10 @@ struct ChatView: View {
                                 materializeFile: { url, filename in
                                     guard let api = model.api, let workspaceID = model.selectedWorkspaceID else { throw APIError.invalidServerURL }
                                     return try await api.materializeFile(url: url, filename: filename, workspaceID: workspaceID)
+                                },
+                                loadImageData: { url in
+                                    guard let api = model.api else { throw APIError.invalidServerURL }
+                                    return try await api.authenticatedData(url: url)
                                 }
                             )
                             if let interaction = choiceInteraction(for: message) {
@@ -108,6 +112,10 @@ struct ChatView: View {
                             materializeFile: { url, filename in
                                 guard let api = model.api, let workspaceID = model.selectedWorkspaceID else { throw APIError.invalidServerURL }
                                 return try await api.materializeFile(url: url, filename: filename, workspaceID: workspaceID)
+                            },
+                            loadImageData: { url in
+                                guard let api = model.api else { throw APIError.invalidServerURL }
+                                return try await api.authenticatedData(url: url)
                             }
                         )
                         .id("stream-\(reply.id)")
@@ -738,6 +746,7 @@ private struct MessageRow: View {
     let fileURL: (UploadedAttachment) -> URL?
     let localFileURL: (String) -> URL?
     let materializeFile: (URL, String) async throws -> URL
+    let loadImageData: (URL) async throws -> Data
     @State private var showingSources = false
 
     private var primaryAttachments: [UploadedAttachment] {
@@ -836,7 +845,8 @@ private struct MessageRow: View {
                                         role: "reference"
                                     ),
                                     url: cited.url,
-                                    materializeFile: materializeFile
+                                    materializeFile: materializeFile,
+                                    loadImageData: loadImageData
                                 )
                             }
                         }
@@ -876,7 +886,7 @@ private struct MessageRow: View {
                         Link(destination: url) {
                             attachmentCard(attachment)
                         }
-                        AttachmentPreview(attachment: attachment, url: url, materializeFile: materializeFile)
+                        AttachmentPreview(attachment: attachment, url: url, materializeFile: materializeFile, loadImageData: loadImageData)
                     } else {
                         attachmentCard(attachment)
                     }
@@ -948,6 +958,7 @@ private struct AttachmentPreview: View {
     let attachment: UploadedAttachment
     let url: URL
     let materializeFile: (URL, String) async throws -> URL
+    let loadImageData: (URL) async throws -> Data
     @State private var isPresentingFullScreen = false
 
     private var normalizedContentType: String {
@@ -963,18 +974,12 @@ private struct AttachmentPreview: View {
     var body: some View {
         Group {
             if normalizedContentType.hasPrefix("image/") {
-                AsyncImage(url: url) { phase in
-                    if let image = phase.image {
-                        image.resizable().scaledToFit()
-                    } else {
-                        Color.clear
-                    }
-                }
+                AuthenticatedImage(url: url, load: loadImageData) { image in image.resizable().scaledToFit() }
                 .frame(maxWidth: 280, maxHeight: 220)
                 .clipShape(RoundedRectangle(cornerRadius: 10))
                 .onTapGesture { isPresentingFullScreen = true }
                 .fullScreenCover(isPresented: $isPresentingFullScreen) {
-                    ImageLightbox(url: url) { isPresentingFullScreen = false }
+                    ImageLightbox(url: url, load: loadImageData) { isPresentingFullScreen = false }
                 }
             } else if normalizedContentType.hasPrefix("audio/") {
                 AudioAttachmentPreview(
@@ -1353,18 +1358,13 @@ private struct MaterializedPDFPreview: View {
 
 private struct ImageLightbox: View {
     let url: URL
+    let load: (URL) async throws -> Data
     let dismiss: () -> Void
 
     var body: some View {
         ZStack {
             Color.black.ignoresSafeArea()
-            AsyncImage(url: url) { phase in
-                if let image = phase.image {
-                    image.resizable().scaledToFit()
-                } else {
-                    ProgressView().tint(.white)
-                }
-            }
+            AuthenticatedImage(url: url, load: load) { image in image.resizable().scaledToFit() }
         }
         .onTapGesture(perform: dismiss)
     }

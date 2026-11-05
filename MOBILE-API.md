@@ -217,11 +217,15 @@ selected IDs are recorded, and a linked user message is appended. Start the
 next `/run-stream` turn using that answer so the agent can continue. Repeated,
 unknown, empty, or invalid-cardinality answers return `400`.
 
-## Security Boundary
+## Authentication
 
-Agent Slack deliberately has no token authentication. LAN mode therefore gives
-devices on that trusted network the ability to read chats and invoke local
-agents. Do not expose port `8899` directly to the public internet. Remote access
-must use an authenticated reverse proxy, VPN, or private tunnel; authentication
-can be added before a public phone release without changing the versioned
-resource model.
+The password is first configured in the macOS app. iOS signs in with
+`POST /api/v1/auth/login`, sending `password` and a user-visible `device_name`;
+the response contains a device-specific bearer token. Store that token in the
+iOS Keychain and send it as `Authorization: Bearer <token>` on API requests.
+The token is revocable from Web UI settings with **Sign out all iOS devices**.
+Browser clients use an HTTP-only session cookie. The macOS desktop app uses its
+private local credential and does not require a password prompt.
+
+LAN access should remain limited to trusted networks. Use a VPN or
+authenticated tunnel for remote access.

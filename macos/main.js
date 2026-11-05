@@ -17,6 +17,7 @@ let settings = null;
 let tunnelClient = null;
 let tunnelStatus = { state: 'stopped', message: '' };
 let isQuitting = false;
+const desktopSecret = crypto.randomBytes(32).toString('hex');
 
 const hasSingleInstanceLock = app.requestSingleInstanceLock();
 if (!hasSingleInstanceLock) app.quit();
@@ -543,6 +544,10 @@ function publicApiUrl() {
   return `http://${host}:${backendPort || configuredPort()}/api/v1`;
 }
 
+function publicWebUrl() {
+  return publicApiUrl().replace(/\/api\/v1$/, '');
+}
+
 function waitForHealth(port, attempts = 80) {
   return new Promise((resolve, reject) => {
     let remaining = attempts;
@@ -607,6 +612,7 @@ async function startBackend() {
         : { AGENT_SLACK_WHISPER_MODEL: defaultWhisperModel }),
       PYTHONUNBUFFERED: '1',
       PYTHONDONTWRITEBYTECODE: '1',
+      AGENT_SLACK_DESKTOP_SECRET: desktopSecret,
     },
     stdio: ['ignore', log, log],
   });
@@ -677,6 +683,15 @@ function createWindow(port) {
     if (!isQuitting && process.platform === 'darwin') app.dock.hide();
   });
   mainWindow.on('closed', () => { mainWindow = null; });
+}
+
+function configureDesktopRequestHeaders() {
+  session.defaultSession.webRequest.onBeforeSendHeaders({ urls: ['http://127.0.0.1:*/*', 'http://localhost:*/*'] }, (details, callback) => {
+    const requestHeaders = { ...details.requestHeaders };
+    const target = new URL(details.url);
+    if (backendPort && Number(target.port) === backendPort) requestHeaders['X-Agent-Slack-Desktop'] = desktopSecret;
+    callback({ requestHeaders });
+  });
 }
 
 function showWindow() {
@@ -755,6 +770,9 @@ function refreshTrayMenu() {
     { label: 'Open Agent Slack', click: showWindow },
     { label: `API: ${apiUrl}`, enabled: false },
     { label: 'Copy API URL', click: () => clipboard.writeText(apiUrl) },
+    { label: `Web login: ${publicWebUrl()}`, enabled: false },
+    { label: 'Open Web Login', click: () => shell.openExternal(publicWebUrl()) },
+    { label: 'Copy Web Login URL', click: () => clipboard.writeText(publicWebUrl()) },
     { type: 'separator' },
     {
       label: 'Allow Trusted LAN Access',
@@ -806,6 +824,7 @@ ipcMain.handle('agent-slack:select-image', async () => {
 
 ipcMain.handle('agent-slack:server-info', () => ({
   apiUrl: publicApiUrl(),
+  webUrl: publicWebUrl(),
   allowLan: settings.allowLan,
   port: backendPort || configuredPort(),
 }));
@@ -876,6 +895,7 @@ app.whenReady().then(async () => {
     settings = loadSettings();
     if (settings.launchAtLogin) app.setLoginItemSettings({ openAtLogin: true });
     configureMicrophoneAccess();
+    configureDesktopRequestHeaders();
     const port = await startBackend();
     if (settings.claudeTunnel?.enabled) startClaudeTunnel().catch((error) => {
       console.error(`Claude MCP tunnel: ${error.message}`);

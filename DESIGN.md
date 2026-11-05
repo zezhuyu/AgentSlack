@@ -87,5 +87,5 @@
 - Test/screenshot expectations: model/parser unit tests and `xcodebuild` compilation; simulator visual review when CoreSimulator is available.
 
 ## Open questions
-- [ ] Public distribution authentication / product owner / required before internet-facing or App Store release.
+- [x] Password authentication for browser and iOS clients; macOS desktop retains its private local credential.
 - [ ] Background notifications for completed runs / product owner / requires an authenticated push or local relay design.

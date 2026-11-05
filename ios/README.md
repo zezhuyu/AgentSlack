@@ -18,9 +18,10 @@ the connection screen returns with the saved URL prefilled so it can be retried
 or modified.
 
 The app accepts user-configured self-hosted `http://` URLs, including numeric
-LAN addresses, through its App Transport Security exception. Agent Slack has no
-built-in authentication, so do not connect it directly to the public internet.
-Use HTTPS through a VPN or authenticated reverse proxy for remote access.
+LAN addresses, through its App Transport Security exception. Sign in with the
+password configured in the macOS app; the iOS app stores its per-installation
+bearer token in the Keychain. Use a trusted LAN, VPN, or authenticated tunnel
+for remote access.
 
 ## Test
 

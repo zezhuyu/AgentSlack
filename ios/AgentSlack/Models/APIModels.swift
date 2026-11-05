@@ -99,6 +99,52 @@ struct ChatsResponse: Decodable {
     let chats: [ChatSummary]
 }
 
+struct HostSessionsResponse: Decodable {
+    let sessions: [HostSession]
+}
+
+struct HostSession: Decodable, Identifiable, Hashable {
+    let sessionID: String
+    let agentType: String
+    let projectName: String
+    let projectRoot: String
+    let title: String
+    let lastMessagePreview: String
+    let updatedAt: String
+    let available: Bool
+    let status: String
+    let messages: [HostSessionMessage]?
+
+    var id: String { sessionID }
+
+    enum CodingKeys: String, CodingKey {
+        case sessionID = "session_id"
+        case agentType = "agent_type"
+        case projectName = "project_name"
+        case projectRoot = "project_root"
+        case title
+        case lastMessagePreview = "last_message_preview"
+        case updatedAt = "updated_at"
+        case available
+        case status
+        case messages
+    }
+}
+
+struct HostSessionMessage: Decodable, Identifiable, Hashable {
+    let authorType: String
+    let authorLabel: String
+    let body: String
+
+    var id: String { "\(authorType):\(authorLabel):\(body.hashValue)" }
+
+    enum CodingKeys: String, CodingKey {
+        case authorType = "author_type"
+        case authorLabel = "author_label"
+        case body
+    }
+}
+
 struct ChatSummary: Codable, Identifiable, Hashable {
     let chatID: String
     let title: String
