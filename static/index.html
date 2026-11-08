@@ -183,6 +183,7 @@
           <button id="browseServerLogoBtn" type="button">Browse</button>
         </div>
         <p id="serverFormError" class="form-error" hidden></p>
+        <button id="openChannelSettingsBtn" type="button" class="secondary-button">Channel Settings</button>
         <section class="integration-card">
           <div class="integration-card-heading"><div><strong>Account password</strong><small>Protects browser and iOS access. The macOS app stays signed in.</small></div></div>
           <label>Current password<input id="currentPassword" type="password" autocomplete="current-password" /></label>
@@ -211,6 +212,22 @@
         <menu>
           <button id="cancelServerBtn" type="button">Cancel</button>
           <button id="serverSubmitBtn" value="submit">Add Server</button>
+        </menu>
+      </form>
+    </dialog>
+
+    <dialog id="channelSettingsDialog" class="settings-dialog">
+      <form method="dialog" id="channelSettingsForm">
+        <h3>Channel Settings</h3>
+        <p class="dialog-help">Configure the Slack channel connector for this agent system.</p>
+        <label class="checkbox-label"><input id="slackConnectorEnabled" type="checkbox" /> Enable channel connector</label>
+        <label>Channel ID <span class="label-note">Private channel ID, for example C0123456789</span>
+          <input id="slackChannelId" placeholder="C0123456789" autocomplete="off" />
+        </label>
+        <p id="channelSettingsStatus" class="form-error" hidden></p>
+        <menu>
+          <button id="cancelChannelSettingsBtn" type="button">Cancel</button>
+          <button id="saveChannelSettingsBtn" value="submit">Save Channel Settings</button>
         </menu>
       </form>
     </dialog>

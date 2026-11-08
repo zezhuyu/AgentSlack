@@ -1744,6 +1744,7 @@ function openServerDialog() {
   $("serverPathPicker").hidden = false;
   $("serverPath").disabled = false;
   $("serverFormError").hidden = true;
+  $("openChannelSettingsBtn").hidden = true;
   $("serverDialog").showModal();
 }
 
@@ -1762,10 +1763,45 @@ function openServerSettings() {
   $("serverPathLabel").hidden = true;
   $("serverPathPicker").hidden = true;
   $("serverFormError").hidden = true;
+  $("openChannelSettingsBtn").hidden = false;
   updateTunnelSummary();
   updateClaudeMcpSummary();
   updateClaudeTunnelSummary();
   $("serverDialog").showModal();
+}
+
+async function openChannelSettings() {
+  if (!state.activeServerId) return;
+  const status = $("channelSettingsStatus");
+  status.hidden = true;
+  try {
+    const settings = await api("/api/v1/channel-settings");
+    $("slackConnectorEnabled").checked = settings.enabled;
+    $("slackChannelId").value = settings.channel_id || "";
+    $("channelSettingsDialog").showModal();
+  } catch (error) {
+    status.textContent = error.message;
+    status.hidden = false;
+    $("channelSettingsDialog").showModal();
+  }
+}
+
+async function saveChannelSettings() {
+  const status = $("channelSettingsStatus");
+  status.hidden = true;
+  try {
+    await api("/api/v1/channel-settings", {
+      method: "POST",
+      body: JSON.stringify({
+        enabled: $("slackConnectorEnabled").checked,
+        channel_id: $("slackChannelId").value.trim(),
+      }),
+    });
+    $("channelSettingsDialog").close();
+  } catch (error) {
+    status.textContent = error.message;
+    status.hidden = false;
+  }
 }
 
 async function updateClaudeMcpSummary() {
@@ -2337,6 +2373,8 @@ $("newChatBtnHeader").onclick = () => {
 $("addServerBtn").onclick = openServerDialog;
 $("hostSessionsServerBtn").onclick = openHostSessionsServer;
 $("serverSettingsBtn").onclick = openServerSettings;
+$("openChannelSettingsBtn").onclick = openChannelSettings;
+$("cancelChannelSettingsBtn").onclick = () => $("channelSettingsDialog").close();
 $("changePasswordBtn").onclick = async () => {
   const status = $("passwordSettingsStatus");
   try {
@@ -2406,6 +2444,10 @@ $("meetingForm").addEventListener("submit", (event) => {
 $("serverForm").addEventListener("submit", (event) => {
   event.preventDefault();
   submitServer();
+});
+$("channelSettingsForm").addEventListener("submit", (event) => {
+  event.preventDefault();
+  saveChannelSettings();
 });
 $("tunnelForm").addEventListener("submit", (event) => {
   event.preventDefault();

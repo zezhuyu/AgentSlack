@@ -1623,9 +1623,9 @@ dialog {
   border-radius: 16px;
   width: min(640px, calc(100vw - 48px));
   max-width: none;
-  max-height: none;
+  max-height: calc(100vh - 32px);
   padding: 24px;
-  overflow: visible;
+  overflow-y: auto;
   box-sizing: border-box;
   box-shadow: 0 24px 80px rgba(20, 25, 31, 0.24);
 }
@@ -1642,8 +1642,12 @@ dialog form {
   display: flex;
   flex-direction: column;
   gap: 12px;
+  min-height: 0;
   overflow: visible;
 }
+
+#serverDialog, #channelSettingsDialog { overscroll-behavior: contain; }
+#serverDialog form, #channelSettingsDialog form { max-height: calc(100vh - 80px); overflow-y: auto; padding-right: 4px; }
 
 .auth-dialog { width: min(420px, calc(100vw - 32px)); }
 .auth-dialog::backdrop { background: rgba(18, 12, 24, .72); }

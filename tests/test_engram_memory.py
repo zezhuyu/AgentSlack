@@ -15,15 +15,29 @@ class EngramBridgeTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.calls = []
+        cls.initializes = 0
+        cls.valid_sessions = set()
 
         class Handler(BaseHTTPRequestHandler):
             def do_POST(self):
                 length = int(self.headers.get("Content-Length", "0"))
                 payload = json.loads(self.rfile.read(length))
                 EngramBridgeTests.calls.append((payload, self.headers.get("Authorization")))
+                session = None
                 if payload.get("method") == "initialize":
+                    EngramBridgeTests.initializes += 1
+                    session = f"sess-{EngramBridgeTests.initializes}"
+                    EngramBridgeTests.valid_sessions.add(session)
                     body = {"jsonrpc": "2.0", "id": payload["id"], "result": {"protocolVersion": "2025-03-26"}}
                 elif payload.get("method") == "tools/call":
+                    if self.headers.get("Mcp-Session-Id") not in EngramBridgeTests.valid_sessions:
+                        unknown = b'{"error":"Initialize first"}'
+                        self.send_response(400)
+                        self.send_header("Content-Type", "application/json")
+                        self.send_header("Content-Length", str(len(unknown)))
+                        self.end_headers()
+                        self.wfile.write(unknown)
+                        return
                     result = {"written": True, "tool": payload["params"]["name"], "args": payload["params"]["arguments"]}
                     body = {"jsonrpc": "2.0", "id": payload["id"], "result": {"structuredContent": {"result": result}}}
                 else:
@@ -32,6 +46,8 @@ class EngramBridgeTests(unittest.TestCase):
                     return
                 encoded = json.dumps(body).encode()
                 self.send_response(200)
+                if session:
+                    self.send_header("Mcp-Session-Id", session)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(encoded)))
                 self.end_headers()
@@ -87,6 +103,50 @@ class EngramBridgeTests(unittest.TestCase):
                 bridge.write("project", "engram_create", {})
             with self.assertRaises(PermissionError):
                 bridge.call("other", "engram_search", {"query": "secret"})
+        finally:
+            os.environ.pop("TEST_ENGRAM_TOKEN", None)
+
+    def _bridge(self):
+        return EngramMemoryBridge(self.endpoint, {"project": {
+            "tokenEnv": "TEST_ENGRAM_TOKEN", "allowWrites": True,
+            "scope": {"type": "workspace", "workspaceId": "fixed-workspace"}, "collectionId": "fixed-collection",
+        }})
+
+    def test_session_is_reused_and_recovered_after_the_server_forgets_it(self):
+        bridge = self._bridge()
+        os.environ["TEST_ENGRAM_TOKEN"] = "t" * 40
+        try:
+            before = type(self).initializes
+            bridge.call("project", "engram_search", {"query": "a"})
+            bridge.call("project", "engram_search", {"query": "b"})
+            self.assertEqual(type(self).initializes - before, 1, "the second call reuses the session")
+            type(self).valid_sessions.clear()  # the server restarted and forgot every session
+            result = bridge.call("project", "engram_search", {"query": "c"})
+            self.assertTrue(result["written"])
+            self.assertEqual(type(self).initializes - before, 2, "a fresh handshake after the server forgot the session")
+        finally:
+            os.environ.pop("TEST_ENGRAM_TOKEN", None)
+
+    def test_search_is_forced_to_the_configured_scope(self):
+        bridge = self._bridge()
+        os.environ["TEST_ENGRAM_TOKEN"] = "t" * 40
+        try:
+            found = bridge.call("project", "engram_search", {"query": "x", "scopes": [{"type": "workspace", "workspaceId": "someone-else"}]})
+        finally:
+            os.environ.pop("TEST_ENGRAM_TOKEN", None)
+        self.assertEqual(found["args"]["scopes"], [{"type": "workspace", "workspaceId": "fixed-workspace", "collectionId": "fixed-collection"}])
+
+    def test_oversized_write_body_is_refused_before_any_request(self):
+        bridge = EngramMemoryBridge(self.endpoint, {"project": {
+            "tokenEnv": "TEST_ENGRAM_TOKEN", "allowWrites": True,
+            "scope": {"type": "workspace", "workspaceId": "fixed-workspace"},
+        }})
+        os.environ["TEST_ENGRAM_TOKEN"] = "t" * 40
+        before = len(self.calls)
+        try:
+            with self.assertRaises(ValueError):
+                bridge.write("project", "engram_create", {"kind": "note", "title": "t", "body": "x" * (EngramMemoryBridge.MAX_WRITE_BODY_BYTES + 1), "idempotencyKey": "k"})
+            self.assertEqual(len(self.calls), before)
         finally:
             os.environ.pop("TEST_ENGRAM_TOKEN", None)
 

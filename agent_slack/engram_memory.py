@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 import urllib.error
 import urllib.request
 from typing import Any
@@ -19,13 +20,22 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
+class _SessionError(RuntimeError):
+    """The server no longer knows this MCP session (or rejected the request shape); a fresh handshake may succeed."""
+
+
 class EngramMemoryBridge:
     MAX_RESPONSE_BYTES = 1_000_000
+    # Engram echoes the stored document in its create/patch response, so a body near the response cap would be committed but reported as a failure.
+    MAX_WRITE_BODY_BYTES = 200_000
 
     def __init__(self, endpoint: str | None, workspaces: dict[str, Any], timeout: float = 10.0):
         self.endpoint = endpoint.rstrip("/") if endpoint else None
         self.workspaces = workspaces
         self.timeout = timeout
+        # One MCP session per credential: a call then costs one HTTP request instead of three, which matters against Engram's per-credential request limit.
+        self._sessions: dict[str, str] = {}
+        self._session_lock = threading.Lock()
         if self.endpoint:
             parsed = urlparse(self.endpoint)
             if parsed.scheme != "https" and parsed.hostname not in ("127.0.0.1", "localhost", "::1"):
@@ -76,6 +86,8 @@ class EngramMemoryBridge:
         except urllib.error.HTTPError as exc:
             if exc.code in (301, 302, 303, 307, 308):
                 raise RuntimeError("Engram MCP redirects are refused to protect the bearer credential") from None
+            if exc.code in (400, 404, 410):
+                raise _SessionError(f"Engram MCP returned HTTP {exc.code}") from None
             raise RuntimeError(f"Engram MCP returned HTTP {exc.code}") from None
         except (urllib.error.URLError, TimeoutError) as exc:
             raise RuntimeError("Engram MCP is unavailable; retry with the same idempotency key for writes") from exc
@@ -91,17 +103,41 @@ class EngramMemoryBridge:
         else:
             result = json.loads(data)
         if not isinstance(result, dict) or "error" in result:
-            raise RuntimeError("Engram MCP returned an invalid or failed protocol response")
+            raise _SessionError("Engram MCP returned an invalid or failed protocol response")
         return result, session_id
 
     def call(self, workspace_key: str, tool: str, arguments: dict[str, Any]) -> Any:
-        _config, token = self._config(workspace_key)
+        config, token = self._config(workspace_key)
+        if tool == "engram_search":
+            # Search is limited to the configured workspace (and collection) here, not only by the credential's access rules.
+            scope = dict(config["scope"])
+            if config.get("collectionId"):
+                scope["collectionId"] = config["collectionId"]
+            arguments = {**arguments, "scopes": [scope]}
+        with self._session_lock:
+            session_id = self._sessions.get(token)
+        if session_id:
+            try:
+                return self._invoke(token, session_id, tool, arguments)
+            except _SessionError:
+                # The server restarted or forgot the session: forget it and handshake again (writes carry an idempotency key, so a repeat is safe).
+                with self._session_lock:
+                    self._sessions.pop(token, None)
+        return self._invoke(token, self._open_session(token), tool, arguments)
+
+    def _open_session(self, token: str) -> str | None:
         init, session_id = self._post(token, {"jsonrpc": "2.0", "id": 1, "method": "initialize",
             "params": {"protocolVersion": "2025-03-26", "capabilities": {},
                         "clientInfo": {"name": "agent-slack", "version": "1"}}})
         if not isinstance(init.get("result"), dict) or not init["result"].get("protocolVersion"):
             raise RuntimeError("Engram MCP initialization failed")
         self._post(token, {"jsonrpc": "2.0", "method": "notifications/initialized"}, session_id)
+        if session_id:
+            with self._session_lock:
+                self._sessions[token] = session_id
+        return session_id
+
+    def _invoke(self, token: str, session_id: str | None, tool: str, arguments: dict[str, Any]) -> Any:
         response, _ = self._post(token, {"jsonrpc": "2.0", "id": 2, "method": "tools/call",
                                          "params": {"name": tool, "arguments": arguments}}, session_id)
         result = response.get("result")
@@ -121,6 +157,9 @@ class EngramMemoryBridge:
         config, _token = self._config(workspace_key)
         if config.get("allowWrites") is not True:
             raise PermissionError("Engram writes are disabled for this Agent Slack workspace")
+        body = arguments.get("body")
+        if isinstance(body, str) and len(body.encode("utf-8")) > self.MAX_WRITE_BODY_BYTES:
+            raise ValueError(f"Memory body exceeds the {self.MAX_WRITE_BODY_BYTES}-byte limit for Agent Slack writes")
         if tool == "engram_create":
             scope = dict(config["scope"])
             if config.get("collectionId"):

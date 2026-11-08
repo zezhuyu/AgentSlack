@@ -21,6 +21,8 @@ from .host_sessions import get_host_session, list_host_sessions, resume_host_ses
 
 
 API_VERSION = "1"
+# A JSON-RPC request for the MCP endpoint is a few kilobytes; a memory write is at most 200 KB plus overhead.
+MAX_MCP_BODY_BYTES = 5_000_000
 
 # mimetypes.guess_type() doesn't know these on many platforms (notably .glb/.gltf,
 # never registered in the stdlib db) - without this fallback, _serve_file() sends
@@ -164,6 +166,30 @@ def _openapi_document() -> dict:
     }
 
 
+def _project_manifest_path(project_root: Path) -> Path:
+    return next(
+        (project_root / name for name in (".agent-slack.json", "agent-slack.json") if (project_root / name).is_file()),
+        project_root / ".agent-slack.json",
+    )
+
+
+def _read_project_manifest(project_root: Path) -> dict:
+    path = _project_manifest_path(project_root)
+    if not path.exists():
+        return {"schema_version": 2}
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError("manifest root must be an object")
+    return payload
+
+
+def _write_project_manifest(project_root: Path, payload: dict) -> None:
+    path = _project_manifest_path(project_root)
+    temporary = path.with_name(f".{path.name}.tmp")
+    temporary.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    temporary.replace(path)
+
+
 def _versioned_path(path: str) -> str:
     if path == "/api/v1":
         return "/api"
@@ -291,6 +317,14 @@ class _Handler(BaseHTTPRequestHandler):
             return self._json({"error": str(exc).strip("'")}, status=404)
         except (LookupError, ValueError) as exc:
             return self._json({"error": str(exc)}, status=409)
+        if path == "/api/channel-settings":
+            try:
+                manifest = _read_project_manifest(app.project_root)
+            except (OSError, json.JSONDecodeError, ValueError) as exc:
+                return self._json({"error": f"Could not read agent system settings: {exc}"}, status=500)
+            connectors = manifest.get("connectors", {})
+            slack = connectors.get("slack", {}) if isinstance(connectors, dict) else {}
+            return self._json({"enabled": bool(slack.get("enabled", True)), "channel_id": str(slack.get("channel_id") or "")})
         if path == "/api/agents":
             return self._json({"agents": app.list_agents()})
         if path == "/api/chats":
@@ -363,7 +397,17 @@ class _Handler(BaseHTTPRequestHandler):
             return self._json({"error": "Authentication required", "code": "authentication_required"}, status=401)
         if path == "/mcp":
             try:
+                declared = int(self.headers.get("Content-Length", "0") or 0)
+            except ValueError:
+                declared = 0
+            if declared > MAX_MCP_BODY_BYTES:
+                self.close_connection = True  # the oversized body is never read
+                return self._json({"jsonrpc": "2.0", "id": None, "error": {"code": -32600, "message": "Request too large"}}, status=413)
+            try:
                 request = self._read_json_body()
+                if not request and declared > 0:
+                    # `_read_json_body` turns an unparseable body into {}, which would look like a notification and get a silent 202.
+                    return self._json({"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "Parse error"}}, status=400)
                 response = handle_jsonrpc(AgentSlackMCP(self.manager), request)
             except Exception as exc:
                 response = {"jsonrpc": "2.0", "id": request.get("id") if isinstance(request, dict) else None,
@@ -416,6 +460,24 @@ class _Handler(BaseHTTPRequestHandler):
             return self._json({"error": str(exc).strip("'")}, status=404)
         except (LookupError, ValueError) as exc:
             return self._json({"error": str(exc)}, status=409)
+        if path == "/api/channel-settings":
+            settings = self._read_json_body()
+            enabled = settings.get("enabled")
+            channel_id = str(settings.get("channel_id") or "").strip()
+            if not isinstance(enabled, bool):
+                return self._json({"error": "enabled must be a boolean"}, status=400)
+            if enabled and not re.fullmatch(r"[CG][A-Z0-9]+", channel_id):
+                return self._json({"error": "Enter a valid Slack channel ID, such as C0123456789"}, status=400)
+            try:
+                manifest = _read_project_manifest(app.project_root)
+                connectors = manifest.setdefault("connectors", {})
+                if not isinstance(connectors, dict):
+                    return self._json({"error": "connectors must be an object in the agent system manifest"}, status=400)
+                connectors["slack"] = {"enabled": enabled, "channel_id": channel_id}
+                _write_project_manifest(app.project_root, manifest)
+            except (OSError, json.JSONDecodeError, ValueError) as exc:
+                return self._json({"error": f"Could not save channel settings: {exc}"}, status=500)
+            return self._json({"enabled": enabled, "channel_id": channel_id})
         match = re.fullmatch(r"/api/chats/([^/]+)/ui-actions", path)
         if match:
             if os.getenv("AGENT_SLACK_GENERATIVE_UI", "1").strip().lower() in {"0", "false", "off"}:
