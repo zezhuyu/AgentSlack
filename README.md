@@ -66,6 +66,17 @@ Agent replies use `AGENT_SLACK_CLI=auto` by default, preferring Codex and then C
 
 ## macOS app
 
+### Install a release build
+
+1. Download the latest `Agent Slack` macOS release from
+   [GitHub Releases](https://github.com/zezhuyu/AgentSlack/releases).
+2. Open the downloaded DMG and drag `Agent Slack.app` into `/Applications`.
+3. In Terminal, remove the quarantine attribute so macOS can open the app:
+
+   ```bash
+   sudo xattr -rd com.apple.quarantine "/Applications/Agent Slack.app"
+   ```
+
 ### ChatGPT MCP and Slack connectors
 
 The optional connectors resolve every request through `workspace_key`, then
