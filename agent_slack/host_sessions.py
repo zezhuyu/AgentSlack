@@ -2,14 +2,48 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
+import sys
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 _SUMMARY_CACHE: dict[str, tuple[int, int, dict[str, Any] | None]] = {}
+_RESUME_LOCK = threading.Lock()
+_RESUMES: dict[str, dict[str, str]] = {}
+
+
+def _claude_background_conflict(result: subprocess.CompletedProcess[str]) -> bool:
+    candidates = [result.stderr or "", result.stdout or ""]
+    for candidate in tuple(candidates):
+        try:
+            payload = json.loads(candidate)
+        except ValueError:
+            continue
+        if isinstance(payload, dict):
+            candidates.extend(str(payload[key]) for key in ("error", "message") if payload.get(key))
+    return any(re.search(r"session\s+is\s+running\s+in\s+the\s+background", value, re.IGNORECASE)
+               for value in candidates)
+
+
+def _codex_active_writer_conflict(result: subprocess.CompletedProcess[str]) -> bool:
+    output = f"{result.stderr or ''}\n{result.stdout or ''}"
+    return "already has an active writer" in output.lower()
+
+
+def _codex_fork_session_id(output: str) -> str:
+    for line in output.splitlines():
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(event, dict) and event.get("type") == "thread.started" and event.get("thread_id"):
+            return str(event["thread_id"])
+    return ""
 
 
 def _roots() -> tuple[Path, Path]:
@@ -228,15 +262,90 @@ def resume_host_session(session_id: str, body: str) -> dict[str, str]:
         executable = shutil.which(backend)
         if not executable:
             raise ValueError(f"{backend.title()} CLI is not installed or available on PATH")
-        command = ([executable, "--resume", session_id, "--print", "--output-format", "text", body]
-                   if backend == "claude" else
-                   [executable, "exec", "resume", session_id, "--skip-git-repo-check", body])
+        run_cwd = summary["project_root"]
+        run_env = None
+        if backend == "claude":
+            project_root = Path(summary["project_root"])
+            if sys.platform == "darwin" and project_root.parts[:2] == ("/", "Volumes"):
+                # Claude can block in getcwd() when started inside a mounted volume.
+                # Keep the CLI process on the local disk while granting access to
+                # the original project and loading its CLAUDE.md instructions.
+                run_cwd = str(Path.home())
+                run_env = os.environ.copy()
+                run_env["CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD"] = "1"
+                command = [executable, "--add-dir", str(project_root), "--resume", session_id,
+                           "--print", "--output-format", "json", body]
+            else:
+                command = [executable, "--resume", session_id, "--print", "--output-format", "json", body]
+        else:
+            command = [executable, "exec", "resume", session_id, "--skip-git-repo-check", body]
         try:
-            result = subprocess.run(command, cwd=summary["project_root"], text=True, capture_output=True,
+            result = subprocess.run(command, cwd=run_cwd, env=run_env, text=True, capture_output=True,
                                     timeout=600, check=False)
         except (OSError, subprocess.TimeoutExpired) as exc:
             raise ValueError(str(exc)) from exc
+        if result.returncode != 0 and backend == "claude" and _claude_background_conflict(result):
+            # A Claude background agent owns the live session. Forking lets the
+            # user continue with the same Claude context without stopping it.
+            command.insert(command.index("--print"), "--fork-session")
+            try:
+                result = subprocess.run(command, cwd=run_cwd, env=run_env, text=True, capture_output=True,
+                                        timeout=600, check=False)
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                raise ValueError(str(exc)) from exc
+        resumed_id = session_id
+        if result.returncode != 0 and backend == "codex" and _codex_active_writer_conflict(result):
+            # The Codex app may still own the source thread's writer lock. Forking
+            # reads its history without competing for that lock and continues in
+            # a new thread that Agent Slack can safely reopen.
+            command = [executable, "exec", "fork", session_id, "--skip-git-repo-check", "--json", body]
+            try:
+                result = subprocess.run(command, cwd=run_cwd, env=run_env, text=True, capture_output=True,
+                                        timeout=600, check=False)
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                raise ValueError(str(exc)) from exc
+            if result.returncode == 0:
+                resumed_id = _codex_fork_session_id(result.stdout)
+                if not resumed_id:
+                    raise ValueError("Codex fork completed but did not return the new session ID")
         if result.returncode != 0:
             raise ValueError(result.stderr.strip() or f"{backend.title()} session resume failed")
-        return {"reply": result.stdout.strip(), "session_id": session_id}
+        reply = result.stdout.strip()
+        if backend == "claude":
+            try:
+                response = json.loads(reply)
+            except ValueError:
+                response = None
+            if isinstance(response, dict):
+                reply = str(response.get("result") or reply)
+                resumed_id = str(response.get("session_id") or session_id)
+        return {"reply": reply, "session_id": resumed_id}
     raise KeyError(f"Host session not found: {session_id}")
+
+
+def start_host_session_resume(session_id: str, body: str) -> dict[str, str]:
+    """Start a native CLI resume without holding the HTTP request open."""
+    if not body.strip():
+        raise ValueError("A message is required")
+    with _RESUME_LOCK:
+        current = _RESUMES.get(session_id)
+        if current and current["status"] == "running":
+            raise ValueError("A resume is already running for this session")
+        _RESUMES[session_id] = {"status": "running"}
+
+    def run() -> None:
+        try:
+            result = resume_host_session(session_id, body)
+            state = {"status": "completed", **result}
+        except Exception as exc:  # surfaced to the browser by polling the job
+            state = {"status": "failed", "error": str(exc)}
+        with _RESUME_LOCK:
+            _RESUMES[session_id] = state
+
+    threading.Thread(target=run, name=f"host-session-resume-{session_id[:8]}", daemon=True).start()
+    return {"status": "running", "session_id": session_id}
+
+
+def host_session_resume_status(session_id: str) -> dict[str, str]:
+    with _RESUME_LOCK:
+        return dict(_RESUMES.get(session_id) or {"status": "unknown"})

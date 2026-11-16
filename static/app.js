@@ -355,6 +355,24 @@ async function openHostSession(sessionId) {
   }
 }
 
+function appendHostSessionPrompt(body) {
+  const row = document.createElement("article");
+  row.className = "message user";
+  row.innerHTML = `<div class="message-avatar">${initials("You")}</div><div class="message-body"><header><strong>You</strong></header><div class="message-content">${renderMarkdown(body)}</div></div>`;
+  $("messages").appendChild(row);
+  $("messages").scrollTop = $("messages").scrollHeight;
+}
+
+async function waitForHostSessionResume(sessionId) {
+  while (true) {
+    await new Promise((resolve) => setTimeout(resolve, 1200));
+    const status = await api(`/api/host-sessions/${encodeURIComponent(sessionId)}/resume`);
+    if (status.status === "completed") return status;
+    if (status.status === "failed") throw new Error(status.error || "Native session resume failed");
+    if (status.status !== "running") throw new Error("Native session resume status was lost");
+  }
+}
+
 function setWorkspaceAvailable(available) {
   ["serverSettingsBtn", "newChatBtnHeader", "refreshAgentsBtn", "runAgentsBtn", "autoMeetingBtn", "manualMeetingBtn", "sendBtn"]
     .forEach((id) => { $(id).disabled = !available; });
@@ -1998,7 +2016,7 @@ async function attachPathToComposer(rawPath) {
 const SLASH_PATH_COMMAND = /^\/path\s+(.+)$/;
 
 async function sendMessage() {
-  if (!state.currentChatId || state.runInProgress) return;
+  if (!state.currentChatId) return;
   const body = $("messageInput").value.trim();
   if (!body) return;
   const pathCommand = body.match(SLASH_PATH_COMMAND);
@@ -2007,15 +2025,24 @@ async function sendMessage() {
       alert("Attachments are not available when continuing a native host session.");
       return;
     }
+    const sessionId = state.hostSessionId;
     $("sendBtn").disabled = true;
-    $("sendBtn").textContent = "Resuming...";
+    $("sendBtn").textContent = "Sending...";
+    appendHostSessionPrompt(body);
     try {
-      await api(`/api/host-sessions/${encodeURIComponent(state.hostSessionId)}/resume`, {
+      $("messageInput").value = "";
+      await api(`/api/host-sessions/${encodeURIComponent(sessionId)}/resume`, {
         method: "POST", body: JSON.stringify({ body }),
       });
-      $("messageInput").value = "";
-      await openHostSession(state.hostSessionId);
+      $("sendBtn").textContent = "Working...";
+      const resumed = await waitForHostSessionResume(sessionId);
+      if (resumed.session_id && resumed.session_id !== state.hostSessionId) {
+        state.hostSessionId = resumed.session_id;
+        await loadAllSessions();
+      }
+      await openHostSession(resumed.session_id || state.hostSessionId);
     } catch (error) {
+      $("messageInput").value = body;
       alert(`Unable to continue native session: ${error.message}`);
     } finally {
       $("sendBtn").disabled = false;
@@ -2023,6 +2050,7 @@ async function sendMessage() {
     }
     return;
   }
+  if (state.runInProgress) return;
   if (pathCommand) {
     $("messageInput").value = "";
     await attachPathToComposer(pathCommand[1]);

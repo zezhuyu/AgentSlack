@@ -17,7 +17,9 @@ from .realtime.session import VoiceSession
 from .mcp_server import AgentSlackMCP, handle_jsonrpc
 from .auth import AuthStore
 from .servers import AgentServerManager
-from .host_sessions import get_host_session, list_host_sessions, resume_host_session
+from .host_sessions import (
+    get_host_session, host_session_resume_status, list_host_sessions, start_host_session_resume,
+)
 
 
 API_VERSION = "1"
@@ -301,6 +303,9 @@ class _Handler(BaseHTTPRequestHandler):
             return self._serve_static(parsed.path)
         if path == "/api/host-sessions":
             return self._json({"sessions": list_host_sessions()})
+        match = re.fullmatch(r"/api/host-sessions/([^/]+)/resume", path)
+        if match:
+            return self._json(host_session_resume_status(match.group(1)))
         match = re.fullmatch(r"/api/host-sessions/([^/]+)", path)
         if match:
             session = get_host_session(match.group(1))
@@ -422,7 +427,7 @@ class _Handler(BaseHTTPRequestHandler):
         if match:
             payload = self._read_json_body()
             try:
-                return self._json(resume_host_session(match.group(1), str(payload.get("body") or "")))
+                return self._json(start_host_session_resume(match.group(1), str(payload.get("body") or "")))
             except KeyError as exc:
                 return self._json({"error": str(exc).strip("'")}, status=404)
             except ValueError as exc:
