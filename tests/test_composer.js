@@ -50,11 +50,21 @@ test("mobile layout keeps People and Send available inside the viewport", () => 
   assert.match(html, /id="mobilePeopleBtn"/);
   assert.match(html, /id="mobileSidebarBackdrop"/);
   assert.match(html, /src="\/composer\.js"/);
-  assert.match(styles, /height: 100dvh/);
+  assert.match(styles, /100dvh/);
   assert.match(styles, /safe-area-inset-bottom/);
   assert.match(styles, /\.sidebar-primary\.mobile-open/);
-  assert.match(styles, /\.send-button[\s\S]*?min-height: 44px/);
-  assert.match(styles, /\.composer-actions input[\s\S]*?display: none/);
+  assert.match(styles, /\.send-button\s*\{[^}]*min-height: 40px/);
+  assert.match(html, /id="chatMoreBtn"/);
+  assert.match(html, /id="chatActionsMenu"/);
+  assert.match(styles, /\.chat-actions-menu\.open\s*\{\s*display:\s*flex/);
+});
+
+test("mobile keyboard: fields never trigger iOS zoom and the shell follows the visible viewport", () => {
+  assert.match(styles, /@media \(pointer: coarse\), \(max-width: 900px\)\s*\{[^}]*textarea[^}]*font-size: 16px !important/);
+  assert.match(styles, /\.shell\s*\{[^}]*top: var\(--vv-top, 0px\)[^}]*height: var\(--vvh, 100dvh\)/);
+  assert.match(html, /src="\/mobile\.js"/);
+  assert.match(html, /interactive-widget=resizes-content/);
+  assert.doesNotMatch(appSource, /visual-viewport-height/);
 });
 
 test("active runs and individual agent rows expose stop controls", () => {
@@ -64,7 +74,8 @@ test("active runs and individual agent rows expose stop controls", () => {
   assert.match(appSource, /\/tasks\/\$\{encodeURIComponent\(taskId\)\}\/cancel/);
   assert.match(appSource, /stopCurrentRun/);
   assert.match(appSource, /event\.type === "agent_cancelled"/);
-  assert.match(styles, /:not\(#stopRunBtn\)/);
+  assert.match(html, /id="stopRunBtn"[^>]*hidden/);
+  assert.doesNotMatch(styles, /:not\(#stopRunBtn\)/);
 });
 
 test("navigation stays available while an agent run streams", () => {
@@ -74,11 +85,10 @@ test("navigation stays available while an agent run streams", () => {
   assert.match(appSource, /currentRunChatId/);
 });
 
-test("user messages are aligned on the right", () => {
-  assert.match(styles, /\.message\.user\s*\{[\s\S]*?grid-template-columns:\s*minmax\(0,\s*1fr\)\s+44px/);
-  assert.match(styles, /\.message\.user \.message-avatar\s*\{[\s\S]*?grid-column:\s*2/);
-  assert.match(styles, /\.message\.user \.message-body\s*\{[\s\S]*?justify-self:\s*end/);
-  assert.match(styles, /\.message\.user \.message-body header\s*\{[\s\S]*?justify-content:\s*flex-end/);
+test("messages are left-aligned like Slack, with no right-hand bubbles", () => {
+  assert.doesNotMatch(styles, /\.message\.user\s*\{[\s\S]*?grid-template-columns:\s*minmax\(0,\s*1fr\)\s+44px/);
+  assert.doesNotMatch(styles, /justify-self:\s*end/);
+  assert.match(styles, /\.message\s*\{[^}]*grid-template-columns:\s*36px minmax\(0, 1fr\)/);
 });
 
 test("server logos fit inside the workspace button without cropping", () => {
@@ -111,7 +121,7 @@ test("composer uploads selected files before posting attachment ids", () => {
 
 test("created files and voice input have client actions", () => {
   assert.match(html, /id="voiceBtn"/);
-  assert.match(html, /class="message-input-row"[\s\S]*id="voiceBtn"[\s\S]*id="messageInput"/);
+  assert.match(html, /id="messageInput"[\s\S]*class="composer-toolbar"[\s\S]*id="voiceBtn"[\s\S]*id="sendBtn"/);
   assert.match(appSource, /voice\/turns/);
   assert.match(appSource, /X-Agent-Slack-Voice-Chat/);
   assert.match(appSource, /speech_ready/);

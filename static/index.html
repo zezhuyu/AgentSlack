@@ -2,9 +2,9 @@
 <html lang="en">
   <head>
     <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content" />
     <title>Agent Slack</title>
-    <meta name="theme-color" content="#17212b" />
+    <meta name="theme-color" content="#3f0e40" />
     <link rel="manifest" href="/site.webmanifest" />
     <link rel="apple-touch-icon" sizes="180x180" href="/icons/apple-touch-icon.png" />
     <link rel="icon" type="image/png" href="/logo.png" />
@@ -77,34 +77,42 @@
 
         <section id="agentModePane" class="mode-pane">
           <header class="chat-header">
+            <button id="mobilePeopleBtn" class="mobile-only header-icon-btn" type="button" aria-controls="mobilePeopleDrawer" aria-expanded="false" aria-label="Open conversations" title="Conversations">
+              <svg aria-hidden="true" viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M4 7h16M4 12h16M4 17h16" /></svg>
+            </button>
             <div class="chat-heading">
               <h2 id="chatTitle">Select a chat</h2>
               <p id="chatMembers" class="muted"></p>
             </div>
             <div class="chat-actions">
-              <button id="mobilePeopleBtn" class="mobile-only" type="button" aria-controls="mobilePeopleDrawer" aria-expanded="false">People</button>
-              <button id="runAgentsBtn">Run Members</button>
-              <button id="autoMeetingBtn">Auto Meeting</button>
-              <button id="manualMeetingBtn">Manual Meeting</button>
               <button id="stopRunBtn" class="danger-button" type="button" hidden>Stop Run</button>
-              <button id="deleteChatBtn" class="danger-button" disabled>Delete Chat</button>
-              <button id="chatInfoBtn" class="icon-btn chat-info-btn" type="button" title="Chat information" aria-label="Chat information">&#9432;</button>
+              <div id="chatActionsMenu" class="chat-actions-menu">
+                <button id="runAgentsBtn">Run Members</button>
+                <button id="autoMeetingBtn">Auto Meeting</button>
+                <button id="manualMeetingBtn">Manual Meeting</button>
+                <button id="deleteChatBtn" class="danger-button" disabled>Delete Chat</button>
+              </div>
+              <button id="chatMoreBtn" class="mobile-only header-icon-btn" type="button" aria-controls="chatActionsMenu" aria-expanded="false" aria-label="More actions" title="More actions">
+                <svg aria-hidden="true" viewBox="0 0 24 24" width="22" height="22" fill="currentColor"><circle cx="5" cy="12" r="1.8" /><circle cx="12" cy="12" r="1.8" /><circle cx="19" cy="12" r="1.8" /></svg>
+              </button>
+              <button id="chatInfoBtn" class="header-icon-btn chat-info-btn" type="button" title="Chat information" aria-label="Chat information">&#9432;</button>
             </div>
           </header>
           <section id="messages" class="messages"></section>
           <footer class="composer">
             <div id="pendingAttachments" class="pending-attachments" aria-live="polite"></div>
-            <div class="message-input-row">
-              <button id="voiceBtn" class="voice-button" type="button" title="Start voice input" aria-label="Start voice input">&#127908;</button>
+            <div class="composer-box">
+              <input id="objectiveInput" class="objective-input" placeholder="Objective for the next run or meeting (optional)" hidden />
               <div class="message-input-wrap">
-                <textarea id="messageInput" rows="4" placeholder="Message Agent Slack — use @ to address a person, /path to attach a file"></textarea>
+                <textarea id="messageInput" rows="1" placeholder="Message · @ mention · /path to attach"></textarea>
                 <div id="mentionMenu" class="mention-menu" role="listbox" hidden></div>
               </div>
-              <button id="sendBtn" class="send-button">Send</button>
-            </div>
-            <div class="composer-actions">
-              <span id="voiceStatus" class="voice-status" aria-live="polite" hidden><span class="voice-status-dot"></span><span id="voiceStatusText"></span></span>
-              <input id="objectiveInput" placeholder="Optional objective for next agent run / meeting" />
+              <div class="composer-toolbar">
+                <button id="voiceBtn" class="voice-button" type="button" title="Start voice input" aria-label="Start voice input">&#127908;</button>
+                <button id="objectiveToggleBtn" class="toolbar-btn" type="button" aria-controls="objectiveInput" aria-expanded="false" title="Set an objective for the next run or meeting">Objective</button>
+                <span id="voiceStatus" class="voice-status" aria-live="polite" hidden><span class="voice-status-dot"></span><span id="voiceStatusText"></span></span>
+                <button id="sendBtn" class="send-button">Send</button>
+              </div>
             </div>
           </footer>
         </section>
@@ -113,9 +121,9 @@
           <header class="chat-header">
             <div class="chat-heading">
               <h2>Chat</h2>
-              <p class="muted">Read + search + reason on this workspace — no files are changed and no commands run.</p>
+              <p class="muted">Read, search and reason on this workspace. No files change and no commands run.</p>
             </div>
-            <div class="chat-actions">
+            <div class="chat-actions chat-actions-inline">
               <span id="chatIndexStatus" class="section-meta"></span>
               <button id="chatIndexBuildBtn" type="button">Build Index</button>
               <button id="chatNewSessionBtn" type="button">New Chat</button>
@@ -126,23 +134,23 @@
             <section id="chatModeMessages" class="messages chatmode-messages"></section>
           </div>
           <footer class="composer">
-            <div class="message-input-row">
-              <button id="chatVoiceBtn" class="voice-button" type="button" title="Start voice conversation" aria-label="Start voice conversation">&#127908;</button>
+            <div class="composer-box">
               <div class="message-input-wrap">
-                <textarea id="chatModeInput" rows="3" placeholder="Ask about this workspace… drag a file in, or /path to attach one"></textarea>
+                <textarea id="chatModeInput" rows="1" placeholder="Ask about this workspace · /path to attach"></textarea>
               </div>
-              <button id="chatSendBtn" class="send-button">Send</button>
-            </div>
-            <div class="composer-actions">
-              <span id="chatVoiceStatus" class="voice-status" aria-live="polite" hidden><span class="voice-status-dot"></span><span id="chatVoiceStatusText"></span></span>
-              <button id="chatCancelBtn" class="danger-button" type="button" hidden>Stop</button>
+              <div class="composer-toolbar">
+                <button id="chatVoiceBtn" class="voice-button" type="button" title="Start voice conversation" aria-label="Start voice conversation">&#127908;</button>
+                <span id="chatVoiceStatus" class="voice-status" aria-live="polite" hidden><span class="voice-status-dot"></span><span id="chatVoiceStatusText"></span></span>
+                <button id="chatCancelBtn" class="danger-button toolbar-btn" type="button" hidden>Stop</button>
+                <button id="chatSendBtn" class="send-button">Send</button>
+              </div>
             </div>
           </footer>
         </section>
       </main>
-    </div>
 
-    <button id="mobileSidebarBackdrop" class="mobile-sidebar-backdrop" type="button" aria-label="Close people drawer" hidden></button>
+      <button id="mobileSidebarBackdrop" class="mobile-sidebar-backdrop" type="button" aria-label="Close people drawer" hidden></button>
+    </div>
 
     <dialog id="chatDialog">
       <form method="dialog" id="chatForm">
@@ -305,6 +313,7 @@
     <script src="/markdown.js"></script>
     <script src="/sync.js"></script>
     <script src="/composer.js"></script>
+    <script src="/mobile.js"></script>
     <script src="/mentions.js"></script>
     <script src="/interactions.js"></script>
     <script src="/generative-ui.js"></script>

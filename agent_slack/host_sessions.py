@@ -80,13 +80,31 @@ def _claude_messages(path: Path) -> tuple[list[dict[str, str]], str, str]:
     messages: list[dict[str, str]] = []
     cwd = ""
     title = ""
+    user_body = ""
+    assistant_parts: dict[str, list[str]] = {}
+    assistant_order: list[str] = []
+
+    def finish_turn() -> None:
+        nonlocal user_body, assistant_parts, assistant_order
+        if not user_body:
+            return
+        messages.append({"author_type": "user", "author_label": "You", "body": user_body})
+        if assistant_order:
+            last_id = assistant_order[-1]
+            body = "\n\n".join(assistant_parts[last_id])
+            if body:
+                messages.append({"author_type": "assistant", "author_label": "Claude", "body": body})
+        user_body = ""
+        assistant_parts = {}
+        assistant_order = []
+
     for line in _tail_lines(path):
         try:
             row = json.loads(line)
         except ValueError:
             continue
         cwd = cwd or str(row.get("cwd") or "")
-        if row.get("type") not in {"user", "assistant"} or row.get("isSidechain"):
+        if row.get("type") not in {"user", "assistant"} or row.get("isSidechain") or row.get("isMeta"):
             continue
         message = row.get("message") or {}
         body = _text(message.get("content"))
@@ -95,11 +113,19 @@ def _claude_messages(path: Path) -> tuple[list[dict[str, str]], str, str]:
         role = str(message.get("role") or row.get("type"))
         if role not in {"user", "assistant"}:
             continue
-        title = title or (body.splitlines()[0][:100] if role == "user" else "")
-        if messages and messages[-1]["author_type"] == role:
-            messages[-1]["body"] += "\n\n" + body
-        else:
-            messages.append({"author_type": role, "author_label": "You" if role == "user" else "Claude", "body": body})
+        if role == "user":
+            finish_turn()
+            user_body = body
+            title = title or body.splitlines()[0][:100]
+        elif user_body:
+            message_id = str(message.get("id") or f"__row_{len(assistant_order)}_{len(assistant_parts)}")
+            if message_id not in assistant_parts:
+                assistant_parts[message_id] = []
+            elif message_id in assistant_order:
+                assistant_order.remove(message_id)
+            assistant_order.append(message_id)
+            assistant_parts[message_id].append(body)
+    finish_turn()
     return messages, cwd, title
 
 
@@ -108,6 +134,18 @@ def _codex_messages(path: Path) -> tuple[list[dict[str, str]], str, str, str]:
     cwd = ""
     session_id = path.stem.removeprefix("rollout-")
     title = ""
+    user_body = ""
+    answer = ""
+
+    def finish_turn() -> None:
+        nonlocal user_body, answer
+        if user_body:
+            messages.append({"author_type": "user", "author_label": "You", "body": user_body})
+            if answer:
+                messages.append({"author_type": "assistant", "author_label": "Codex", "body": answer})
+        user_body = ""
+        answer = ""
+
     for line in _tail_lines(path):
         try:
             row = json.loads(line)
@@ -127,11 +165,14 @@ def _codex_messages(path: Path) -> tuple[list[dict[str, str]], str, str, str]:
         body = _text(payload.get("content"))
         if not body:
             continue
-        title = title or (body.splitlines()[0][:100] if role == "user" else "")
-        if messages and messages[-1]["author_type"] == role:
-            messages[-1]["body"] += "\n\n" + body
+        if role == "user":
+            finish_turn()
+            user_body = body
+            title = title or body.splitlines()[0][:100]
         else:
-            messages.append({"author_type": role, "author_label": "You" if role == "user" else "Codex", "body": body})
+            if user_body:
+                answer = body
+    finish_turn()
     return messages, cwd, title, session_id
 
 
@@ -141,7 +182,7 @@ def _summary(path: Path, backend: str) -> dict[str, Any] | None:
         cache_key = str(path)
         cached = _SUMMARY_CACHE.get(cache_key)
         if cached and cached[:2] == (stat.st_mtime_ns, stat.st_size):
-            return cached[2]
+            return dict(cached[2]) if cached[2] is not None else None
         with path.open("rb") as source:
             head = source.read(128 * 1024).decode("utf-8", errors="replace")
             size = source.seek(0, os.SEEK_END)
@@ -210,6 +251,9 @@ def _summary(path: Path, backend: str) -> dict[str, Any] | None:
     except (OSError, ValueError):
         return None
     project = Path(cwd).name if cwd else "Unknown folder"
+    if "/.claude-mem/observer-sessions" in cwd:
+        _SUMMARY_CACHE[cache_key] = (stat.st_mtime_ns, stat.st_size, None)
+        return None
     result = {
         "session_id": session_id,
         "agent_type": backend,
@@ -219,21 +263,35 @@ def _summary(path: Path, backend: str) -> dict[str, Any] | None:
         "last_message_preview": preview,
         "updated_at": updated,
         "available": Path(cwd).is_dir(),
-        "status": "Running" if running else "History",
+        "running_hint": bool(running),
+        "updated_epoch": stat.st_mtime,
     }
     _SUMMARY_CACHE[cache_key] = (stat.st_mtime_ns, stat.st_size, result)
+    return dict(result)
+
+
+def _public_summary(summary: dict[str, Any]) -> dict[str, Any]:
+    """Project cached metadata into a fresh public summary with live status."""
+    result = {key: value for key, value in summary.items() if key not in {"running_hint", "updated_epoch", "status", "resuming"}}
+    with _RESUME_LOCK:
+        resuming = (_RESUMES.get(str(summary["session_id"]) or "") or {}).get("status") == "running"
+    fresh = time.time() - float(summary.get("updated_epoch") or 0) < 15 * 60
+    result["status"] = "Running" if (summary.get("running_hint") and fresh) or resuming else "History"
+    result["resuming"] = resuming
     return result
 
 
 def _session_files() -> list[tuple[Path, str]]:
     claude_root, codex_root = _roots()
-    files = [(path, "claude") for path in claude_root.glob("*/*.jsonl")]
+    files = [(path, "claude") for path in claude_root.glob("*/*.jsonl")
+             if "claude-mem-observer-sessions" not in path.parent.name]
     files.extend((path, "codex") for path in codex_root.glob("*/*/*/*.jsonl"))
     return files
 
 
 def list_host_sessions() -> list[dict[str, Any]]:
-    sessions = [summary for path, backend in _session_files() if (summary := _summary(path, backend))]
+    sessions = [_public_summary(summary) for path, backend in _session_files()
+                if (summary := _summary(path, backend))]
     sessions.sort(key=lambda item: item["updated_at"], reverse=True)
     return sessions
 
@@ -246,7 +304,7 @@ def get_host_session(session_id: str) -> dict[str, Any] | None:
             messages = messages[-200:]
             for message in messages:
                 message["body"] = message["body"][-50_000:]
-            return {**summary, "messages": messages}
+            return {**_public_summary(summary), "messages": messages}
     return None
 
 

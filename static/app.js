@@ -6,6 +6,11 @@ const state = {
   chats: [],
   hostSessions: [],
   hostSessionId: null,
+  hostSessionLastError: new Map(),
+  hostSessionStatus: null,
+  hostMessagesStatus: null,
+  hostResumes: new Map(),
+  hostSessionOpenRequest: 0,
   hostSessionsView: false,
   currentChatId: null,
   currentChatUpdatedAt: null,
@@ -254,8 +259,11 @@ async function loadActiveServer() {
 }
 
 async function openHostSessionsServer() {
+  state.hostSessionOpenRequest += 1;
   state.hostSessionsView = true;
   state.hostSessionId = null;
+  state.hostSessionStatus = null;
+  state.hostMessagesStatus = null;
   state.currentChatId = null;
   renderServers();
   $("workspaceLabel").textContent = "Host Sessions";
@@ -270,6 +278,8 @@ async function openHostSessionsServer() {
   $("deleteChatBtn").disabled = true;
   $("messageInput").disabled = true;
   $("sendBtn").disabled = true;
+  $("sendBtn").textContent = "Send";
+  $("messageInput").placeholder = "Select a host session to continue";
   await loadAllSessions();
   renderUnonboardedHostSessions();
   $("chatTitle").textContent = "Select a host session";
@@ -288,16 +298,20 @@ function renderUnonboardedHostSessions() {
     const button = document.createElement("button");
     button.type = "button";
     button.className = `chat-row ${session.session_id === state.hostSessionId ? "active" : ""}`;
-    button.disabled = !session.available;
-    button.innerHTML = `<strong>${escapeHtml(session.title)}</strong><span>${escapeHtml(session.agent_type)} · ${escapeHtml(session.project_name)}</span><small><span class="host-session-status ${session.status === "Running" ? "is-running" : ""}">${escapeHtml(session.status || "History")}</span> · ${escapeHtml(session.last_message_preview || session.session_id)}</small>`;
-    button.title = `${session.project_name} · ${session.session_id}`;
+    button.classList.toggle("unavailable", !session.available);
+    const isResuming = session.resuming || state.hostResumes.has(session.session_id);
+    const isRunning = session.status === "Running" || isResuming;
+    const statusLabel = isResuming ? "Resuming…" : isRunning ? "Running" : "Idle";
+    button.innerHTML = `<strong>${escapeHtml(session.title)}</strong><span>${escapeHtml(session.agent_type)} · ${escapeHtml(session.project_name)}</span><small><span class="host-session-status ${isRunning ? "is-running" : ""}">${isRunning ? '<i class="host-session-dot" aria-hidden="true"></i>' : ""}${escapeHtml(statusLabel)}</span> · ${escapeHtml(session.last_message_preview || session.session_id)}</small>`;
+    button.title = session.available ? `${session.project_name} · ${session.session_id}` : `${session.project_name} · ${session.session_id} · Folder unavailable; session is read-only`;
     button.onclick = () => openHostSession(session.session_id);
     $("chatList").appendChild(button);
   });
 }
 
 function compareHostSessions(left, right) {
-  const runningOrder = Number(right.status === "Running") - Number(left.status === "Running");
+  const isRunning = (session) => session.status === "Running" || session.resuming || state.hostResumes.has(session.session_id);
+  const runningOrder = Number(isRunning(right)) - Number(isRunning(left));
   if (runningOrder) return runningOrder;
   return String(right.updated_at || "").localeCompare(String(left.updated_at || ""));
 }
@@ -318,26 +332,53 @@ async function loadAllSessions() {
     if (state.hostSessionsView) renderUnonboardedHostSessions();
     if (state.hostSessionId) {
       const activeSession = state.hostSessions.find((session) => session.session_id === state.hostSessionId);
-      if (activeSession) renderHostSessionDetails(activeSession);
+      if (activeSession) {
+        const statusChanged = (state.hostMessagesStatus || "History") !== (activeSession.status || "History");
+        const messagesChanged = state.currentChatUpdatedAt !== (activeSession.updated_at || null);
+        renderHostSessionDetails(activeSession);
+        syncHostComposer(activeSession);
+        if ((messagesChanged || statusChanged) && !(document.activeElement === $("messageInput") && $("messageInput").value)) {
+          await openHostSession(activeSession.session_id, { preserveScroll: true });
+        }
+      }
     }
   } catch (error) { console.warn("Unable to load all sessions", error); }
 }
 
 function renderHostSessionDetails(session) {
-  const status = session.status || "History";
+  const isResuming = session.resuming || state.hostResumes.has(session.session_id);
+  const status = isResuming ? "Resuming…" : session.status === "Running" ? "Running" : "Idle";
+  state.hostSessionStatus = session.status || "History";
   $("chatMembers").textContent = `${status} · ${session.project_name} · ${session.agent_type} · ${session.session_id}`;
 }
 
-async function openHostSession(sessionId) {
+function syncHostComposer(session) {
+  const resuming = state.hostResumes.has(session.session_id) || session.resuming;
+  const available = Boolean(session.available);
+  $("messageInput").disabled = !available || Boolean(resuming);
+  $("messageInput").placeholder = !available
+    ? "Folder unavailable; this session is read-only"
+    : resuming ? "Working…" : "Message · @ mention · /path to attach";
+  $("sendBtn").disabled = !available || Boolean(resuming);
+  $("sendBtn").textContent = resuming ? "Working..." : "Send";
+}
+
+async function openHostSession(sessionId, { preserveScroll = false } = {}) {
+  const requestId = ++state.hostSessionOpenRequest;
   try {
     const session = await api(`/api/host-sessions/${encodeURIComponent(sessionId)}`);
+    if (requestId !== state.hostSessionOpenRequest || !state.hostSessionsView) return;
+    const messages = $("messages");
+    const followLatest = messages.scrollHeight - messages.scrollTop - messages.clientHeight < 80;
+    const previousScrollTop = messages.scrollTop;
     state.hostSessionId = session.session_id;
     state.currentChatId = session.session_id;
     state.currentChatUpdatedAt = session.updated_at;
+    state.hostMessagesStatus = session.status || "History";
+    state.hostSessionLastError.delete(sessionId);
     $("deleteChatBtn").disabled = true;
     if (state.hostSessionsView) renderUnonboardedHostSessions();
-    $("messageInput").disabled = !session.available;
-    $("sendBtn").disabled = !session.available;
+    syncHostComposer(session);
     ["runAgentsBtn", "autoMeetingBtn", "manualMeetingBtn"].forEach((id) => { $(id).disabled = true; });
     $("chatTitle").textContent = session.title;
     renderHostSessionDetails(session);
@@ -349,9 +390,25 @@ async function openHostSession(sessionId) {
       row.innerHTML = `<div class="message-avatar">${initials(message.author_label)}</div><div class="message-body"><header><strong>${escapeHtml(message.author_label)}</strong></header><div class="message-content">${renderMarkdown(message.body)}</div></div>`;
       $("messages").appendChild(row);
     });
-    $("messages").scrollTop = $("messages").scrollHeight;
+    messages.scrollTop = preserveScroll && !followLatest ? previousScrollTop : messages.scrollHeight;
   } catch (error) {
-    alert(`Unable to load host session: ${error.message}`);
+    if (requestId !== state.hostSessionOpenRequest || !state.hostSessionsView) return;
+    const message = error.message || "The session could not be loaded.";
+    if (state.hostSessionLastError.get(sessionId) !== message) {
+      state.hostSessionLastError.set(sessionId, message);
+      const messages = $("messages");
+      let row = [...messages.querySelectorAll("[data-host-session-error]")]
+        .find((item) => item.dataset.hostSessionError === sessionId);
+      if (!row) {
+        row = document.createElement("article");
+        row.className = "message host-session-error";
+        row.dataset.hostSessionError = sessionId;
+        row.setAttribute("role", "status");
+        messages.appendChild(row);
+      }
+      row.textContent = `Unable to load host session: ${message}`;
+    }
+    console.warn("Unable to load host session", sessionId, error);
   }
 }
 
@@ -370,6 +427,37 @@ async function waitForHostSessionResume(sessionId) {
     if (status.status === "completed") return status;
     if (status.status === "failed") throw new Error(status.error || "Native session resume failed");
     if (status.status !== "running") throw new Error("Native session resume status was lost");
+  }
+}
+
+async function resumeHostSessionInBackground(sessionId, body) {
+  try {
+    await api(`/api/host-sessions/${encodeURIComponent(sessionId)}/resume`, {
+      method: "POST", body: JSON.stringify({ body }),
+    });
+    const resumed = await waitForHostSessionResume(sessionId);
+    await loadAllSessions();
+    const returnedId = resumed.session_id || sessionId;
+    if (state.hostSessionId === sessionId || state.hostSessionId === returnedId) {
+      state.hostSessionId = returnedId;
+      await openHostSession(returnedId, { preserveScroll: true });
+    }
+  } catch (error) {
+    if (state.hostSessionId === sessionId) {
+      const row = document.createElement("article");
+      row.className = "message host-session-error";
+      row.setAttribute("role", "status");
+      row.textContent = `Unable to continue native session: ${error.message}`;
+      $("messages").appendChild(row);
+      $("messageInput").value = body;
+      $("messages").scrollTop = $("messages").scrollHeight;
+    }
+  } finally {
+    state.hostResumes.delete(sessionId);
+    if (state.hostSessionsView) renderUnonboardedHostSessions();
+    await loadAllSessions();
+    const session = state.hostSessions.find((item) => item.session_id === state.hostSessionId);
+    if (session) syncHostComposer(session);
   }
 }
 
@@ -2026,28 +2114,15 @@ async function sendMessage() {
       return;
     }
     const sessionId = state.hostSessionId;
-    $("sendBtn").disabled = true;
-    $("sendBtn").textContent = "Sending...";
+    const session = state.hostSessions.find((item) => item.session_id === sessionId);
+    if (!session?.available || state.hostResumes.has(sessionId) || session.resuming) return;
     appendHostSessionPrompt(body);
-    try {
-      $("messageInput").value = "";
-      await api(`/api/host-sessions/${encodeURIComponent(sessionId)}/resume`, {
-        method: "POST", body: JSON.stringify({ body }),
-      });
-      $("sendBtn").textContent = "Working...";
-      const resumed = await waitForHostSessionResume(sessionId);
-      if (resumed.session_id && resumed.session_id !== state.hostSessionId) {
-        state.hostSessionId = resumed.session_id;
-        await loadAllSessions();
-      }
-      await openHostSession(resumed.session_id || state.hostSessionId);
-    } catch (error) {
-      $("messageInput").value = body;
-      alert(`Unable to continue native session: ${error.message}`);
-    } finally {
-      $("sendBtn").disabled = false;
-      $("sendBtn").textContent = "Send";
-    }
+    $("messageInput").value = "";
+    state.hostResumes.set(sessionId, true);
+    renderUnonboardedHostSessions();
+    renderHostSessionDetails(session);
+    syncHostComposer(session);
+    void resumeHostSessionInBackground(sessionId, body);
     return;
   }
   if (state.runInProgress) return;
@@ -2515,7 +2590,7 @@ window.addEventListener("resize", () => {
 window.setInterval(syncChatState, 2000);
 window.setInterval(() => {
   if (state.hostSessionsView && !document.hidden) loadAllSessions();
-}, 15000);
+}, 5000);
 
 initializeAuth().then((ready) => ready && loadServers().then(loadActiveServer)).catch((error) => {
   console.error(error);
