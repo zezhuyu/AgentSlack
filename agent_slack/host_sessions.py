@@ -381,7 +381,7 @@ def resume_host_session(session_id: str, body: str) -> dict[str, str]:
     raise KeyError(f"Host session not found: {session_id}")
 
 
-def start_host_session_resume(session_id: str, body: str) -> dict[str, str]:
+def start_host_session_resume(session_id: str, body: str, on_finished=None) -> dict[str, str]:
     """Start a native CLI resume without holding the HTTP request open."""
     if not body.strip():
         raise ValueError("A message is required")
@@ -399,6 +399,11 @@ def start_host_session_resume(session_id: str, body: str) -> dict[str, str]:
             state = {"status": "failed", "error": str(exc)}
         with _RESUME_LOCK:
             _RESUMES[session_id] = state
+        if on_finished:
+            try:
+                on_finished(state)
+            except Exception:
+                pass
 
     threading.Thread(target=run, name=f"host-session-resume-{session_id[:8]}", daemon=True).start()
     return {"status": "running", "session_id": session_id}

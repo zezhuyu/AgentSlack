@@ -20,6 +20,7 @@ from .servers import AgentServerManager
 from .host_sessions import (
     get_host_session, host_session_resume_status, list_host_sessions, start_host_session_resume,
 )
+from . import push as web_push
 
 
 API_VERSION = "1"
@@ -200,14 +201,51 @@ def _versioned_path(path: str) -> str:
     return path
 
 
+def _base_path() -> str:
+    configured = os.getenv("AGENT_SLACK_BASE_PATH", "/agent_slack").strip()
+    if not configured:
+        return ""
+    normalized = configured.strip("/")
+    return "/" + normalized if normalized else ""
+
+
+def _safe_forwarded_prefix(value: str) -> str | None:
+    value = value.strip()
+    if not re.fullmatch(r"/[A-Za-z0-9._~/-]*", value) or ".." in value or "//" in value:
+        return None
+    return value.rstrip("/") or "/"
+
+
 class _Handler(BaseHTTPRequestHandler):
     manager: AgentServerManager
     auth: AuthStore
     desktop_secret: str | None = None
 
-    def do_GET(self) -> None:  # noqa: N802
+    def _prepare_path(self):
         parsed = urlparse(self.path)
-        path = _versioned_path(parsed.path)
+        prefix = _base_path()
+        self._request_had_base_path = bool(prefix and (parsed.path == prefix or parsed.path.startswith(prefix + "/")))
+        self._cookie_path = prefix if self._request_had_base_path else (
+            _safe_forwarded_prefix(self.headers.get("X-Forwarded-Prefix", "")) or "/"
+        )
+        if self._request_had_base_path and parsed.path == prefix:
+            self.send_response(HTTPStatus.PERMANENT_REDIRECT)
+            self.send_header("Location", prefix + "/" + ("?" + parsed.query if parsed.query else ""))
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return None, None
+        path = parsed.path[len(prefix):] if self._request_had_base_path else parsed.path
+        return parsed, path
+
+    def _session_cookie(self, token: str, max_age: int) -> str:
+        secure = "; Secure" if self.headers.get("X-Forwarded-Proto", "").lower() == "https" else ""
+        return f"agent_slack_session={token}; HttpOnly; SameSite=Strict; Path={self._cookie_path}; Max-Age={max_age}{secure}"
+
+    def do_GET(self) -> None:  # noqa: N802
+        parsed, path = self._prepare_path()
+        if parsed is None:
+            return
+        path = _versioned_path(path)
         if path == "/api/auth/verify":
             if not self._request_authorized():
                 return self._json({"error": "Authentication required"}, status=401)
@@ -219,6 +257,8 @@ class _Handler(BaseHTTPRequestHandler):
             return self._json(result)
         if path.startswith("/api/") and not path.startswith("/api/auth/") and not self._request_authorized():
             return self._json({"error": "Authentication required", "code": "authentication_required"}, status=401)
+        if path == "/api/push/config":
+            return self._json(web_push.config(self.manager.data_root))
         if path == "/mcp":
             # MCP is stateless Streamable HTTP here and accepts JSON-RPC over
             # POST. Do not let discovery receive the web UI with a 200 response.
@@ -300,7 +340,7 @@ class _Handler(BaseHTTPRequestHandler):
                 return self._json({"error": "file not found"}, status=404)
             return self._serve_file(file_path, filename=file_path.name, inline=True)
         if not path.startswith("/api/"):
-            return self._serve_static(parsed.path)
+            return self._serve_static(path)
         if path == "/api/host-sessions":
             return self._json({"sessions": list_host_sessions()})
         match = re.fullmatch(r"/api/host-sessions/([^/]+)/resume", path)
@@ -355,11 +395,13 @@ class _Handler(BaseHTTPRequestHandler):
             if chat is None:
                 return self._json({"error": "chat not found"}, status=404)
             return self._json(chat)
-        return self._serve_static(parsed.path)
+        return self._serve_static(path)
 
     def do_POST(self) -> None:  # noqa: N802
-        parsed = urlparse(self.path)
-        path = _versioned_path(parsed.path)
+        parsed, path = self._prepare_path()
+        if parsed is None:
+            return
+        path = _versioned_path(path)
         if path == "/api/auth/setup":
             payload = self._read_json_body()
             if not self._is_desktop_request():
@@ -378,11 +420,11 @@ class _Handler(BaseHTTPRequestHandler):
                 return self._json({"error": str(exc)}, status=401)
             if is_device:
                 return self._json({"token": token, "device": True})
-            return self._json({"ok": True}, headers={"Set-Cookie": f"agent_slack_session={token}; HttpOnly; SameSite=Strict; Path=/; Max-Age=1209600"})
+            return self._json({"ok": True}, headers={"Set-Cookie": self._session_cookie(token, 1209600)})
         if path == "/api/auth/logout":
             cookie = self._cookie_token()
             self.auth.sessions.pop(cookie or "", None)
-            return self._json({"ok": True}, headers={"Set-Cookie": "agent_slack_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0"})
+            return self._json({"ok": True}, headers={"Set-Cookie": self._session_cookie("", 0)})
         if path == "/api/auth/password":
             if not self._request_authorized():
                 return self._json({"error": "Authentication required"}, status=401)
@@ -400,6 +442,41 @@ class _Handler(BaseHTTPRequestHandler):
             return self._json({"revoked": self.auth.revoke_devices()})
         if path.startswith("/api/") and not path.startswith("/api/auth/") and not self._request_authorized():
             return self._json({"error": "Authentication required", "code": "authentication_required"}, status=401)
+        if path in {"/api/push/subscribe", "/api/push/unsubscribe", "/api/push/test"}:
+            try:
+                push_body_length = int(self.headers.get("Content-Length", "0") or 0)
+            except ValueError:
+                return self._json({"error": "Invalid Content-Length"}, status=400)
+            if push_body_length > 16_384:
+                self.close_connection = True
+                return self._json({"error": "Push request exceeds 16 KB"}, status=413)
+            payload = self._read_json_body()
+            if not isinstance(payload, dict):
+                return self._json({"error": "Push request must be a JSON object"}, status=400)
+            try:
+                if path == "/api/push/subscribe":
+                    request_origin = self.headers.get("Origin", "")
+                    forwarded_host = self.headers.get("X-Forwarded-Host", "").split(",", 1)[0].strip()
+                    forwarded_proto = self.headers.get("X-Forwarded-Proto", "").split(",", 1)[0].strip()
+                    host = forwarded_host or self.headers.get("Host", "")
+                    proto = forwarded_proto or (urlparse(request_origin).scheme if request_origin else "http")
+                    # Browsers always send Origin on a same-origin POST; proxies (Caddy) rewrite Host and
+                    # X-Forwarded-Proto, so prefer Origin and fall back to the forwarded headers.
+                    origin = request_origin or (f"{proto}://{host}" if host else "")
+                    result = web_push.subscribe(
+                        self.manager.data_root, payload.get("subscription"), str(payload.get("base_url") or ""),
+                        origin, str(payload.get("label") or ""), self.headers.get("User-Agent", ""),
+                    )
+                elif path == "/api/push/unsubscribe":
+                    result = web_push.unsubscribe(self.manager.data_root, str(payload.get("endpoint") or ""))
+                else:
+                    web_push.send_test(self.manager.data_root)
+                    result = {"ok": True}
+                return self._json(result)
+            except ValueError as exc:
+                return self._json({"error": str(exc)}, status=400)
+            except RuntimeError as exc:
+                return self._json({"error": str(exc)}, status=503)
         if path == "/mcp":
             try:
                 declared = int(self.headers.get("Content-Length", "0") or 0)
@@ -427,7 +504,18 @@ class _Handler(BaseHTTPRequestHandler):
         if match:
             payload = self._read_json_body()
             try:
-                return self._json(start_host_session_resume(match.group(1), str(payload.get("body") or "")))
+                session_id = match.group(1)
+                session = get_host_session(session_id) or {}
+                def push_resume_finished(result):
+                    from .push import notify_run_finished
+                    failed = result.get("status") == "failed"
+                    notify_run_finished(
+                        self.manager.data_root,
+                        title=str(session.get("title") or session.get("backend") or "Host session"),
+                        body=(f"Run failed: {result.get('error') or 'Host session resume failed'}" if failed else str(result.get("reply") or "Host session resumed")),
+                        failed=failed,
+                    )
+                return self._json(start_host_session_resume(session_id, str(payload.get("body") or ""), push_resume_finished))
             except KeyError as exc:
                 return self._json({"error": str(exc).strip("'")}, status=404)
             except ValueError as exc:
@@ -722,8 +810,10 @@ class _Handler(BaseHTTPRequestHandler):
         return self._json({"error": "not found"}, status=404)
 
     def do_PATCH(self) -> None:  # noqa: N802
-        parsed = urlparse(self.path)
-        path = _versioned_path(parsed.path)
+        parsed, path = self._prepare_path()
+        if parsed is None:
+            return
+        path = _versioned_path(path)
         payload = self._read_json_body()
         match = re.fullmatch(r"/api/servers/([^/]+)", path)
         if not match:
@@ -743,8 +833,10 @@ class _Handler(BaseHTTPRequestHandler):
         return self._json(server)
 
     def do_DELETE(self) -> None:  # noqa: N802
-        parsed = urlparse(self.path)
-        path = _versioned_path(parsed.path)
+        parsed, path = self._prepare_path()
+        if parsed is None:
+            return
+        path = _versioned_path(path)
         if path.startswith("/api/") and not path.startswith("/api/auth/") and not self._request_authorized():
             return self._json({"error": "Authentication required", "code": "authentication_required"}, status=401)
         if path.startswith("/api/") and self.manager.active_server_id is None:
@@ -761,6 +853,9 @@ class _Handler(BaseHTTPRequestHandler):
         return self._json(result)
 
     def do_OPTIONS(self) -> None:  # noqa: N802
+        _parsed, path = self._prepare_path()
+        if path is None:
+            return
         self.send_response(HTTPStatus.NO_CONTENT)
         self.send_header("Allow", "GET, POST, PATCH, DELETE, OPTIONS")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, PATCH, DELETE, OPTIONS")
@@ -931,6 +1026,8 @@ class _Handler(BaseHTTPRequestHandler):
         content = file_path.read_bytes()
         total = len(content)
         mime = content_type or _guess_content_type(file_path) or "text/html; charset=utf-8"
+        if file_path.name == "sw.js":
+            mime = "application/javascript; charset=utf-8"
 
         # Safari refuses to play <audio>/<video> (and model-viewer can stall) unless
         # the server honors Range requests, so parse a single "bytes=start-end" spec.
@@ -954,6 +1051,8 @@ class _Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", mime)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Accept-Ranges", "bytes")
+        if file_path.name == "sw.js":
+            self.send_header("Cache-Control", "no-cache")
         if status == HTTPStatus.PARTIAL_CONTENT:
             self.send_header("Content-Range", f"bytes {start}-{end}/{total}")
         if filename:

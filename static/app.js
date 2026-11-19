@@ -256,7 +256,39 @@ async function loadActiveServer() {
   await loadHealth();
   await loadAgents();
   await loadChats();
+  refreshPushSettings();
 }
+
+async function refreshPushSettings() {
+  const status = $("pushStatus");
+  const hint = $("pushInstallHint");
+  try {
+    const pushState = await window.AgentSlackPush.state();
+    status.textContent = pushState === "subscribed" ? "Notifications are enabled on this device."
+      : pushState === "needs-install" ? "Install Agent Slack to your Home Screen to enable notifications."
+        : pushState === "denied" ? "Notifications are blocked in browser settings."
+          : pushState === "unsupported" ? "Push notifications are not supported by this browser."
+            : "Get a notification when an agent run finishes.";
+    hint.hidden = pushState !== "needs-install";
+    $("pushEnableBtn").hidden = pushState === "subscribed" || pushState === "unsupported" || pushState === "denied";
+    $("pushDisableBtn").hidden = pushState !== "subscribed";
+    $("pushTestBtn").disabled = pushState !== "subscribed";
+  } catch (error) { status.textContent = error.message; }
+}
+
+$("pushEnableBtn").onclick = async () => {
+  const status = $("pushStatus");
+  try { await window.AgentSlackPush.enable(); await refreshPushSettings(); }
+  catch (error) { status.textContent = error.message; }
+};
+$("pushDisableBtn").onclick = async () => {
+  try { await window.AgentSlackPush.disable(); await refreshPushSettings(); }
+  catch (error) { $("pushStatus").textContent = error.message; }
+};
+$("pushTestBtn").onclick = async () => {
+  try { await window.AgentSlackPush.test(); $("pushStatus").textContent = "Test notification sent."; }
+  catch (error) { $("pushStatus").textContent = error.message; }
+};
 
 async function openHostSessionsServer() {
   state.hostSessionOpenRequest += 1;
@@ -519,6 +551,11 @@ function applyChatList(chats) {
 async function loadChats({ openFirst = true } = {}) {
   const payload = await api("/api/chats");
   applyChatList(payload.chats || []);
+  const deepLinkChat = new URLSearchParams(window.location.hash.slice(1)).get("chat");
+  if (deepLinkChat && state.chats.some((chat) => chat.chat_id === deepLinkChat)) {
+    await openChat(deepLinkChat);
+    return;
+  }
   if (openFirst && !state.currentChatId && state.chats.length) {
     await openChat(state.chats[0].chat_id);
   } else if (!state.chats.length) {

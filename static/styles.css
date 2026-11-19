@@ -1298,11 +1298,17 @@ dialog select:focus {
 }
 .integration-card-heading { display: flex; align-items: center; justify-content: space-between; gap: 1rem; }
 .integration-card-heading strong, .integration-card-heading small { display: block; }
+.push-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 0.4rem; }
 .integration-card-heading small { margin-top: 0.25rem; color: var(--muted, #b8aabe); }
 .integration-summary { margin: 0.55rem 0 0; font-size: 0.82rem; }
 .secondary-button { padding: 0.45rem 0.7rem; }
 .checkbox-label { display: flex; flex-direction: row; align-items: center; gap: 0.55rem; }
 .checkbox-label input { width: auto; }
+
+@media (max-width: 560px) {
+  .push-actions { justify-content: flex-start; }
+  .integration-card-heading:has(.push-actions) { align-items: flex-start; flex-direction: column; }
+}
 
 /* ---- stop button / message content ---- */
 .agent-stop-button {

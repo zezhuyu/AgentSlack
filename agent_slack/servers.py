@@ -248,6 +248,7 @@ class AgentServerManager:
                 project_root=root,
                 app_root=self.app_root,
                 data_root=server_data_root,
+                push_root=self.data_root,
                 runner_override=item.get("runner"),
                 model_override=item.get("model"),
             )

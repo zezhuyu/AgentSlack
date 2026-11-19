@@ -7,7 +7,7 @@ import os
 import re
 import shutil
 import time
-from threading import Thread
+from concurrent.futures import ThreadPoolExecutor
 from collections import Counter
 from collections.abc import Iterator
 from copy import deepcopy
@@ -37,6 +37,9 @@ from .ui_actions import UIActionError, find_action_node, validate_form_args
 from .voice import LocalVoiceBackend
 
 logger = logging.getLogger(__name__)
+_project_task_executors: dict[str, ThreadPoolExecutor] = {}
+_project_task_executor_counts: dict[str, int] = {}
+_project_task_executors_guard = RLock()
 
 
 # Build/dependency/cache noise an agent's working directory routinely accumulates
@@ -98,10 +101,13 @@ class AgentSlackApp:
         data_root: Path | None = None,
         runner_override: str | None = None,
         model_override: str | None = None,
+        push_root: Path | None = None,
     ):
         self.project_root = project_root
         self.app_root = app_root
         self.data_root = data_root or self.app_root / "data"
+        # Push subscriptions are global to the install (push.json beside auth.json), not per agent server.
+        self.push_root = push_root or self.data_root
         self.static_root = self.app_root / "static"
         self.discovery = AgentDiscovery(project_root)
         self.storage = AgentSlackStorage(self.data_root)
@@ -161,7 +167,8 @@ class AgentSlackApp:
     def get_task(self, task_id: str) -> dict[str, Any] | None:
         return self.storage.get_task(task_id)
 
-    def create_task(self, agent_id: str, instruction: str, source: str = "chatgpt") -> dict[str, Any]:
+    def create_task(self, agent_id: str, instruction: str, source: str = "chatgpt",
+                    chat_id: str | None = None, session_title: str | None = None) -> dict[str, Any]:
         agent = self.get_agent(agent_id)
         if agent is None:
             raise ValueError(f"Agent not found: {agent_id}")
@@ -175,18 +182,58 @@ class AgentSlackApp:
             "result": None,
             "artifacts": [],
             "completed_at": None,
+            "chat_id": chat_id,
         })
-        Thread(target=self._run_project_task, args=(task["task_id"],), daemon=True).start()
+        if chat_id is None:
+            chat = self.create_chat(session_title or f"Task {task['task_id']}", [agent_id], kind="task")
+            chat_id = chat["chat_id"]
+            task = self.storage.update_task(task["task_id"], chat_id=chat_id)
+        with _project_task_executors_guard:
+            executor = _project_task_executors.get(chat_id)
+            if executor is None:
+                executor = _project_task_executors[chat_id] = ThreadPoolExecutor(max_workers=1)
+            _project_task_executor_counts[chat_id] = _project_task_executor_counts.get(chat_id, 0) + 1
+            future = executor.submit(self._run_project_task, task["task_id"])
+            future.add_done_callback(lambda _future, key=chat_id, pool=executor: self._release_task_executor(key, pool))
         return task
+
+    @staticmethod
+    def _release_task_executor(chat_id: str, executor: ThreadPoolExecutor) -> None:
+        with _project_task_executors_guard:
+            count = _project_task_executor_counts.get(chat_id, 0) - 1
+            if count <= 0:
+                _project_task_executor_counts.pop(chat_id, None)
+                if _project_task_executors.get(chat_id) is executor:
+                    _project_task_executors.pop(chat_id, None)
+                    executor.shutdown(wait=False)
+            else:
+                _project_task_executor_counts[chat_id] = count
 
     def _run_project_task(self, task_id: str) -> None:
         task = self.storage.get_task(task_id)
         if not task:
             return
         try:
-            chat = self.create_chat(f"Task {task_id}", [task["agent_id"]], kind="task")
+            self._execute_project_task(task_id)
+        except Exception as exc:
+            self.storage.update_task(task_id, status="failed", completed_at=utc_now(), result=str(exc))
+            try:
+                from .push import notify_run_finished
+                notify_run_finished(self.push_root, title=f"Task {task_id}", body=f"Run failed: {exc}", failed=True)
+            except Exception:
+                logger.warning("Could not queue push notification for failed task %s", task_id)
+
+    def _execute_project_task(self, task_id: str) -> None:
+        task = self.storage.get_task(task_id)
+        if not task:
+            return
+        try:
+            chat = self.storage.get_chat(str(task.get("chat_id") or ""))
+            if chat is None:
+                chat = self.create_chat(f"Task {task_id}", [task["agent_id"]], kind="task")
             self.storage.append_message(chat["chat_id"], {
-                "author_type": "user", "author_id": "external", "author_label": task["source"],
+                "author_type": "user", "author_id": "external",
+                "author_label": {"chatgpt": "ChatGPT", "claude": "Claude"}.get(task.get("source"), task.get("source", "external")),
                 "body": task["instruction"], "metadata": {"task_id": task_id},
             })
             self.storage.update_task(task_id, status="running", chat_id=chat["chat_id"])
@@ -219,6 +266,11 @@ class AgentSlackApp:
                 )
         except Exception as exc:
             self.storage.update_task(task_id, status="failed", completed_at=utc_now(), result=str(exc))
+            try:
+                from .push import notify_run_finished
+                notify_run_finished(self.push_root, title=f"Task {task_id}", body=f"Run failed: {exc}", failed=True)
+            except Exception:
+                logger.warning("Could not queue push notification for failed task %s", task_id)
 
     def cancel_task_record(self, task_id: str) -> dict[str, Any]:
         task = self.storage.get_task(task_id)
@@ -1117,6 +1169,9 @@ class AgentSlackApp:
         }
         failed_agent_ids: list[str] = []
         cancelled_agent_ids: list[str] = []
+        push_body = ""
+        push_needs_input = False
+        push_title = str(run_agent.get("title") or run_agent.get("name") or run_agent_id)
         run_cancelled = False
         buffers: dict[str, str] = {}
         labels: dict[str, str] = {}
@@ -1194,6 +1249,7 @@ class AgentSlackApp:
                     failed_agent_ids.append(agent_id)
                 if cancelled:
                     cancelled_agent_ids.append(agent_id)
+                    run_cancelled = True
                 interaction = None
                 ui_spec = None
                 ui_error = None
@@ -1228,6 +1284,11 @@ class AgentSlackApp:
                         )
                     if interaction:
                         event = {**event, "body": body, "interaction": interaction}
+                if not cancelled and (agent_id == run_agent_id or not push_body):
+                    # Notify with the agent's cleaned final answer, never raw markup or a partial step.
+                    push_body = body
+                    push_title = label
+                    push_needs_input = bool(interaction)
                 self._update_run_task(
                     run_id,
                     task_id,
@@ -1330,6 +1391,17 @@ class AgentSlackApp:
         if run_cancelled:
             yield {"type": "run_cancelled", "run_id": run_id, "chat_id": run_chat_id}
         else:
+            try:
+                from .push import notify_run_finished
+                failure = bool(failed_agent_ids)
+                reason = push_body or ("Run failed" if failure else "Run completed")
+                if failure and not reason.lower().startswith("run failed"):
+                    reason = f"Run failed: {reason}"
+                elif push_needs_input:
+                    reason = f"Needs your answer: {reason}"
+                notify_run_finished(self.push_root, title=push_title, body=reason, chat_id=run_chat_id, failed=failure)
+            except Exception as exc:
+                logger.warning("Could not queue push notification: %s", exc)
             yield {"type": "run_completed", "run_id": run_id, "chat_id": run_chat_id}
 
     def _update_latest_meeting(self, chat_id: str, **updates: Any) -> None:

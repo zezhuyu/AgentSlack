@@ -1,8 +1,8 @@
 (function initAgentSlackGenerativeUI(root, factory) {
-  const api = factory();
+  const api = factory(root);
   if (typeof module === "object" && module.exports) module.exports = api;
   else root.AgentSlackGenerativeUI = api;
-})(typeof globalThis !== "undefined" ? globalThis : this, function createAgentSlackGenerativeUI() {
+})(typeof globalThis !== "undefined" ? globalThis : this, function createAgentSlackGenerativeUI(root) {
   const MAX_NODES = 120;
   const MAX_DEPTH = 8;
   const known = new Set([
@@ -291,7 +291,8 @@
     if (props.summary) card.append(element("p", "", props.summary));
     if (/^[a-f0-9]{32}$/.test(String(props.artifactId || ""))) {
       const link = element("a", "", "Open artifact");
-      link.href = `/api/artifacts/${encodeURIComponent(props.artifactId)}`;
+      const artifactUrl = `/api/artifacts/${encodeURIComponent(props.artifactId)}`;
+      link.href = root?.appUrl ? root.appUrl(artifactUrl) : artifactUrl;
       link.target = "_blank";
       link.rel = "noopener noreferrer";
       card.append(link);

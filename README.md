@@ -60,6 +60,20 @@ its own revocable device token. macOS app traffic uses a private local desktop
 credential and remains signed in. Keep LAN access on trusted networks and use
 a VPN or authenticated tunnel for remote access.
 
+## Push notifications
+
+Push notifications require HTTPS through a reverse proxy. On iOS, install Agent
+Slack from Safari's Share menu with **Add to Home Screen**, then open the Home
+Screen app before enabling notifications (iOS 16.4+). Safari 18.4+ uses
+Declarative Web Push; older supported browsers use the service worker fallback.
+Install the optional crypto dependency with `pip install -r requirements-push.txt`.
+Set `AGENT_SLACK_PUSH_SUBJECT` to a valid `mailto:` or HTTPS contact URI (default
+`mailto:agent-slack@localhost`). VAPID keys and subscriptions are stored in
+`<data-root>/push.json` with owner-only permissions; back up that file to retain
+subscriptions and the VAPID identity. Enable notifications in Server Settings,
+then use **Send test** to confirm delivery. Agent completion and failure
+notifications open the related chat when available.
+
 Omit `--project-root` to start with an empty server registry, then use the `+` button in the workspace rail and enter an agent-system folder. Use `--data-root <folder>` to move the server registry, chats, and memories out of the source tree.
 
 Agent replies use `AGENT_SLACK_CLI=auto` by default, preferring Codex and then Claude Code. Set `AGENT_SLACK_CLI=codex` or `AGENT_SLACK_CLI=claude` to force a runner, and optionally set `AGENT_SLACK_CLI_TIMEOUT` to change the 180-second reply timeout. Both runners execute with the same unrestricted filesystem, command, network, MCP, plugin, and user-configuration access as their trusted terminal CLIs. Agent Slack also directs either runner to honor matching skills from project and user `.agents/skills`, `.claude/skills`, and `.codex/skills` roots.
@@ -108,6 +122,12 @@ file. No separate AgentSlack MCP package is needed. Restart Claude Desktop
 after installation. Claude Desktop and Claude Code launch the packaged backend
 with `--mcp-stdio`; every tool call still requires
 `workspace_key` and remains restricted to the configured project roots.
+
+MCP task calls continue in the same Agent Slack chat for a conversation:
+ChatGPT supplies its conversation identity automatically through
+`openai/session`; Claude connectors do not send a conversation id, so pass the
+returned `session_id` from an earlier call to continue that chat. Calls without
+either identity start a new chat each time.
 
 For Claude Platform MCP tunnels, use the **Claude MCP Tunnel** Configure button
 in Server Settings. Create the tunnel in Claude Console, paste its domain and
@@ -222,6 +242,78 @@ client requires iOS 17 or later and has no third-party dependencies. See
 - LAN access: enabled by default; use **Copy API URL** from the desktop menu-bar icon
 - internet access: put the daemon behind an authenticated reverse proxy or private tunnel; Agent Slack itself does not authenticate requests
 - same-origin browser app: the UI and JSON API are served from the same daemon, so no separate frontend build or CORS setup is required
+
+### Run behind a reverse proxy / Tailscale
+
+The browser app supports a URL sub-path. `AGENT_SLACK_BASE_PATH` defaults to
+`/agent_slack`; the server accepts requests with or without that prefix, so it
+works with proxies that strip the location prefix and proxies that preserve it.
+Set it to another leading-slash path to use a different mount, or to an empty
+string to disable prefix stripping. Browser API and artifact URLs remain
+root-relative in the app and `base-path.js` derives the public mount from its
+own script URL. This leaves the un-prefixed API URLs used by the native iOS and
+macOS clients unchanged.
+
+The installed Tailscale CLI accepts this form (`tailscale serve --help`):
+
+```sh
+tailscale serve --bg --https=443 --set-path /agent_slack http://127.0.0.1:8899
+```
+
+For nginx, define the WebSocket mapping once in the `http` block:
+
+```nginx
+map $http_upgrade $connection_upgrade {
+    default upgrade;
+    ''      close;
+}
+```
+
+Add this exact location once to redirect the no-trailing-slash URL while
+retaining its query string:
+
+```nginx
+location = /agent_slack { return 308 /agent_slack/$is_args$args; }
+```
+
+For strip mode, use a trailing slash on `proxy_pass` to remove the location
+prefix:
+
+```nginx
+location /agent_slack/ {
+    proxy_pass http://127.0.0.1:8899/;
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_set_header X-Forwarded-Prefix /agent_slack;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection $connection_upgrade;
+    proxy_buffering off;
+    proxy_read_timeout 3600s;
+}
+```
+
+For keep mode, omit the URI suffix on `proxy_pass` so the daemon receives
+`/agent_slack/` and strips it:
+
+```nginx
+location /agent_slack/ {
+    proxy_pass http://127.0.0.1:8899;
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection $connection_upgrade;
+    proxy_buffering off;
+    proxy_read_timeout 3600s;
+}
+```
+
+`proxy_buffering off` preserves NDJSON streaming, and the Upgrade headers carry
+the voice WebSocket handshake. `X-Forwarded-Proto` lets login cookies include
+`Secure` when TLS terminates at the proxy. For strip mode, `X-Forwarded-Prefix`
+sets the cookie path to `/agent_slack`; in keep mode the server detects that
+path from the request itself.
 
 The stable mobile-client contract, endpoint list, server-selection header, and
 NDJSON streaming examples are documented in [MOBILE-API.md](./MOBILE-API.md).

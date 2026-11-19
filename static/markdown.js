@@ -1,8 +1,8 @@
 (function initMarkdown(root, factory) {
-  const api = factory();
+  const api = factory(root);
   if (typeof module !== "undefined" && module.exports) module.exports = api;
   if (root) root.AgentSlackMarkdown = api;
-}(typeof window !== "undefined" ? window : globalThis, function createMarkdownRenderer() {
+}(typeof window !== "undefined" ? window : globalThis, function createMarkdownRenderer(root) {
   function escapeHtml(value) {
     return String(value ?? "")
       .replaceAll("&", "&amp;")
@@ -21,8 +21,9 @@
     if (/^[a-z][a-z0-9+.-]*:/i.test(url) || /^\/\//.test(url)) {
       return null;
     }
-    if (url.startsWith("/api/")) return escapeHtml(url);
-    return `/api/v1/files?path=${encodeURIComponent(url)}`;
+    if (url.startsWith("/api/")) return escapeHtml(root?.appUrl ? root.appUrl(url) : url);
+    const fileUrl = `/api/v1/files?path=${encodeURIComponent(url)}`;
+    return escapeHtml(root?.appUrl ? root.appUrl(fileUrl) : fileUrl);
   }
 
   function renderInline(value) {

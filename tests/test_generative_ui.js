@@ -93,6 +93,26 @@ test("renders a bounded accessible spinner and non-button dashboard components",
   }
 });
 
+test("artifact links use the app URL helper when mounted below a path prefix", () => {
+  const previousDocument = global.document;
+  const previousAppUrl = global.appUrl;
+  global.document = stubDocument();
+  global.appUrl = (path) => `/agent_slack${path}`;
+  try {
+    const container = global.document.createElement("div");
+    assert.equal(renderer.append(container, {
+      schemaVersion: "1",
+      root: { type: "ArtifactPreview", props: { artifactId: "a".repeat(32) } },
+    }), true);
+    const artifactLink = container.children[0].children[0].children.find((child) => child.tag === "a");
+    assert.equal(artifactLink.href, `/agent_slack/api/artifacts/${"a".repeat(32)}`);
+  } finally {
+    global.document = previousDocument;
+    if (previousAppUrl === undefined) delete global.appUrl;
+    else global.appUrl = previousAppUrl;
+  }
+});
+
 test("chart motion is declarative, bounded, and reduced-motion aware", () => {
   const previousDocument = global.document;
   global.document = stubDocument();

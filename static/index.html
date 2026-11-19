@@ -5,10 +5,10 @@
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content" />
     <title>Agent Slack</title>
     <meta name="theme-color" content="#3f0e40" />
-    <link rel="manifest" href="/site.webmanifest" />
-    <link rel="apple-touch-icon" sizes="180x180" href="/icons/apple-touch-icon.png" />
-    <link rel="icon" type="image/png" href="/logo.png" />
-    <link rel="stylesheet" href="/styles.css" />
+    <link rel="manifest" href="./site.webmanifest" />
+    <link rel="apple-touch-icon" sizes="180x180" href="./icons/apple-touch-icon.png" />
+    <link rel="icon" type="image/png" href="./logo.png" />
+    <link rel="stylesheet" href="./styles.css" />
   </head>
   <body>
     <dialog id="authDialog" class="auth-dialog">
@@ -23,7 +23,7 @@
     </dialog>
     <div class="shell">
       <aside class="workspace-rail">
-        <div class="workspace-badge"><img src="/logo.png" alt="Agent Slack" /></div>
+        <div class="workspace-badge"><img src="./logo.png" alt="Agent Slack" /></div>
         <button id="hostSessionsServerBtn" class="server-btn host-sessions-server-btn" type="button" title="Host sessions outside onboarded projects" aria-label="Host sessions outside onboarded projects">&#9673;</button>
         <div id="serverList" class="workspace-stack server-stack"></div>
         <button id="addServerBtn" class="rail-btn add-server-btn" title="Add agent system">+</button>
@@ -205,6 +205,13 @@
         </section>
         <section class="integration-card">
           <div class="integration-card-heading">
+            <div><strong>Notifications</strong><small id="pushStatus" role="status">Checking notification support…</small></div>
+            <div class="push-actions"><button id="pushEnableBtn" type="button" class="secondary-button">Enable</button><button id="pushDisableBtn" type="button" class="secondary-button" hidden>Disable</button><button id="pushTestBtn" type="button" class="secondary-button">Send test</button></div>
+          </div>
+          <p id="pushInstallHint" class="muted integration-summary" hidden>Add to Home Screen first (Share &gt; Add to Home Screen), then open from the icon.</p>
+        </section>
+        <section class="integration-card">
+          <div class="integration-card-heading">
             <div><strong>ChatGPT / OpenAI MCP Tunnel</strong><small>Agent Slack starts the local MCP server automatically.</small></div>
             <button id="configureTunnelBtn" type="button" class="secondary-button">Configure</button>
           </div>
@@ -310,14 +317,16 @@
 
     <div id="peopleTooltip" class="people-tooltip" hidden></div>
 
-    <script src="/markdown.js"></script>
-    <script src="/sync.js"></script>
-    <script src="/composer.js"></script>
-    <script src="/mobile.js"></script>
-    <script src="/mentions.js"></script>
-    <script src="/interactions.js"></script>
-    <script src="/generative-ui.js"></script>
-    <script src="/chatmode.js"></script>
-    <script src="/app.js"></script>
+    <script src="./base-path.js"></script>
+    <script src="./push.js"></script>
+    <script src="./markdown.js"></script>
+    <script src="./sync.js"></script>
+    <script src="./composer.js"></script>
+    <script src="./mobile.js"></script>
+    <script src="./mentions.js"></script>
+    <script src="./interactions.js"></script>
+    <script src="./generative-ui.js"></script>
+    <script src="./chatmode.js"></script>
+    <script src="./app.js"></script>
   </body>
 </html>

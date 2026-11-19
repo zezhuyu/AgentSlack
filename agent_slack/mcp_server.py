@@ -13,21 +13,55 @@ import base64
 from hashlib import sha256
 from datetime import datetime, timezone
 import re
+import os
+import tempfile
+import threading
+import uuid
 from pathlib import Path
 from typing import Any, Callable
 
 from .servers import AgentServerManager
 from .engram_memory import EngramMemoryBridge
+from .storage import utc_now
+
+
+def _read_session_records(path: Path) -> dict[str, dict[str, Any]]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+        return value if isinstance(value, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _write_session_records(path: Path, records: dict[str, dict[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=".mcp_sessions-", dir=path.parent)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            json.dump(records, stream, ensure_ascii=False)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+        os.chmod(path, 0o600)
+    finally:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
 
 
 class AgentSlackMCP:
     MAX_MEMORY_RESULT_CHARS = 1200
     MAX_STATUS_TASKS = 50
     MAX_MEMORY_RESULTS = 8
+    _session_locks: dict[str, threading.RLock] = {}
+    _session_locks_guard = threading.Lock()
 
     def __init__(self, manager: AgentServerManager):
         self.manager = manager
         self.engram = EngramMemoryBridge.from_environment()
+        self._call_context = threading.local()
 
     @staticmethod
     def _compact_agent(agent: dict[str, Any]) -> dict[str, Any]:
@@ -211,8 +245,80 @@ class AgentSlackMCP:
     def get_task(self, workspace_key: str, task_id: str) -> dict[str, Any] | None:
         return self._app(workspace_key).get_task(task_id)
 
-    def create_task(self, workspace_key: str, agent_id: str, instruction: str) -> dict[str, Any]:
-        return self._app(workspace_key).create_task(agent_id, instruction, source="chatgpt")
+    def create_task(self, workspace_key: str, agent_id: str, instruction: str,
+                    session_id: str | None = None) -> dict[str, Any]:
+        return self.create_session_task(workspace_key, agent_id, instruction, session_id, getattr(self._call_context, "meta", None))
+
+    def create_session_task(self, workspace_key: str, agent_id: str, instruction: str,
+                            session_id: str | None, meta: dict[str, Any] | None,
+                            skill_name: str | None = None) -> dict[str, Any]:
+        app = self._app(workspace_key)
+        explicit = session_id is not None
+        if explicit and (not isinstance(session_id, str) or not re.fullmatch(r"[A-Za-z0-9._:-]{1,128}", session_id)):
+            raise ValueError("session_id must be 1-128 characters using letters, digits, '.', '_', ':', or '-'")
+        source = "explicit"
+        conversation = session_id or ""
+        if not explicit:
+            meta = meta if isinstance(meta, dict) else {}
+            for key, label in (("openai/session", "chatgpt"), ("anthropic/session", "claude"),
+                               ("claude/conversation_id", "claude"), ("conversationId", "claude"),
+                               ("conversation_id", "claude")):
+                candidate = meta.get(key)
+                if isinstance(candidate, str) and candidate:
+                    source, conversation = label, candidate
+                    break
+        path = app.data_root / "mcp_sessions.json"
+        with self._session_locks_guard:
+            lock = self._session_locks.setdefault(str(path), threading.RLock())
+        mapping_key = sha256(f"{source}|{conversation}|{agent_id}".encode()).hexdigest() if conversation else ""
+        with lock:
+            records = _read_session_records(path)
+            if explicit and session_id.startswith("as_"):
+                if not re.fullmatch(r"as_[0-9a-f]{16}", session_id):
+                    raise ValueError("Invalid session_id token")
+                found = next(((key, value) for key, value in records.items()
+                              if value.get("token") == session_id and value.get("agent_id") == agent_id), None)
+                if found is None:
+                    raise ValueError("Unknown session_id token")
+                mapping_key, record = found
+                conversation = record.get("conversation_id_hash", session_id)
+                source = record.get("source", source)
+            record = records.get(mapping_key) if mapping_key else None
+            chat = app.get_chat(record.get("chat_id")) if record else None
+            reused = bool(chat and agent_id in (chat.get("member_ids") or []))
+            if not reused:
+                agent = app.get_agent(agent_id)
+                if agent is None:
+                    raise ValueError(f"Agent not found: {agent_id}")
+                label = str(agent.get("name") or agent.get("title") or agent_id)
+                title_source = {"chatgpt": "ChatGPT", "claude": "Claude", "explicit": "Session"}[source]
+                chat = app.create_chat(f"{title_source} · {label}", [agent_id], kind="task")
+                if not mapping_key:
+                    conversation = uuid.uuid4().hex
+                    mapping_key = sha256(f"explicit|{conversation}|{agent_id}".encode()).hexdigest()
+                token = "as_" + uuid.uuid4().hex[:16]
+                record = {"chat_id": chat["chat_id"], "agent_id": agent_id, "source": source,
+                          "conversation_id_hash": sha256(conversation.encode()).hexdigest(),
+                          "created": utc_now(), "last_used": utc_now(), "task_count": 0, "token": token}
+                records[mapping_key] = record
+            else:
+                token = record.get("token") or ("as_" + uuid.uuid4().hex[:16])
+            record["last_used"] = utc_now()
+            record["task_count"] = int(record.get("task_count", 0)) + 1
+            # Explicit tokens resolve to the same record on later calls.
+            record["token"] = token
+            records[mapping_key] = record
+            if len(records) > 500:
+                records = dict(sorted(records.items(), key=lambda pair: pair[1].get("last_used", ""))[-500:])
+            _write_session_records(path, records)
+        instruction_text = instruction
+        if skill_name:
+            skill = resolve_project_skill(app.project_root, skill_name)
+            instruction_text = (f"Use the project skill {skill['skill_name']} from {skill['path']}. Read its complete SKILL.md before acting.\n\nUser request:\n{instruction}")
+        task = app.create_task(agent_id, instruction_text, source=source, chat_id=chat["chat_id"])
+        task = app.storage.update_task(task["task_id"], session_id=token,
+                                       session_reused=reused, **({"skill_name": skill_name} if skill_name else {}))
+        return {**task, "session_id": token, "chat_id": chat["chat_id"], "session_reused": reused}
 
     def cancel_task(self, workspace_key: str, task_id: str) -> dict[str, Any]:
         return self._app(workspace_key).cancel_task_record(task_id)
@@ -304,8 +410,9 @@ class AgentSlackMCP:
         return self._app(workspace_key).list_project_skills()
 
     def run_project_skill(self, workspace_key: str, agent_id: str, skill_name: str,
-                          instruction: str) -> dict[str, Any]:
-        return self._app(workspace_key).run_project_skill(skill_name, instruction, agent_id)
+                          instruction: str, session_id: str | None = None) -> dict[str, Any]:
+        return self.create_session_task(workspace_key, agent_id, instruction, session_id,
+                                        getattr(self._call_context, "meta", None), skill_name)
 
     TOOLS: dict[str, Callable[..., Any]] = {
         "get_project_status": get_project_status,
@@ -334,10 +441,18 @@ class AgentSlackMCP:
         "run_project_skill": run_project_skill,
     }
 
-    def call(self, name: str, arguments: dict[str, Any]) -> Any:
+    def call(self, name: str, arguments: dict[str, Any], meta: dict[str, Any] | None = None) -> Any:
         method = self.TOOLS.get(name)
         if method is None:
             raise KeyError(f"Unknown MCP tool: {name}")
+        if name in {"create_task", "run_project_skill"}:
+            self._call_context.meta = meta or {}
+            try:
+                return method(self, **arguments)
+            finally:
+                self._call_context.meta = {}
+        arguments = dict(arguments)
+        arguments.pop("session_id", None)
         return method(self, **arguments)
 
 
@@ -360,13 +475,13 @@ def _tool_definitions() -> list[dict[str, Any]]:
         "read_project_file": {"path": {"type": "string"}},
         "list_tasks": {},
         "get_task": {"task_id": {"type": "string"}},
-        "create_task": {"agent_id": {"type": "string"}, "instruction": {"type": "string"}},
+        "create_task": {"agent_id": {"type": "string"}, "instruction": {"type": "string"}, "session_id": {"type": "string", "maxLength": 128, "pattern": "^[A-Za-z0-9._:-]+$", "description": "Pass the session_id returned by earlier calls in this conversation to continue the same Agent Slack session."}},
         "cancel_task": {"task_id": {"type": "string"}},
         "list_task_artifacts": {"task_id": {"type": "string"}},
         "get_task_artifact": {"task_id": {"type": "string"}, "artifact_id": {"type": "string"}},
         "download_task_artifact": {"task_id": {"type": "string"}, "artifact_id": {"type": "string"}},
         "list_project_skills": {},
-        "run_project_skill": {"agent_id": {"type": "string"}, "skill_name": {"type": "string"}, "instruction": {"type": "string"}},
+        "run_project_skill": {"agent_id": {"type": "string"}, "skill_name": {"type": "string"}, "instruction": {"type": "string"}, "session_id": {"type": "string", "maxLength": 128, "pattern": "^[A-Za-z0-9._:-]+$", "description": "Pass the session_id returned by earlier calls in this conversation to continue the same Agent Slack session."}},
     }
     required = {
         "get_agent_status": [], "search_memory": ["query"],
@@ -382,7 +497,9 @@ def _tool_definitions() -> list[dict[str, Any]]:
         "download_task_artifact": ["task_id", "artifact_id"],
         "run_project_skill": ["agent_id", "skill_name", "instruction"],
     }
-    return [{"name": name, "description": f"AgentSlack project-scoped {name}",
+    return [{"name": name, "description": (
+                f"AgentSlack project-scoped {name}. Pass the session_id returned by earlier calls in this conversation to continue the same Agent Slack session."
+                if name in {"create_task", "run_project_skill"} else f"AgentSlack project-scoped {name}"),
              "inputSchema": {"type": "object", "required": ["workspace_key", *required.get(name, [])],
                               "properties": {"workspace_key": {"type": "string"}, **fields[name]}}}
             for name in AgentSlackMCP.TOOLS]
@@ -431,7 +548,14 @@ def handle_jsonrpc(adapter: AgentSlackMCP, request: dict[str, Any]) -> dict[str,
     elif method == "tools/call":
         params = request.get("params") or {}
         tool_name = str(params.get("name") or "")
-        value = adapter.call(tool_name, dict(params.get("arguments") or {}))
+        arguments = dict(params.get("arguments") or {})
+        if tool_name not in {"create_task", "run_project_skill"}:
+            arguments.pop("session_id", None)
+        try:
+            value = adapter.call(tool_name, arguments, meta=params.get("_meta") if isinstance(params.get("_meta"), dict) else None)
+        except Exception as exc:
+            return {"jsonrpc": "2.0", "id": request.get("id"),
+                    "error": {"code": -32000, "message": str(exc)}}
         if tool_name == "get_task_artifact":
             result = {
                 "content": [
