@@ -227,11 +227,16 @@ def send(data_root: Path, payload: dict) -> None:
         try:
             outgoing = json.loads(json.dumps(payload))
             notification = outgoing.get("notification") or {}
-            if notification.get("navigate") is None:
-                base = str(subscription.get("base_url") or "").rstrip("/")
+            base_url = str(subscription.get("base_url") or "")
+            navigate = notification.get("navigate")
+            if navigate is None:
                 chat_id = str(notification.get("chat_id") or "")
-                notification["navigate"] = base + (f"/#chat={urllib.parse.quote(chat_id)}" if chat_id else "/")
-                notification.pop("chat_id", None)
+                navigate = base_url.rstrip("/") + (f"/#chat={urllib.parse.quote(chat_id)}" if chat_id else "/")
+            elif not re.match(r"https?://", str(navigate)):
+                # Declarative Web Push requires an absolute URL; deep links like "#host=<id>" are relative to the app.
+                navigate = urllib.parse.urljoin(base_url, str(navigate))
+            notification["navigate"] = navigate
+            notification.pop("chat_id", None)
             _send_one(state, subscription, outgoing)
         except urllib.error.HTTPError as exc:
             if exc.code in {404, 410}:
@@ -242,7 +247,7 @@ def send(data_root: Path, payload: dict) -> None:
             logger.warning("Push delivery failed: %s", exc)
 
 
-def notify_run_finished(data_root: Path, *, title: str, body: str, base_url: str = "", chat_id: str = "", failed: bool = False, cancelled: bool = False, app_badge: int | None = None) -> None:
+def notify_run_finished(data_root: Path, *, title: str, body: str, base_url: str = "", chat_id: str = "", deep_link: str = "", failed: bool = False, cancelled: bool = False, app_badge: int | None = None) -> None:
     if cancelled or not CRYPTO_AVAILABLE:
         return
     try:
@@ -253,7 +258,8 @@ def notify_run_finished(data_root: Path, *, title: str, body: str, base_url: str
         return
     body = re.sub(r"[`*_>#]+", "", str(body)).replace("\r", " ").replace("\n", " ")
     body = re.sub(r"\s+", " ", body).strip()[:140] or ("Run failed" if failed else "Agent run completed")
-    notification = {"title": str(title or "Agent Slack")[:80], "body": body, "navigate": base_url.rstrip("/") + (f"/#chat={urllib.parse.quote(chat_id)}" if chat_id else "/") if base_url else None, "chat_id": chat_id, "silent": False, "tag": f"agent-slack-{chat_id or uuid.uuid4().hex}"}
+    navigate = deep_link or (base_url.rstrip("/") + (f"/#chat={urllib.parse.quote(chat_id)}" if chat_id else "/") if base_url else None)
+    notification = {"title": str(title or "Agent Slack")[:80], "body": body, "navigate": navigate, "chat_id": chat_id, "silent": False, "tag": f"agent-slack-{chat_id or uuid.uuid4().hex}"}
     payload = {"web_push": 8030, "notification": notification}
     if app_badge is not None:
         payload["app_badge"] = max(0, int(app_badge))

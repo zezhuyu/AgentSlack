@@ -5,20 +5,30 @@ const state = {
   agents: [],
   chats: [],
   hostSessions: [],
+  permissions: [],
   hostSessionId: null,
+  hostSubagentId: null,
   hostSessionLastError: new Map(),
   hostSessionStatus: null,
   hostMessagesStatus: null,
   hostResumes: new Map(),
+  hostResumeAliases: new Map(),
+  hostPendingPrompts: new Map(),
+  hostSessionMessages: new Map(),
+  hostSessionDetails: new Map(),
   hostSessionOpenRequest: 0,
   hostSessionsView: false,
   currentChatId: null,
   currentChatUpdatedAt: null,
+  currentChatSize: null,
   orchestratorIds: [],
   peopleExpanded: false,
   mobileSidebarOpen: false,
   openingDmAgentIds: new Set(),
   runInProgress: false,
+  runnerOptions: null,
+  runnerOptionsAt: 0,
+  currentChatSettings: null,
   currentRunId: null,
   currentRunChatId: null,
   stoppingTaskIds: new Set(),
@@ -36,6 +46,23 @@ const state = {
     meetingParticipants: new Set(),
   },
 };
+
+const HOST_PENDING_PROMPTS_KEY = "agentSlackHostPendingPrompts";
+try {
+  const saved = JSON.parse(localStorage.getItem(HOST_PENDING_PROMPTS_KEY) || "[]");
+  if (Array.isArray(saved)) {
+    for (const [sessionId, prompts] of saved) {
+      if (typeof sessionId === "string" && Array.isArray(prompts)) {
+        state.hostPendingPrompts.set(sessionId, prompts.filter((item) => item && typeof item.body === "string"));
+      }
+    }
+  }
+} catch {}
+
+function saveHostPendingPrompts() {
+  try { localStorage.setItem(HOST_PENDING_PROMPTS_KEY, JSON.stringify([...state.hostPendingPrompts])); }
+  catch {}
+}
 
 let authSetupToken = null;
 let desktopClient = Boolean(window.agentSlack);
@@ -68,7 +95,9 @@ async function api(path, options = {}) {
   if (!response.ok) {
     if (response.status === 401) showAuthDialog(false, null);
     const text = await response.text();
-    throw new Error(text || `HTTP ${response.status}`);
+    const error = new Error(text || `HTTP ${response.status}`);
+    error.status = response.status;
+    throw error;
   }
   return response.json();
 }
@@ -233,6 +262,7 @@ function renderServers() {
 async function switchServer(serverId) {
   if (serverId === state.activeServerId && !state.hostSessionsView) return;
   state.hostSessionsView = false;
+  state.hostSessionId = null; setHostMode(false);
   clearPendingAttachments();
   await api(`/api/servers/${serverId}/activate`, { method: "POST", body: "{}" });
   state.activeServerId = serverId;
@@ -256,6 +286,7 @@ async function loadActiveServer() {
   await loadHealth();
   await loadAgents();
   await loadChats();
+  await loadAllSessions();
   refreshPushSettings();
 }
 
@@ -293,7 +324,7 @@ $("pushTestBtn").onclick = async () => {
 async function openHostSessionsServer() {
   state.hostSessionOpenRequest += 1;
   state.hostSessionsView = true;
-  state.hostSessionId = null;
+  state.hostSessionId = null; setHostMode(false);
   state.hostSessionStatus = null;
   state.hostMessagesStatus = null;
   state.currentChatId = null;
@@ -314,31 +345,59 @@ async function openHostSessionsServer() {
   $("messageInput").placeholder = "Select a host session to continue";
   await loadAllSessions();
   renderUnonboardedHostSessions();
-  $("chatTitle").textContent = "Select a host session";
+  setChatTitle("Select a host session", false);
   $("chatMembers").textContent = "Sessions from folders not onboarded in Agent Slack";
   $("messages").innerHTML = '<div class="empty-server"><strong>Host sessions</strong><p>Choose a Claude Code or Codex conversation from the sidebar.</p></div>';
 }
 
+function activeServer() {
+  return state.servers.find((server) => server.server_id === state.activeServerId) || null;
+}
+
 function renderUnonboardedHostSessions() {
-  const onboardedRoots = new Set(state.servers.map((server) => normalizeFolder(server.project_root)));
   const sessions = state.hostSessions
-    .filter((session) => !folderIsOnboarded(session.project_root, onboardedRoots))
+    .filter((session) => !mostSpecificServer(session.project_root))
     .sort(compareHostSessions);
   $("chatList").innerHTML = "";
   $("chatCount").textContent = String(sessions.length);
-  sessions.forEach((session) => {
-    const button = document.createElement("button");
-    button.type = "button";
-    button.className = `chat-row ${session.session_id === state.hostSessionId ? "active" : ""}`;
-    button.classList.toggle("unavailable", !session.available);
-    const isResuming = session.resuming || state.hostResumes.has(session.session_id);
-    const isRunning = session.status === "Running" || isResuming;
-    const statusLabel = isResuming ? "Resuming…" : isRunning ? "Running" : "Idle";
-    button.innerHTML = `<strong>${escapeHtml(session.title)}</strong><span>${escapeHtml(session.agent_type)} · ${escapeHtml(session.project_name)}</span><small><span class="host-session-status ${isRunning ? "is-running" : ""}">${isRunning ? '<i class="host-session-dot" aria-hidden="true"></i>' : ""}${escapeHtml(statusLabel)}</span> · ${escapeHtml(session.last_message_preview || session.session_id)}</small>`;
-    button.title = session.available ? `${session.project_name} · ${session.session_id}` : `${session.project_name} · ${session.session_id} · Folder unavailable; session is read-only`;
-    button.onclick = () => openHostSession(session.session_id);
-    $("chatList").appendChild(button);
-  });
+  sessions.forEach((session) => $("chatList").appendChild(renderHostSessionRow(session)));
+  renderProjectHostSessions();
+}
+
+function renderHostSessionRow(session) {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = `chat-row ${session.session_id === state.hostSessionId ? "active" : ""}`;
+  button.classList.toggle("unavailable", !session.available);
+  const isResuming = session.resuming || state.hostResumes.has(session.session_id);
+  const isRunning = session.status === "Running" || isResuming;
+  const statusLabel = isResuming ? "Resuming…" : session.awaiting ? "Needs you" : isRunning ? "Running" : "Idle";
+  const title = document.createElement("strong"); title.textContent = session.title;
+  const subtitle = document.createElement("span"); subtitle.textContent = `${session.agent_type} · ${session.project_name}`;
+  const small = document.createElement("small");
+  const status = document.createElement("span"); status.className = `host-session-status ${session.awaiting ? "is-awaiting" : isRunning ? "is-running" : ""}`;
+  if (isRunning) { const dot = document.createElement("i"); dot.className = "host-session-dot"; dot.setAttribute("aria-hidden", "true"); status.appendChild(dot); }
+  status.append(document.createTextNode(statusLabel));
+  small.append(status, document.createTextNode(` · ${session.last_message_preview || session.session_id}`));
+  if (session.queued_count) {
+    const queuedChip = document.createElement("span"); queuedChip.className = "queued-chip";
+    queuedChip.textContent = `${session.queued_count} queued`;
+    small.append(document.createTextNode(" · "), queuedChip);
+  }
+  if (session.subagents_total) {
+    const chip = document.createElement("span"); chip.className = `subagent-chip ${session.subagents_running ? "is-running" : ""}`;
+    chip.textContent = `${session.subagents_total} agents · ${session.subagents_running || 0} running`;
+    small.append(document.createTextNode(" · "), chip);
+  }
+  if (session.is_subagent) {
+    const orphan = document.createElement("span"); orphan.className = "subagent-chip orphan";
+    orphan.textContent = session.parent_missing ? "Orphan sub-agent" : "Sub-agent";
+    small.append(document.createTextNode(" · "), orphan);
+  }
+  button.append(title, subtitle, small);
+  button.title = session.available ? `${session.project_name} · ${session.session_id}` : `${session.project_name} · ${session.session_id} · Folder unavailable; session is read-only`;
+  button.onclick = () => openHostSession(session.session_id);
+  return button;
 }
 
 function compareHostSessions(left, right) {
@@ -349,12 +408,34 @@ function compareHostSessions(left, right) {
 }
 
 function normalizeFolder(folder) {
-  return String(folder || "").replace(/\\/g, "/").replace(/\/+$/, "").toLocaleLowerCase();
+  const normalized = String(folder || "").replace(/\\/g, "/").replace(/\/+$/, "");
+  return normalized || (String(folder || "").startsWith("/") ? "/" : "");
 }
 
 function folderIsOnboarded(folder, roots) {
   const candidate = normalizeFolder(folder);
-  return [...roots].some((root) => candidate === root || candidate.startsWith(`${root}/`));
+  return roots.some((root) => candidate === root || candidate.startsWith(`${root === "/" ? "" : root}/`));
+}
+
+function mostSpecificServer(folder) {
+  const candidate = normalizeFolder(folder);
+  return state.servers.filter((server) => {
+    const root = normalizeFolder(server.project_root);
+    return root && (candidate === root || candidate.startsWith(`${root === "/" ? "" : root}/`));
+  }).sort((a, b) => normalizeFolder(b.project_root).length - normalizeFolder(a.project_root).length)[0] || null;
+}
+
+function renderProjectHostSessions() {
+  const section = $("projectHostSessionsSection");
+  const server = activeServer();
+  const visible = Boolean(server && !state.hostSessionsView);
+  section.hidden = !visible;
+  if (!visible) return;
+  const root = normalizeFolder(server.project_root);
+  const sessions = state.hostSessions.filter((session) => mostSpecificServer(session.project_root)?.server_id === server.server_id && folderIsOnboarded(session.project_root, [root])).sort(compareHostSessions);
+  $("projectHostSessionCount").textContent = String(sessions.length);
+  const list = $("projectHostSessionsList");
+  list.replaceChildren(...sessions.map(renderHostSessionRow));
 }
 
 async function loadAllSessions() {
@@ -362,14 +443,17 @@ async function loadAllSessions() {
     const payload = await api("/api/host-sessions");
     state.hostSessions = payload.sessions || [];
     if (state.hostSessionsView) renderUnonboardedHostSessions();
+    else renderProjectHostSessions();
     if (state.hostSessionId) {
       const activeSession = state.hostSessions.find((session) => session.session_id === state.hostSessionId);
       if (activeSession) {
-        const statusChanged = (state.hostMessagesStatus || "History") !== (activeSession.status || "History");
-        const messagesChanged = state.currentChatUpdatedAt !== (activeSession.updated_at || null);
         renderHostSessionDetails(activeSession);
         syncHostComposer(activeSession);
-        if ((messagesChanged || statusChanged) && !(document.activeElement === $("messageInput") && $("messageInput").value)) {
+        if (state.hostSubagentId) {
+          await openHostSubagent(activeSession.session_id, state.hostSubagentId);
+        } else if ((state.currentChatUpdatedAt !== (activeSession.updated_at || null)
+          || (activeSession.size_bytes !== undefined && state.currentChatSize !== activeSession.size_bytes))
+          && !(document.activeElement === $("messageInput") && $("messageInput").value)) {
           await openHostSession(activeSession.session_id, { preserveScroll: true });
         }
       }
@@ -377,11 +461,339 @@ async function loadAllSessions() {
   } catch (error) { console.warn("Unable to load all sessions", error); }
 }
 
+function setChatTitle(text, canRename) {
+  $("chatTitle").textContent = text;
+  $("chatRenameBtn").hidden = !canRename;
+}
+
+// Rename the open conversation in place: a host session (stored by Agent Slack, the CLI's transcript is
+// untouched) or a project chat. Enter saves, Escape cancels; clearing a host session name restores the generated one.
+function startTitleRename() {
+  const target = state.hostSessionId ? { kind: "host", id: state.hostSessionId }
+    : state.currentChatId ? { kind: "chat", id: state.currentChatId } : null;
+  const heading = $("chatTitle");
+  if (!target || heading.querySelector("input")) return;
+  const original = heading.textContent;
+  const input = document.createElement("input");
+  input.className = "chat-title-input";
+  input.value = original;
+  input.maxLength = 60;
+  input.setAttribute("aria-label", "Conversation name");
+  heading.replaceChildren(input);
+  input.focus();
+  input.select();
+  let finished = false;
+  const finish = async (save) => {
+    if (finished) return;
+    finished = true;
+    const name = input.value.trim();
+    if (!save || name === original || (!name && target.kind === "chat")) { heading.textContent = original; return; }
+    try {
+      const path = target.kind === "host" ? `/api/host-sessions/${encodeURIComponent(target.id)}/title` : `/api/chats/${encodeURIComponent(target.id)}`;
+      const result = await api(path, { method: "PATCH", body: JSON.stringify({ title: name }) });
+      heading.textContent = result.title || original;
+      if (target.kind === "host") await loadAllSessions(); else await loadChats({ openFirst: false });
+    } catch (error) {
+      heading.textContent = original;
+      console.warn("Unable to rename conversation", error);
+    }
+  };
+  input.addEventListener("keydown", (event) => {
+    if (event.key === "Enter") { event.preventDefault(); finish(true); }
+    else if (event.key === "Escape") { event.preventDefault(); finish(false); }
+  });
+  input.addEventListener("blur", () => finish(true));
+}
+
+function setHostMode(on) {
+  if (!on && $("hostResumeHint")) $("hostResumeHint").hidden = true;
+  document.body.classList.toggle("host-session-open", Boolean(on));
+}
+
 function renderHostSessionDetails(session) {
+  setHostMode(true);
   const isResuming = session.resuming || state.hostResumes.has(session.session_id);
   const status = isResuming ? "Resuming…" : session.status === "Running" ? "Running" : "Idle";
   state.hostSessionStatus = session.status || "History";
   $("chatMembers").textContent = `${status} · ${session.project_name} · ${session.agent_type} · ${session.session_id}`;
+}
+
+function renderHostProgress(steps, subagents = []) {
+  const details = document.createElement("details");
+  details.className = "host-progress";
+  details.open = true;
+  details.appendChild(createProgressHeader());
+  const list = document.createElement("ul");
+  list.className = "progress-steps";
+  const nested = subagents.filter((agent) => agent.status === "running").map((agent) => ({
+    kind: "subagent", state: "running", label: `Subagent: ${agent.role} – ${agent.current_step || agent.task || "Working"}`,
+  }));
+  const allSteps = progressActions([...steps, ...nested]);
+  const visible = allSteps.slice(-4);
+  visible.forEach((step) => list.appendChild(createHostProgressStep(step)));
+  details.appendChild(list);
+  if (allSteps.length > visible.length) {
+    const showAll = document.createElement("button");
+    showAll.type = "button";
+    showAll.className = "progress-more";
+    showAll.textContent = `Show all ${allSteps.length} steps`;
+    showAll.onclick = () => {
+      list.replaceChildren(...allSteps.map(createHostProgressStep));
+      showAll.remove();
+    };
+    details.appendChild(showAll);
+  }
+  $("messages").appendChild(details);
+}
+
+// The agent is blocked on a question or plan approval that is answered in the terminal.
+function renderHostAwaiting(awaiting) {
+  const card = document.createElement("section");
+  card.className = `host-awaiting kind-${awaiting.kind}`;
+  const heading = document.createElement("div");
+  heading.className = "host-awaiting-heading";
+  heading.textContent = awaiting.kind === "plan" ? "Plan ready for your approval" : "Waiting for your answer";
+  const text = document.createElement("div");
+  text.className = "host-awaiting-text";
+  text.textContent = awaiting.text;
+  card.append(heading, text);
+  if (awaiting.options?.length) {
+    const options = document.createElement("ul");
+    options.className = "host-awaiting-options";
+    awaiting.options.forEach((label) => {
+      const item = document.createElement("li");
+      item.textContent = label;
+      options.appendChild(item);
+    });
+    card.appendChild(options);
+  }
+  const note = document.createElement("div");
+  note.className = "host-awaiting-note";
+  note.textContent = `Answer in the terminal${awaiting.multi ? " (you can pick several)" : ""}${awaiting.questions > 1 ? ` · ${awaiting.questions} questions` : ""}.`;
+  card.appendChild(note);
+  $("messages").appendChild(card);
+}
+
+// Messages submitted in the terminal while the agent was busy; they become normal turns once dequeued.
+function renderHostQueue(queued) {
+  const wrap = document.createElement("section");
+  wrap.className = "host-queue";
+  const heading = document.createElement("div");
+  heading.className = "host-queue-heading";
+  heading.textContent = queued.length === 1 ? "1 message queued" : `${queued.length} messages queued`;
+  wrap.appendChild(heading);
+  queued.forEach((item) => {
+    const bubble = document.createElement("div");
+    bubble.className = "host-queue-item";
+    const pill = document.createElement("span");
+    pill.className = "host-queue-pill";
+    pill.textContent = "Queued";
+    const text = document.createElement("span");
+    text.className = "host-queue-text";
+    text.textContent = item.content;
+    bubble.append(pill, text);
+    wrap.appendChild(bubble);
+  });
+  $("messages").appendChild(wrap);
+}
+
+function createProgressHeader(elapsed = null) {
+  const header = document.createElement("summary");
+  header.className = "managed-progress-header";
+  const spinner = document.createElement("span");
+  spinner.className = "progress-spinner";
+  spinner.setAttribute("aria-hidden", "true");
+  const title = document.createElement("span");
+  title.className = "progress-title";
+  title.textContent = "Working…";
+  header.append(spinner, title);
+  if (elapsed) header.appendChild(elapsed);
+  return header;
+}
+
+function createHostProgressStep(step) {
+  const running = step.state === "running";
+  const item = document.createElement("li");
+  item.className = `progress-step ${running ? "step-running" : "step-done"} kind-${step.kind || "tool"}`;
+  const dot = document.createElement("span");
+  dot.className = "progress-dot";
+  dot.setAttribute("aria-hidden", "true");
+  const label = document.createElement("span");
+  label.className = "progress-label";
+  label.textContent = step.label || "Working";
+  label.title = label.textContent;
+  item.append(dot, label);
+  return item;
+}
+
+// Assistant commentary is already visible as chat text; the progress list only shows actions.
+function progressActions(steps) {
+  return steps.filter((step) => step.kind !== "text" && step.kind !== "commentary");
+}
+
+function permissionInputSummary(input) {
+  if (typeof input === "string") return input.slice(0, 300);
+  if (!input || typeof input !== "object") return String(input ?? "");
+  const value = input.command || input.description || input.path || input.file_path || input.url || JSON.stringify(input);
+  return String(value).slice(0, 300);
+}
+
+// Claude's AskUserQuestion arrives as a permission request; answer it with options and free text instead of approve/deny.
+function renderQuestionForm(permission, card) {
+  const questions = Array.isArray(permission.tool_input?.questions) ? permission.tool_input.questions : [];
+  const form = document.createElement("form");
+  form.className = "permission-question-form";
+  const fields = questions.map((question, index) => {
+    const box = document.createElement("fieldset");
+    box.className = "permission-question";
+    const legend = document.createElement("legend");
+    legend.textContent = [question.header, question.question].filter(Boolean).join(" · ") || `Question ${index + 1}`;
+    box.appendChild(legend);
+    const multi = Boolean(question.multiSelect);
+    const inputs = (question.options || []).map((option) => {
+      const label = document.createElement("label");
+      label.className = "permission-option";
+      const input = document.createElement("input");
+      input.type = multi ? "checkbox" : "radio";
+      input.name = `q${index}`;
+      input.value = option.label || "";
+      const text = document.createElement("span");
+      text.textContent = option.label || "";
+      if (option.description) { const hint = document.createElement("small"); hint.textContent = option.description; text.appendChild(hint); }
+      label.append(input, text);
+      box.appendChild(label);
+      return input;
+    });
+    const other = document.createElement("input");
+    other.type = "text";
+    other.className = "permission-other";
+    other.placeholder = "Or type your own answer";
+    other.oninput = () => { if (other.value && !multi) inputs.forEach((item) => { item.checked = false; }); };
+    inputs.forEach((item) => { item.onchange = () => { if (!multi && item.checked) other.value = ""; }; });
+    box.appendChild(other);
+    form.appendChild(box);
+    return { question: question.question || legend.textContent, inputs, other };
+  });
+  const actions = document.createElement("div");
+  actions.className = "permission-card-actions";
+  const submit = document.createElement("button");
+  submit.type = "submit";
+  submit.className = "permission-approve";
+  submit.textContent = "Send answer";
+  const skip = document.createElement("button");
+  skip.type = "button";
+  skip.className = "permission-deny";
+  skip.textContent = "Skip";
+  const send = async (body) => {
+    submit.disabled = skip.disabled = true;
+    try { await api(`/api/permissions/${encodeURIComponent(permission.request_id)}/decision`, { method: "POST", body: JSON.stringify(body) }); }
+    catch (error) { if (![404, 409].includes(error.status)) console.warn("Unable to answer question", error); submit.disabled = skip.disabled = false; }
+    await loadPermissions();
+  };
+  form.onsubmit = (event) => {
+    event.preventDefault();
+    const answers = {};
+    fields.forEach((field) => {
+      const typed = field.other.value.trim();
+      const picked = field.inputs.filter((item) => item.checked).map((item) => item.value);
+      const value = [...picked, ...(typed ? [typed] : [])].join(", ");
+      if (value) answers[field.question] = value;
+    });
+    if (!Object.keys(answers).length) return;
+    void send({ decision: "allow", answers });
+  };
+  skip.onclick = () => send({ decision: "deny", reason: "The user chose not to answer in Agent Slack." });
+  actions.append(submit, skip);
+  form.appendChild(actions);
+  card.appendChild(form);
+}
+
+async function loadPermissions() {
+  if (document.hidden) return;
+  try {
+    const payload = await api("/api/permissions");
+    state.permissions = payload.permissions || [];
+    renderPermissions();
+  } catch (error) {
+    if (!/401|Authentication required/.test(error.message)) console.warn("Unable to load permission requests", error);
+  }
+}
+
+function renderPermissions() {
+  const root = $("permissionCards");
+  const pending = state.permissions.filter((item) => item.status === "pending" && item.expires * 1000 > Date.now());
+  $("permissionCount").textContent = String(pending.length);
+  $("permissionCount").hidden = !pending.length;
+  // The list is polled every few seconds; rebuilding unchanged cards would wipe what the user is typing or selecting.
+  const visible = [...pending, ...state.permissions.filter((item) => item.status === "resolved" && Date.now() - item.resolved_at * 1000 < 5000)];
+  const signature = visible.map((item) => `${item.request_id}:${item.status}:${item.decision || ""}`).join("|")
+    + `|${new URLSearchParams(window.location.hash.slice(1)).get("permission") || ""}`;
+  if (signature === state.permissionSignature) return;
+  state.permissionSignature = signature;
+  root.replaceChildren();
+  const focusId = new URLSearchParams(window.location.hash.slice(1)).get("permission");
+  visible.forEach((permission) => {
+    const card = document.createElement("article");
+    card.className = `permission-card ${permission.status === "resolved" ? "resolved" : ""} ${permission.request_id === focusId ? "is-focused" : ""}`;
+    card.dataset.permissionId = permission.request_id;
+    const header = document.createElement("header");
+    const title = document.createElement("span");
+    title.textContent = `${permission.source === "codex" ? "Codex" : "Claude"} · ${permission.tool_name || "Tool"}`;
+    const cwd = document.createElement("span");
+    cwd.textContent = permission.cwd || "Unknown project";
+    header.append(title, cwd);
+    const summary = document.createElement("div");
+    summary.className = "permission-card-summary";
+    summary.textContent = permission.status === "resolved" ? (permission.tool_name === "AskUserQuestion" ? (permission.decision === "allow" ? "Answered" : "Skipped") : permission.decision === "allow" ? "Approved" : "Denied") : permissionInputSummary(permission.tool_input);
+    card.append(header, summary);
+    if (permission.status === "pending" && permission.tool_name === "AskUserQuestion" && permission.tool_input?.questions) {
+      summary.textContent = "Claude is asking you a question";
+      renderQuestionForm(permission, card);
+    } else if (permission.status === "pending") {
+      const expiry = document.createElement("small");
+      expiry.className = "permission-expiry";
+      expiry.textContent = `Expires in ${Math.max(0, Math.ceil(permission.expires - Date.now()))}s`;
+      const actions = document.createElement("div");
+      actions.className = "permission-card-actions";
+      [["Approve", "allow", "permission-approve"], ["Deny", "deny", "permission-deny"]].forEach(([label, decision, className]) => {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = className;
+        button.textContent = label;
+        button.onclick = async () => {
+          button.disabled = true;
+          try { await api(`/api/permissions/${encodeURIComponent(permission.request_id)}/decision`, { method: "POST", body: JSON.stringify({ decision }) }); }
+          catch (error) { if (![404, 409].includes(error.status)) console.warn("Unable to resolve permission", error); }
+          await loadPermissions();
+        };
+        actions.appendChild(button);
+      });
+      card.append(expiry, actions);
+    }
+    root.appendChild(card);
+    if (permission.request_id === focusId) requestAnimationFrame(() => card.scrollIntoView?.({ block: "center" }));
+  });
+}
+
+async function handleDeepLink() {
+  const params = new URLSearchParams(window.location.hash.slice(1));
+  if (params.has("permission")) {
+    await loadPermissions();
+    return;
+  }
+  const hostId = params.get("host");
+  if (!hostId) return;
+  const session = state.hostSessions.find((item) => item.session_id === hostId);
+  if (session) {
+    const owner = mostSpecificServer(session.project_root);
+    if (owner && (owner.server_id !== state.activeServerId || state.hostSessionsView)) await switchServer(owner.server_id);
+    else if (!owner && !state.hostSessionsView) await openHostSessionsServer();
+    await openHostSession(hostId);
+  } else if (!state.hostSessionsView) {
+    await loadAllSessions();
+    const discovered = state.hostSessions.find((item) => item.session_id === hostId);
+    if (discovered) await handleDeepLink();
+  }
 }
 
 function syncHostComposer(session) {
@@ -396,35 +808,17 @@ function syncHostComposer(session) {
 }
 
 async function openHostSession(sessionId, { preserveScroll = false } = {}) {
+  state.hostSubagentId = null;
   const requestId = ++state.hostSessionOpenRequest;
+  const cached = state.hostSessionDetails.get(sessionId);
+  if (cached) renderHostSession(cached, sessionId, requestId, preserveScroll);
   try {
     const session = await api(`/api/host-sessions/${encodeURIComponent(sessionId)}`);
-    if (requestId !== state.hostSessionOpenRequest || !state.hostSessionsView) return;
-    const messages = $("messages");
-    const followLatest = messages.scrollHeight - messages.scrollTop - messages.clientHeight < 80;
-    const previousScrollTop = messages.scrollTop;
-    state.hostSessionId = session.session_id;
-    state.currentChatId = session.session_id;
-    state.currentChatUpdatedAt = session.updated_at;
-    state.hostMessagesStatus = session.status || "History";
-    state.hostSessionLastError.delete(sessionId);
-    $("deleteChatBtn").disabled = true;
-    if (state.hostSessionsView) renderUnonboardedHostSessions();
-    syncHostComposer(session);
-    ["runAgentsBtn", "autoMeetingBtn", "manualMeetingBtn"].forEach((id) => { $(id).disabled = true; });
-    $("chatTitle").textContent = session.title;
-    renderHostSessionDetails(session);
-    state.streamingRows.clear();
-    $("messages").innerHTML = "";
-    (session.messages || []).forEach((message) => {
-      const row = document.createElement("article");
-      row.className = `message ${message.author_type}`;
-      row.innerHTML = `<div class="message-avatar">${initials(message.author_label)}</div><div class="message-body"><header><strong>${escapeHtml(message.author_label)}</strong></header><div class="message-content">${renderMarkdown(message.body)}</div></div>`;
-      $("messages").appendChild(row);
-    });
-    messages.scrollTop = preserveScroll && !followLatest ? previousScrollTop : messages.scrollHeight;
+    state.hostSessionDetails.set(session.session_id, session);
+    if (requestId !== state.hostSessionOpenRequest || (!state.hostSessionsView && !state.activeServerId)) return;
+    renderHostSession(session, sessionId, requestId, preserveScroll);
   } catch (error) {
-    if (requestId !== state.hostSessionOpenRequest || !state.hostSessionsView) return;
+    if (requestId !== state.hostSessionOpenRequest || (!state.hostSessionsView && !state.activeServerId)) return;
     const message = error.message || "The session could not be loaded.";
     if (state.hostSessionLastError.get(sessionId) !== message) {
       state.hostSessionLastError.set(sessionId, message);
@@ -444,48 +838,333 @@ async function openHostSession(sessionId, { preserveScroll = false } = {}) {
   }
 }
 
-function appendHostSessionPrompt(body) {
-  const row = document.createElement("article");
-  row.className = "message user";
-  row.innerHTML = `<div class="message-avatar">${initials("You")}</div><div class="message-body"><header><strong>You</strong></header><div class="message-content">${renderMarkdown(body)}</div></div>`;
-  $("messages").appendChild(row);
-  $("messages").scrollTop = $("messages").scrollHeight;
+function renderHostSession(session, sessionId, requestId, preserveScroll) {
+  if (requestId !== state.hostSessionOpenRequest || (!state.hostSessionsView && !state.activeServerId)) return;
+  const messages = $("messages");
+  const followLatest = messages.scrollHeight - messages.scrollTop - messages.clientHeight < 80;
+  const previousScrollTop = messages.scrollTop;
+  state.hostSessionId = session.session_id;
+  state.currentChatId = session.session_id;
+  state.currentChatUpdatedAt = session.updated_at;
+  state.currentChatSize = session.size_bytes;
+  state.hostMessagesStatus = session.status || "History";
+  state.hostSessionLastError.delete(sessionId);
+  $("deleteChatBtn").disabled = true;
+  if (state.hostSessionsView) renderUnonboardedHostSessions(); else renderProjectHostSessions();
+  syncHostComposer(session);
+  const hostHint = $("hostResumeHint");
+  hostHint.textContent = session.resume_hint || "";
+  hostHint.hidden = !hostHint.textContent;
+  ["runAgentsBtn", "autoMeetingBtn", "manualMeetingBtn"].forEach((id) => { $(id).disabled = true; });
+  setChatTitle(session.title, true);
+  renderHostSessionDetails(session);
+  state.streamingRows.forEach(clearManagedProgress);
+  state.streamingRows.clear();
+  $("messages").innerHTML = "";
+  renderHostSubagents(session);
+  let previousAuthor = null;
+  (session.messages || []).forEach((message) => {
+    const row = document.createElement("article");
+    const author = message.author_label || message.author_id;
+    const showAuthor = !["user", "system"].includes(message.author_type) && author !== previousAuthor;
+    row.className = `message ${message.author_type}${showAuthor ? " show-author" : ""}`;
+    row.innerHTML = `<div class="message-avatar">${initials(message.author_label)}</div><div class="message-body"><header><strong>${escapeHtml(message.author_label)}</strong></header><div class="message-content">${renderMarkdown(message.body)}</div></div>`;
+    $("messages").appendChild(row);
+    previousAuthor = author;
+  });
+  state.hostSessionMessages.set(session.session_id, session.messages || []);
+  renderHostPendingPrompts(session.session_id, session.messages || []);
+  if (session.resuming && !state.hostResumes.has(session.session_id)) {
+    state.hostResumes.set(session.session_id, true);
+    void resumeHostSessionInBackground(session.session_id, "", { attach: true });
+  }
+  if (session.status === "Running" && (session.progress?.length || session.subagents?.length)) renderHostProgress(session.progress || [], session.subagents || []);
+  if (session.status === "Running" && session.queued?.length) renderHostQueue(session.queued);
+  if (session.awaiting) renderHostAwaiting(session.awaiting);
+  messages.scrollTop = preserveScroll && !followLatest ? previousScrollTop : messages.scrollHeight;
 }
 
-async function waitForHostSessionResume(sessionId) {
+function renderHostSubagents(session) {
+  const agents = session.subagents || [];
+  if (!agents.length) return;
+  const running = agents.some((agent) => agent.status === "running");
+  const panel = document.createElement("details");
+  panel.className = "host-subagents";
+  panel.open = running;
+  const summary = document.createElement("summary");
+  const finished = agents.filter((agent) => agent.status === "done").length;
+  const attention = agents.filter((agent) => ["failed", "aborted", "stalled"].includes(agent.status)).length;
+  summary.textContent = running ? `Agents · ${agents.filter((agent) => agent.status === "running").length} running`
+    : attention ? `Agents · ${finished} finished · ${attention} need attention`
+      : `${agents.length} agents finished`;
+  panel.appendChild(summary);
+  agents.forEach((agent) => {
+    const card = document.createElement("button"); card.type = "button"; card.className = "subagent-card";
+    const name = document.createElement("strong"); name.textContent = `${agent.nickname} · ${agent.role}`;
+    const status = document.createElement("span"); status.className = `subagent-status ${agent.status}`;
+    status.textContent = ({ running: "◌ Running", done: "✓ Done", failed: "! Failed", aborted: "↶ Aborted", stalled: "… Stalled" })[agent.status] || agent.status;
+    const task = document.createElement("span"); task.textContent = agent.task || "Sub-agent task";
+    card.append(name, status, task);
+    if (agent.status === "running" && agent.current_step) { const step = document.createElement("small"); step.textContent = agent.current_step; card.appendChild(step); }
+    if (agent.status === "done" && agent.result_preview) { const result = document.createElement("small"); result.textContent = agent.result_preview; card.appendChild(result); }
+    card.onclick = () => openHostSubagent(session.session_id, agent.id);
+    panel.appendChild(card);
+  });
+  $("messages").appendChild(panel);
+}
+
+async function openHostSubagent(parentId, subId) {
+  try {
+    const child = await api(`/api/host-sessions/${encodeURIComponent(parentId)}/subagents/${encodeURIComponent(subId)}`);
+    state.hostSubagentId = subId;
+    const messages = $("messages"); messages.replaceChildren();
+    const back = document.createElement("button"); back.type = "button"; back.className = "secondary-button"; back.textContent = "← Back to parent";
+    back.onclick = () => openHostSession(parentId, { preserveScroll: true }); messages.appendChild(back);
+    const heading = document.createElement("h3"); heading.textContent = `${child.nickname} · ${child.role} · ${child.status}`; messages.appendChild(heading);
+    (child.messages || []).forEach((message) => {
+      const row = document.createElement("article"); row.className = `message ${message.author_type}`;
+      const body = document.createElement("div"); body.className = "message-content"; body.textContent = message.body; row.appendChild(body); messages.appendChild(row);
+    });
+    if (child.progress?.length) renderHostProgress(child.progress);
+    $("messageInput").disabled = true; $("sendBtn").disabled = true;
+  } catch (error) { console.warn("Unable to load sub-agent", error); }
+}
+
+// A host-session prompt stays visible until the transcript confirms it, including after a failed resume.
+function appendPendingUserRow(body, note = "", pending = null) {
+  const row = document.createElement("article");
+  row.className = "message user pending";
+  row.dataset.pending = "1";
+  if (pending?.request_id) row.dataset.requestId = pending.request_id;
+  row.innerHTML = `<div class="message-avatar">${initials("You")}</div><div class="message-body"><header><strong>You</strong><time>sending…</time></header><div class="message-content">${renderMarkdown(body)}</div></div>`;
+  if (note) {
+    const extra = document.createElement("div");
+    extra.className = "pending-note";
+    extra.textContent = note;
+    row.querySelector(".message-body").appendChild(extra);
+  }
+  $("messages").appendChild(row);
+  if (pending?.partial_text) appendPendingAssistantText(pending.request_id, pending.partial_text);
+  if (pending?.failed) markPendingPromptFailed(row, pending);
+  $("messages").scrollTop = $("messages").scrollHeight;
+  return row;
+}
+
+function countUserMessages(messages, body) {
+  const wanted = body.trim();
+  return (messages || []).filter((message) => message.author_type === "user" && String(message.body || "").trim() === wanted).length;
+}
+
+function appendHostSessionPrompt(sessionId, body) {
+  // baseline: how many identical prompts the transcript already holds, so a repeated "continue" is not
+  // mistaken for the one we are still waiting to see.
+  const known = state.hostSessionMessages.get(sessionId) || [];
+  const pending = state.hostPendingPrompts.get(sessionId) || [];
+  const requestId = globalThis.crypto?.randomUUID?.() || `resume-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  const prompt = { request_id: requestId, body, baseline: countUserMessages(known, body) + pending.filter((item) => item.body.trim() === body.trim()).length };
+  pending.push(prompt);
+  state.hostPendingPrompts.set(sessionId, pending);
+  saveHostPendingPrompts();
+  appendPendingUserRow(body, "", prompt);
+  return requestId;
+}
+
+// Re-draw prompts the transcript does not contain yet (the CLI writes them a moment after it starts).
+function renderHostPendingPrompts(sessionId, messages) {
+  const pending = state.hostPendingPrompts.get(sessionId);
+  if (!pending?.length) return;
+  const remaining = pending.filter((item) => countUserMessages(messages, item.body) <= item.baseline);
+  if (remaining.length) state.hostPendingPrompts.set(sessionId, remaining); else state.hostPendingPrompts.delete(sessionId);
+  saveHostPendingPrompts();
+  remaining.forEach((item) => appendPendingUserRow(item.body, "", item));
+}
+
+function appendPendingAssistantText(requestId, text) {
+  const row = [...document.querySelectorAll("#messages [data-request-id]")].reverse()
+    .find((item) => item.dataset.requestId === requestId);
+  if (!row) return;
+  let partial = row.querySelector(".pending-assistant");
+  if (!partial) {
+    partial = document.createElement("div");
+    partial.className = "pending-assistant message-content";
+    row.appendChild(partial);
+  }
+  partial.textContent = text;
+}
+
+function markPendingPromptFailed(row, pending) {
+  row.classList.add("failed");
+  const time = row.querySelector("time");
+  if (time) time.textContent = pending.cancelled ? "stopped · kept here" : "failed · kept here";
+  if (row.querySelector("[data-retry]")) return;
+  const retry = document.createElement("button");
+  retry.type = "button";
+  retry.className = "secondary-button";
+  retry.dataset.retry = "1";
+  retry.textContent = "Retry";
+  retry.onclick = () => { $("messageInput").value = pending.body; $("messageInput").focus(); };
+  row.appendChild(retry);
+}
+
+function formatClock(seconds) {
+  const total = Math.max(0, Math.round(seconds || 0));
+  return `${Math.floor(total / 60)}:${String(total % 60).padStart(2, "0")}`;
+}
+
+// While the CLI works: live clock on the button, stage text, and a Stop button.
+function renderHostResumeProgress(sessionId, status) {
+  if (state.hostSessionId !== sessionId) return;
+  const loading = status.stage === "starting";
+  $("sendBtn").textContent = `${loading ? "Loading session" : "Working"}… ${formatClock(status.elapsed)}`;
+  $("messageInput").placeholder = loading ? "Loading the session…" : "Working… you can stop it at any time";
+  $("stopRunBtn").hidden = false;
+  $("stopRunBtn").disabled = false;
+  $("stopRunBtn").textContent = "Stop";
+}
+
+// A failed poll (network blip, phone tab suspended, proxy 5xx) says nothing about the run: the CLI keeps
+// working on the server. Only a status the server reports (failed / cancelled) ends the wait.
+const RESUME_POLL_TOLERANCE = 30;
+
+async function waitForHostSessionResume(sessionId, requestId) {
+  let misses = 0;
+  let after = -1;
   while (true) {
-    await new Promise((resolve) => setTimeout(resolve, 1200));
-    const status = await api(`/api/host-sessions/${encodeURIComponent(sessionId)}/resume`);
+    let status;
+    try {
+      status = await api(`/api/host-sessions/${encodeURIComponent(sessionId)}/resume?after=${after}`);
+      misses = 0;
+    } catch (error) {
+      if (error.status === 401 || ++misses > RESUME_POLL_TOLERANCE) throw error;
+      await new Promise((resolve) => setTimeout(resolve, Math.min(5000, 1000 * misses)));
+      continue;
+    }
+    if (status.request_id && requestId && status.request_id !== requestId) {
+      const stale = new Error("Resume status belongs to a different request");
+      stale.lost = true;
+      throw stale;
+    }
+    let assistantDelta = "";
+    for (const event of status.events || []) {
+      after = Math.max(after, Number(event.i) || 0);
+      if (event.type === "assistant" && typeof event.text === "string") assistantDelta += event.text;
+    }
+    if (Number.isFinite(status.next)) after = Math.max(after, status.next - 1);
+    if (status.session_id && status.session_id !== sessionId) {
+      transferPendingHostPrompts(sessionId, status.session_id);
+      if (state.hostSessionId === status.session_id) void openHostSession(status.session_id, { preserveScroll: true });
+    }
+    const pending = (state.hostPendingPrompts?.get(status.session_id || sessionId) || [])
+      .find((item) => item.request_id === requestId);
+    if (pending && (typeof status.partial_text === "string" || assistantDelta)) {
+      pending.partial_text = typeof status.partial_text === "string"
+        ? status.partial_text : `${pending.partial_text || ""}${assistantDelta}`;
+      saveHostPendingPrompts();
+      appendPendingAssistantText(requestId, pending.partial_text);
+    }
     if (status.status === "completed") return status;
-    if (status.status === "failed") throw new Error(status.error || "Native session resume failed");
-    if (status.status !== "running") throw new Error("Native session resume status was lost");
+    if (status.status === "cancelled") { const stopped = new Error("Stopped"); stopped.cancelled = true; throw stopped; }
+    if (status.status === "failed") {
+      const failure = new Error(status.error || "Native session resume failed");
+      failure.detail = status.detail || "";
+      throw failure;
+    }
+    if (status.status !== "running") {
+      // The server forgot the job (it restarted). The transcript is the source of truth, so keep the prompt.
+      const lost = new Error("Lost track of the run (the server may have restarted). Showing the transcript as it stands.");
+      lost.lost = true;
+      throw lost;
+    }
+    renderHostResumeProgress(sessionId, status);
+    await new Promise((resolve) => setTimeout(resolve, 400));
   }
 }
 
-async function resumeHostSessionInBackground(sessionId, body) {
+function transferPendingHostPrompts(sourceId, returnedId) {
+  if (sourceId === returnedId) return;
+  if (state.hostPendingPrompts?.has(sourceId)) {
+    const pending = state.hostPendingPrompts.get(sourceId);
+    const known = state.hostSessionMessages.get(returnedId) || [];
+    state.hostPendingPrompts.set(returnedId, pending.map((item, index) => ({
+      ...item,
+      baseline: Math.max(item.baseline || 0, countUserMessages(known, item.body)
+        + pending.slice(0, index).filter((prior) => prior.body.trim() === item.body.trim()).length),
+    })));
+    state.hostPendingPrompts.delete(sourceId);
+    saveHostPendingPrompts();
+  }
+  if (state.hostResumes.has(sourceId)) {
+    state.hostResumeAliases.set(sourceId, returnedId);
+    state.hostResumes.set(returnedId, true);
+  }
+  if (state.hostSessionId === sourceId) state.hostSessionId = returnedId;
+}
+
+// attach: the page was reloaded (or opened elsewhere) while the server's CLI run is still going, so only follow it.
+async function resumeHostSessionInBackground(sessionId, body, options) {
+  const attach = Boolean(options && options.attach);
+  let requestId = options?.requestId || "";
   try {
-    await api(`/api/host-sessions/${encodeURIComponent(sessionId)}/resume`, {
-      method: "POST", body: JSON.stringify({ body }),
-    });
-    const resumed = await waitForHostSessionResume(sessionId);
+    if (!requestId) requestId = (state.hostPendingPrompts.get(sessionId) || []).find((item) => !item.failed)?.request_id || "";
+    if (!attach) {
+      await api(`/api/host-sessions/${encodeURIComponent(sessionId)}/resume`, {
+        method: "POST", body: JSON.stringify({ body, request_id: requestId }),
+      });
+    }
+    const resumed = await waitForHostSessionResume(sessionId, requestId);
     await loadAllSessions();
     const returnedId = resumed.session_id || sessionId;
+    if (returnedId !== sessionId) transferPendingHostPrompts(sessionId, returnedId);
     if (state.hostSessionId === sessionId || state.hostSessionId === returnedId) {
       state.hostSessionId = returnedId;
       await openHostSession(returnedId, { preserveScroll: true });
     }
   } catch (error) {
-    if (state.hostSessionId === sessionId) {
+    const pendingSessionId = state.hostResumeAliases.get(sessionId) || sessionId;
+    const pending = state.hostPendingPrompts.get(pendingSessionId) || [];
+    pending.forEach((item) => { if (!requestId || item.request_id === requestId) { item.failed = true; item.cancelled = Boolean(error.cancelled); } });
+    if (pending.length) state.hostPendingPrompts.set(pendingSessionId, pending);
+    saveHostPendingPrompts();
+    document.querySelectorAll("#messages [data-pending]").forEach((row) => {
+      const item = pending.find((candidate) => candidate.request_id === row.dataset.requestId);
+      if (item) markPendingPromptFailed(row, item);
+    });
+    if (state.hostSessionId === sessionId || state.hostSessionId === pendingSessionId) {
       const row = document.createElement("article");
       row.className = "message host-session-error";
       row.setAttribute("role", "status");
-      row.textContent = `Unable to continue native session: ${error.message}`;
+      row.textContent = error.lost ? error.message : error.cancelled ? "Stopped. Your message is back in the box." : `Unable to continue native session: ${error.message}`;
+      if (error.detail) {
+        const details = document.createElement("details");
+        const summary = document.createElement("summary");
+        summary.textContent = "Details";
+        const raw = document.createElement("pre");
+        raw.textContent = error.detail;
+        details.append(summary, raw);
+        row.appendChild(details);
+      }
+      if (!error.lost && body && !pending.some((item) => item.request_id === requestId && item.body === body)) {
+        const retry = document.createElement("button");
+        retry.type = "button";
+        retry.className = "secondary-button";
+        retry.textContent = "Retry";
+        retry.onclick = () => {
+          $("messageInput").value = body;
+          $("messageInput").focus();
+        };
+        row.appendChild(retry);
+      }
       $("messages").appendChild(row);
-      $("messageInput").value = body;
+      if (body) $("messageInput").value = body;
       $("messages").scrollTop = $("messages").scrollHeight;
     }
   } finally {
     state.hostResumes.delete(sessionId);
+    const forkedSessionId = state.hostResumeAliases.get(sessionId);
+    if (forkedSessionId) state.hostResumes.delete(forkedSessionId);
+    state.hostResumeAliases.delete(sessionId);
+    $("stopRunBtn").hidden = true;
+    $("stopRunBtn").disabled = false;
     if (state.hostSessionsView) renderUnonboardedHostSessions();
     await loadAllSessions();
     const session = state.hostSessions.find((item) => item.session_id === state.hostSessionId);
@@ -509,7 +1188,7 @@ function renderEmptyServerState() {
   state.chatListSignature = "";
   state.orchestratorIds = [];
   $("workspaceLabel").textContent = "Agent Slack";
-  $("chatTitle").textContent = "Add an agent system";
+  setChatTitle("Add an agent system", false);
   $("chatMembers").textContent = "Each server connects to one local agent-system folder.";
   $("messages").innerHTML = `
     <div class="empty-server">
@@ -566,7 +1245,7 @@ async function loadChats({ openFirst = true } = {}) {
 function renderNoChatState() {
   state.currentChatId = null;
   state.currentChatUpdatedAt = null;
-  $("chatTitle").textContent = "Select a chat";
+  setChatTitle("Select a chat", false);
   $("chatMembers").textContent = "";
   $("messages").innerHTML = '<div class="empty-server"><strong>No chats yet</strong><p>Create a chat or open a person to begin.</p></div>';
   $("deleteChatBtn").disabled = true;
@@ -575,7 +1254,8 @@ function renderNoChatState() {
 async function openChat(chatId) {
   try {
     const chat = await api(`/api/chats/${chatId}`);
-    state.hostSessionId = null;
+    try { await loadRunnerOptions(); } catch (error) { console.warn("Unable to load runner options", error); }
+    state.hostSessionId = null; setHostMode(false);
     ["runAgentsBtn", "autoMeetingBtn", "manualMeetingBtn"].forEach((id) => { $(id).disabled = !state.activeServerId; });
     $("messageInput").disabled = !state.activeServerId;
     $("sendBtn").disabled = !state.activeServerId;
@@ -594,7 +1274,7 @@ async function openChat(chatId) {
     state.currentChatId = null;
     state.currentChatUpdatedAt = null;
     $("deleteChatBtn").disabled = true;
-    $("chatTitle").textContent = "Unable to open chat";
+    setChatTitle("Unable to open chat", false);
     $("chatMembers").textContent = "";
     $("messages").innerHTML = `<div class="empty-server chat-open-error"><strong>Unable to open this chat</strong><p>${escapeHtml(error.message || "The chat could not be loaded.")}</p><button type="button" class="secondary-button" data-retry-chat="${escapeHtml(chatId)}">Retry</button></div>`;
     $("messages").querySelector("[data-retry-chat]")?.addEventListener("click", () => openChat(chatId));
@@ -602,7 +1282,7 @@ async function openChat(chatId) {
 }
 
 async function syncChatState() {
-  if (state.hostSessionsView || !state.activeServerId || state.streamAttached || state.syncInProgress || document.hidden) return;
+  if (state.hostSessionsView || state.hostSessionId || !state.activeServerId || state.streamAttached || state.syncInProgress || document.hidden) return;
   const serverId = state.activeServerId;
   state.syncInProgress = true;
   try {
@@ -705,18 +1385,64 @@ async function openAgentDm(agent) {
   }
 }
 
-function renderChat(chat) {
+async function loadRunnerOptions(force = false) {
+  if (!force && state.runnerOptions && Date.now() - state.runnerOptionsAt < 60000) return state.runnerOptions;
+  state.runnerOptions = await api("/api/runners");
+  state.runnerOptionsAt = Date.now();
+  return state.runnerOptions;
+}
+
+function fillRunnerSelect(select, modelSelect, selectedRunner, selectedModel) {
+  const runners = state.runnerOptions?.runners || [];
+  select.replaceChildren();
+  runners.forEach((runner) => {
+    const option = document.createElement("option");
+    option.value = runner.id;
+    option.textContent = `${runner.label}${runner.available ? "" : " (not installed)"}`;
+    option.disabled = !runner.available;
+    option.selected = runner.id === (selectedRunner || state.runnerOptions.default_runner);
+    select.appendChild(option);
+  });
+  const runner = runners.find((item) => item.id === select.value) || runners[0];
+  modelSelect.replaceChildren();
+  const defaultOption = document.createElement("option");
+  defaultOption.value = "";
+  defaultOption.textContent = `Default${runner?.default_model ? ` (${runner.default_model})` : ""}`;
+  modelSelect.appendChild(defaultOption);
+  (runner?.models || []).forEach((model) => {
+    const option = document.createElement("option");
+    option.value = model.id;
+    option.textContent = model.label;
+    option.title = model.description || model.id;
+    modelSelect.appendChild(option);
+  });
+  modelSelect.value = selectedModel || "";
+}
+
+async function renderChat(chat) {
   const messages = $("messages");
   const followLatest = messages.scrollHeight - messages.scrollTop - messages.clientHeight < 80;
   const previousScrollTop = messages.scrollTop;
-  $("chatTitle").textContent = chat.title;
-  $("chatMembers").textContent = chat.member_ids.join(", ");
+  setChatTitle(chat.title, true);
+  state.currentChatSettings = chat;
+  if (!state.hostSessionId) {
+    const locked = Boolean(chat.settings_locked || state.runInProgress);
+    $("chatRunnerSettings").hidden = locked;
+    const runnerInfo = state.runnerOptions?.runners?.find((item) => item.id === (chat.runner || state.runnerOptions.default_runner));
+    if (locked) $("chatMembers").textContent = `${runnerInfo?.label || chat.runner || "Default"} · ${chat.model || "Default"}`;
+    else $("chatMembers").textContent = chat.member_ids.join(", ");
+    if (!locked && state.runnerOptions) fillRunnerSelect($("chatRunnerSelect"), $("chatModelSelect"), chat.runner, chat.model);
+  }
   state.currentChatUpdatedAt = chat.updated_at || null;
+  state.streamingRows.forEach(clearManagedProgress);
   state.streamingRows.clear();
   messages.innerHTML = "";
+  let previousAuthor = null;
   chatSync.visibleMessages(chat.messages).forEach((message) => {
     const row = document.createElement("article");
-    row.className = `message ${message.author_type}`;
+    const author = message.author_label || message.author_id;
+    const showAuthor = !["user", "system"].includes(message.author_type) && author !== previousAuthor;
+    row.className = `message ${message.author_type}${showAuthor ? " show-author" : ""}`;
     row.innerHTML = `
       <div class="message-avatar">${initials(message.author_label || message.author_id)}</div>
       <div class="message-body">
@@ -737,6 +1463,7 @@ function renderChat(chat) {
       getActionStatus: (action, nodeId) => actionStatusForMessage(chat, message.message_id, nodeId, action?.type),
     });
     messages.appendChild(row);
+    previousAuthor = author;
   });
   messages.scrollTop = followLatest ? messages.scrollHeight : previousScrollTop;
 }
@@ -1444,16 +2171,37 @@ function createStreamingRow(taskId, agentId, agentLabel) {
         <time>working now</time>
         <button class="agent-stop-button" type="button">Stop</button>
       </header>
-      <div class="message-content"><span class="typing-dots"><i></i><i></i><i></i></span></div>
+      <div class="message-content"></div>
     </div>
   `;
   $("messages").appendChild(row);
   $("messages").scrollTop = $("messages").scrollHeight;
   const stopButton = row.querySelector(".agent-stop-button");
   stopButton.onclick = () => stopAgentTask(taskId);
+  const body = row.querySelector(".message-content");
+  const progressPanel = document.createElement("details");
+  progressPanel.className = "host-progress managed-progress";
+  progressPanel.open = true;
+  const elapsed = document.createElement("span");
+  elapsed.className = "managed-progress-elapsed";
+  elapsed.textContent = "0s";
+  progressPanel.appendChild(createProgressHeader(elapsed));
+  const progressList = document.createElement("ul");
+  progressList.className = "progress-steps";
+  progressPanel.appendChild(progressList);
+  const messageBody = row.querySelector(".message-body");
+  messageBody.insertBefore(progressPanel, body);
+  const startedAt = Date.now();
+  const elapsedTimer = setInterval(() => {
+    elapsed.textContent = `${Math.floor((Date.now() - startedAt) / 1000)}s`;
+  }, 1000);
   state.streamingRows.set(taskId, {
     row,
-    body: row.querySelector(".message-content"),
+    body,
+    progressPanel,
+    progressList,
+    progressSteps: new Map(),
+    elapsedTimer,
     stopButton,
     agentId,
     rawText: "",
@@ -1467,10 +2215,42 @@ function createStreamingRow(taskId, agentId, agentLabel) {
   return state.streamingRows.get(taskId);
 }
 
+function clearManagedProgress(stream) {
+  if (!stream) return;
+  if (stream.elapsedTimer) clearInterval(stream.elapsedTimer);
+  stream.elapsedTimer = null;
+  stream.progressPanel?.remove();
+  stream.progressPanel = null;
+}
+
+function renderManagedProgress(stream) {
+  if (!stream?.progressList) return;
+  const steps = progressActions([...stream.progressSteps.values()]);
+  const visible = stream.progressExpanded ? steps : steps.slice(-4);
+  stream.progressList.replaceChildren(...visible.map(createHostProgressStep));
+  stream.progressShowAll?.remove();
+  stream.progressShowAll = null;
+  if (!stream.progressExpanded && steps.length > visible.length) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "progress-more";
+    button.textContent = `Show all ${steps.length} steps`;
+    button.onclick = () => {
+      stream.progressExpanded = true;
+      renderManagedProgress(stream);
+    };
+    stream.progressPanel.appendChild(button);
+    stream.progressShowAll = button;
+  }
+}
+
 function applyActiveRun(run, chatId = state.currentChatId) {
   if (!run) {
     if (state.runInProgress && state.currentRunChatId && state.currentRunChatId !== chatId) return;
-    state.streamingRows.forEach((stream) => stream.row.remove());
+    state.streamingRows.forEach((stream) => {
+      clearManagedProgress(stream);
+      stream.row.remove();
+    });
     state.streamingRows.clear();
     state.runInProgress = false;
     state.currentRunId = null;
@@ -1483,6 +2263,11 @@ function applyActiveRun(run, chatId = state.currentChatId) {
   }
 
   state.runInProgress = true;
+  if (chatId === state.currentChatId) { $("chatRunnerSettings").hidden = true; $("chatRunnerSelect").disabled = true; $("chatModelSelect").disabled = true; }
+  if (chatId === state.currentChatId && state.currentChatSettings) {
+    const selectedRunner = state.runnerOptions?.runners?.find((item) => item.id === (state.currentChatSettings.runner || state.runnerOptions.default_runner));
+    $("chatMembers").textContent = `${selectedRunner?.label || state.currentChatSettings.runner || "Default"} · ${state.currentChatSettings.model || "Default"}`;
+  }
   state.currentRunId = run.run_id;
   state.currentRunChatId = chatId;
   $("stopRunBtn").hidden = false;
@@ -1496,12 +2281,14 @@ function applyActiveRun(run, chatId = state.currentChatId) {
   const runningTaskIds = new Set(runningTasks.map((task) => task.task_id));
   state.streamingRows.forEach((stream, taskId) => {
     if (!runningTaskIds.has(taskId)) {
+      clearManagedProgress(stream);
       stream.row.remove();
       state.streamingRows.delete(taskId);
     }
   });
   runningTasks.forEach((task) => {
     const stream = createStreamingRow(task.task_id, task.agent_id, task.agent_label || task.agent_id);
+    stream.row.querySelector("time").textContent = "Working…";
     stream.rawText = task.text || "";
     stream.started = Boolean(stream.rawText);
     const uiFence = stream.rawText.search(/```agent-ui(?:\s*\n|$)/i);
@@ -1539,6 +2326,16 @@ async function renderStreamEvent(event, streamChatId = state.currentChatId) {
   } else if (event.type === "agent_started") {
     const stream = createStreamingRow(taskId, event.agent_id, event.agent_label);
     stream.messageId = event.message_id || null;
+    stream.row.querySelector("time").textContent = "Working…";
+  } else if (event.type === "agent_progress") {
+    const stream = state.streamingRows.get(taskId);
+    if (!stream || !stream.progressPanel) return;
+    stream.progressSteps.set(event.step_id, {
+      kind: event.kind,
+      label: `${event.kind === "subagent" ? "Subagent: " : ""}${String(event.label || "Working")}`.slice(0, 120),
+      state: event.state === "done" ? "done" : "running",
+    });
+    renderManagedProgress(stream);
   } else if (event.type === "ui.started" && state.generativeUiEnabled) {
     const stream = state.streamingRows.get(taskId);
     if (!stream) return;
@@ -1601,6 +2398,7 @@ async function renderStreamEvent(event, streamChatId = state.currentChatId) {
   } else if (event.type === "agent_completed") {
     const stream = state.streamingRows.get(taskId);
     if (stream) {
+      clearManagedProgress(stream);
       stream.body.innerHTML = renderMarkdown(event.body !== undefined ? event.body : stream.rawText);
       stream.uiLoading?.remove();
       const finalUi = event.ui || stream.uiSpec;
@@ -1624,6 +2422,7 @@ async function renderStreamEvent(event, streamChatId = state.currentChatId) {
       stream = state.streamingRows.get(taskId);
     }
     if (stream) {
+      clearManagedProgress(stream);
       stream.body.innerHTML = renderMarkdown(event.message || "**Agent run failed.**");
       stream.row.classList.remove("streaming");
       stream.row.classList.add("failed");
@@ -1638,6 +2437,7 @@ async function renderStreamEvent(event, streamChatId = state.currentChatId) {
       stream = state.streamingRows.get(taskId);
     }
     if (stream) {
+      clearManagedProgress(stream);
       const stopped = event.message || "Stopped by user.";
       const visibleText = visibleStreamText(stream.rawText);
       const content = visibleText ? `${visibleText}\n\n_${stopped}_` : `_${stopped}_`;
@@ -1650,9 +2450,13 @@ async function renderStreamEvent(event, streamChatId = state.currentChatId) {
       state.stoppingTaskIds.delete(taskId);
     }
   } else if (event.type === "run_cancelled") {
+    state.streamingRows.forEach(clearManagedProgress);
     $("stopRunBtn").disabled = true;
     $("stopRunBtn").textContent = "Stopped";
+  } else if (event.type === "run_completed") {
+    state.streamingRows.forEach(clearManagedProgress);
   } else if (event.type === "error") {
+    state.streamingRows.forEach(clearManagedProgress);
     const error = new Error(event.message || "Agent run failed");
     error.agentRunFailure = true;
     throw error;
@@ -1747,6 +2551,18 @@ async function stopAgentTask(taskId) {
 }
 
 async function stopCurrentRun() {
+  if (state.hostSessionId && state.hostResumes.has(state.hostSessionId)) {
+    $("stopRunBtn").disabled = true;
+    $("stopRunBtn").textContent = "Stopping...";
+    try {
+      await api(`/api/host-sessions/${encodeURIComponent(state.hostSessionId)}/resume/cancel`, { method: "POST", body: "{}" });
+    } catch (error) {
+      console.warn("Unable to stop the resume", error);
+      $("stopRunBtn").disabled = false;
+      $("stopRunBtn").textContent = "Stop";
+    }
+    return;
+  }
   if (!state.currentRunId || !state.runInProgress) return;
   $("stopRunBtn").disabled = true;
   $("stopRunBtn").textContent = "Stopping...";
@@ -1773,6 +2589,9 @@ async function runChatStream(payload, chatId = state.currentChatId) {
   $("sendBtn").textContent = "Working...";
   try {
     await streamApi(`/api/chats/${chatId}/run-stream`, payload, async (event) => {
+      if ((event.type === "agent_completed" || event.type === "run_completed") && chatId === state.currentChatId) {
+        try { renderChat(await api(`/api/chats/${encodeURIComponent(chatId)}`)); } catch (_) { /* the final reload retries */ }
+      }
       if (event.type === "meeting_created") {
         resultChatId = event.chat_id;
         await loadChats();
@@ -1784,13 +2603,17 @@ async function runChatStream(payload, chatId = state.currentChatId) {
     });
   } catch (error) {
     console.warn("Agent Slack stream detached", error);
+    state.streamingRows.forEach(clearManagedProgress);
     alert(chatSync.streamErrorMessage(error));
   } finally {
     state.streamAttached = false;
     state.runInProgress = false;
+    $("chatRunnerSelect").disabled = false;
+    $("chatModelSelect").disabled = false;
     state.currentRunId = null;
     state.currentRunChatId = null;
     state.stoppingTaskIds.clear();
+    state.streamingRows.forEach(clearManagedProgress);
     state.streamingRows.clear();
     $("stopRunBtn").hidden = true;
     $("deleteChatBtn").disabled = !state.currentChatId;
@@ -2143,7 +2966,8 @@ const SLASH_PATH_COMMAND = /^\/path\s+(.+)$/;
 async function sendMessage() {
   if (!state.currentChatId) return;
   const body = $("messageInput").value.trim();
-  if (!body) return;
+  if (!body && !state.pendingAttachments.length) return;
+  $("uploadError").hidden = true;
   const pathCommand = body.match(SLASH_PATH_COMMAND);
   if (state.hostSessionId) {
     if (pathCommand || state.pendingAttachments.length) {
@@ -2153,13 +2977,13 @@ async function sendMessage() {
     const sessionId = state.hostSessionId;
     const session = state.hostSessions.find((item) => item.session_id === sessionId);
     if (!session?.available || state.hostResumes.has(sessionId) || session.resuming) return;
-    appendHostSessionPrompt(body);
+    const requestId = appendHostSessionPrompt(sessionId, body);
     $("messageInput").value = "";
     state.hostResumes.set(sessionId, true);
     renderUnonboardedHostSessions();
     renderHostSessionDetails(session);
     syncHostComposer(session);
-    void resumeHostSessionInBackground(sessionId, body);
+    void resumeHostSessionInBackground(sessionId, body, { requestId });
     return;
   }
   if (state.runInProgress) return;
@@ -2171,6 +2995,11 @@ async function sendMessage() {
   const currentChat = state.chats.find((chat) => chat.chat_id === state.currentChatId);
   $("sendBtn").disabled = true;
   $("sendBtn").textContent = state.pendingAttachments.length ? "Uploading..." : "Sending...";
+  const attachmentNote = state.pendingAttachments.length
+    ? `📎 ${state.pendingAttachments.map((file) => file.name).join(", ")}` : "";
+  const pendingRow = appendPendingUserRow(body, attachmentNote);
+  $("messageInput").value = "";
+  let stored = false;
   try {
     const uploads = await Promise.all(state.pendingAttachments.map(uploadAttachment));
     await api(`/api/chats/${state.currentChatId}/messages`, {
@@ -2180,7 +3009,7 @@ async function sendMessage() {
         attachment_ids: uploads.map((attachment) => attachment.attachment_id),
       }),
     });
-    $("messageInput").value = "";
+    stored = true;
     clearPendingAttachments();
     await openChat(state.currentChatId);
     const runPayload = runPayloadForMessage(currentChat, body);
@@ -2191,9 +3020,14 @@ async function sendMessage() {
       $("sendBtn").textContent = "Send";
     }
   } catch (error) {
+    if (!stored) {
+      // Not saved: take the bubble back and return the text to the box so nothing is lost or double-sent.
+      pendingRow.remove();
+      if (!$("messageInput").value) $("messageInput").value = body;
+    }
     $("sendBtn").disabled = false;
     $("sendBtn").textContent = "Send";
-    alert(`Unable to send message: ${error.message}`);
+    showAttachmentError(`Unable to send message: ${error.message}`);
   }
 }
 
@@ -2211,7 +3045,30 @@ async function uploadAttachment(file) {
   return response.json();
 }
 
+function openAttachmentPicker() {
+  $("attachInput").click();
+}
+
+function handleAttachmentInputChange(event) {
+  selectAttachments(event.target.files);
+  event.target.value = "";
+}
+
+function handleMessagePaste(event) {
+  const files = Array.from(event.clipboardData?.files || []);
+  if (!files.length) return;
+  const named = files.map((file, index) => {
+    if (file.name) return file;
+    const image = file.type.startsWith("image/");
+    const extension = ({ "image/jpeg": "jpg", "image/gif": "gif", "image/webp": "webp", "image/png": "png" })[file.type] || (image ? "img" : "bin");
+    return new File([file], `${image ? "pasted-image" : "pasted-file"}-${Date.now()}-${index + 1}.${extension}`, { type: file.type || (image ? "image/png" : "application/octet-stream") });
+  });
+  selectAttachments(named);
+  event.preventDefault();
+}
+
 function selectAttachments(files) {
+  $("uploadError").hidden = true;
   let rejectedLargeFile = false;
   let rejectedCount = false;
   const existing = new Set(
@@ -2231,17 +3088,26 @@ function selectAttachments(files) {
     }
   }
   renderPendingAttachments();
-  if (rejectedLargeFile) alert("Attachments must be 50 MB or smaller.");
-  if (rejectedCount) alert("You can attach up to 10 items per message.");
+  if (rejectedLargeFile) showAttachmentError("Attachments must be 50 MB or smaller.");
+  else if (rejectedCount) showAttachmentError("You can attach up to 10 items per message.");
 }
 
 function renderPendingAttachments() {
   const container = $("pendingAttachments");
+  container.querySelectorAll("img[data-preview-url]").forEach((image) => URL.revokeObjectURL(image.dataset.previewUrl));
   container.innerHTML = "";
   state.pendingAttachments.forEach((file, index) => {
     const chip = document.createElement("span");
     chip.className = "pending-attachment";
-    chip.append(document.createTextNode(`${file.type.startsWith("image/") ? "🖼️" : "📄"} ${file.name} · ${formatBytes(file.size)}`));
+    const previewUrl = file.type.startsWith("image/") ? URL.createObjectURL(file) : null;
+    if (previewUrl) {
+      const image = document.createElement("img");
+      image.src = previewUrl;
+      image.alt = "";
+      image.dataset.previewUrl = previewUrl;
+      chip.appendChild(image);
+    }
+    chip.append(document.createTextNode(`${file.name} · ${formatBytes(file.size)}`));
     const remove = document.createElement("button");
     remove.type = "button";
     remove.textContent = "×";
@@ -2256,8 +3122,16 @@ function renderPendingAttachments() {
 }
 
 function clearPendingAttachments() {
+  document.querySelectorAll("#pendingAttachments img[data-preview-url]").forEach((image) => URL.revokeObjectURL(image.dataset.previewUrl));
   state.pendingAttachments = [];
+  $("uploadError").hidden = true;
   renderPendingAttachments();
+}
+
+function showAttachmentError(message) {
+  const error = $("uploadError");
+  error.textContent = message;
+  error.hidden = false;
 }
 
 function formatBytes(value) {
@@ -2321,6 +3195,7 @@ async function deleteCurrentChat() {
     await api(`/api/chats/${chatId}`, { method: "DELETE" });
     state.currentChatId = null;
     state.currentChatUpdatedAt = null;
+    state.streamingRows.forEach(clearManagedProgress);
     state.streamingRows.clear();
     await loadChats();
   } catch (error) {
@@ -2355,7 +3230,7 @@ async function submitNewChat() {
   if (!title || !memberIds.length) return;
   const chat = await api("/api/chats", {
     method: "POST",
-    body: JSON.stringify({ title, member_ids: memberIds, kind: memberIds.length > 1 ? "group" : "direct" }),
+    body: JSON.stringify({ title, member_ids: memberIds, kind: memberIds.length > 1 ? "group" : "direct", runner: $("newChatRunnerSelect").value || null, model: $("newChatModelSelect").value || null }),
   });
   $("chatDialog").close();
   $("chatForm").reset();
@@ -2391,7 +3266,7 @@ function setPeopleExpanded(expanded) {
 }
 
 function setMobileSidebarOpen(open) {
-  const enabled = Boolean(open) && window.matchMedia("(max-width: 900px)").matches;
+  const enabled = Boolean(open) && (window.AgentSlackMobile?.isDrawerViewport(window) ?? window.matchMedia("(max-width: 639px)").matches);
   state.mobileSidebarOpen = enabled;
   $("mobilePeopleBtn").setAttribute("aria-expanded", String(enabled));
   $("mobileSidebarBackdrop").hidden = !enabled;
@@ -2455,6 +3330,8 @@ function formatTime(value) {
 }
 
 $("sendBtn").onclick = sendMessage;
+$("attachBtn").onclick = openAttachmentPicker;
+$("attachInput").addEventListener("change", handleAttachmentInputChange);
 $("voiceBtn").onclick = toggleVoice;
 const messageInputWrap = $("messageInput").closest(".message-input-wrap");
 ["dragenter", "dragover"].forEach((eventName) => messageInputWrap.addEventListener(eventName, (event) => {
@@ -2485,6 +3362,9 @@ $("messageInput").addEventListener("keydown", (event) => {
   event.preventDefault();
   sendMessage();
 });
+$("messageInput").addEventListener("paste", (event) => {
+  handleMessagePaste(event);
+});
 $("messageInput").addEventListener("input", renderMentionMenu);
 $("messageInput").addEventListener("click", renderMentionMenu);
 $("messageInput").addEventListener("blur", () => setTimeout(hideMentionMenu, 100));
@@ -2501,6 +3381,8 @@ $("chatInfoBtn").onclick = () => {
   if (chat) window.alert(`Chat ID: ${chat.chat_id}\nProject: ${state.servers.find((server) => server.server_id === state.activeServerId)?.project_root || ""}`);
 };
 $("stopRunBtn").onclick = stopCurrentRun;
+$("chatRenameBtn").onclick = startTitleRename;
+$("chatTitle").ondblclick = startTitleRename;
 $("refreshAgentsBtn").onclick = async () => {
   if (state.runInProgress) return;
   await api("/api/agents/discover", { method: "POST", body: "{}" });
@@ -2508,8 +3390,21 @@ $("refreshAgentsBtn").onclick = async () => {
 };
 $("newChatBtnHeader").onclick = () => {
   resetPeoplePicker("chat");
+  loadRunnerOptions().then(() => fillRunnerSelect($("newChatRunnerSelect"), $("newChatModelSelect"), null, null)).catch((error) => console.warn(error));
   $("chatDialog").showModal();
 };
+$("chatRunnerSelect").addEventListener("change", async () => {
+  if (!state.currentChatId || state.runInProgress) return;
+  fillRunnerSelect($("chatRunnerSelect"), $("chatModelSelect"), $("chatRunnerSelect").value, "");
+  try { renderChat(await api(`/api/chats/${encodeURIComponent(state.currentChatId)}`, { method: "PATCH", body: JSON.stringify({ runner: $("chatRunnerSelect").value }) })); }
+  catch (error) { if (error.status === 409) await openChat(state.currentChatId); else alert(error.message); }
+});
+$("chatModelSelect").addEventListener("change", async () => {
+  if (!state.currentChatId || state.runInProgress) return;
+  try { renderChat(await api(`/api/chats/${encodeURIComponent(state.currentChatId)}`, { method: "PATCH", body: JSON.stringify({ model: $("chatModelSelect").value || null }) })); }
+  catch (error) { if (error.status === 409) await openChat(state.currentChatId); else alert(error.message); }
+});
+$("newChatRunnerSelect").addEventListener("change", () => fillRunnerSelect($("newChatRunnerSelect"), $("newChatModelSelect"), $("newChatRunnerSelect").value, ""));
 $("addServerBtn").onclick = openServerDialog;
 $("hostSessionsServerBtn").onclick = openHostSessionsServer;
 $("serverSettingsBtn").onclick = openServerSettings;
@@ -2618,18 +3513,20 @@ document.addEventListener("click", (event) => {
   });
 });
 document.addEventListener("visibilitychange", () => {
-  if (!document.hidden) syncChatState();
+  if (!document.hidden) { syncChatState(); loadPermissions(); if (state.hostSessionsView || state.activeServerId) loadAllSessions(); }
 });
 window.addEventListener("focus", syncChatState);
+window.addEventListener("hashchange", handleDeepLink);
 window.addEventListener("resize", () => {
-  if (!window.matchMedia("(max-width: 900px)").matches) setMobileSidebarOpen(false);
+  if (!(window.AgentSlackMobile?.isDrawerViewport(window) ?? window.matchMedia("(max-width: 639px)").matches)) setMobileSidebarOpen(false);
 });
 window.setInterval(syncChatState, 2000);
 window.setInterval(() => {
-  if (state.hostSessionsView && !document.hidden) loadAllSessions();
+  if (!document.hidden && (state.hostSessionsView || state.activeServerId)) loadAllSessions();
 }, 5000);
+window.setInterval(() => { if (!document.hidden) loadPermissions(); }, 3000);
 
-initializeAuth().then((ready) => ready && loadServers().then(loadActiveServer)).catch((error) => {
+initializeAuth().then((ready) => ready && loadServers().then(loadActiveServer).then(handleDeepLink)).catch((error) => {
   console.error(error);
   alert(`Failed to initialize Agent Slack: ${error.message}`);
 });

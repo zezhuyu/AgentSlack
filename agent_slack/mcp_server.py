@@ -22,6 +22,7 @@ from typing import Any, Callable
 
 from .servers import AgentServerManager
 from .engram_memory import EngramMemoryBridge
+from .titles import short_title
 from .storage import utc_now
 
 
@@ -292,7 +293,7 @@ class AgentSlackMCP:
                     raise ValueError(f"Agent not found: {agent_id}")
                 label = str(agent.get("name") or agent.get("title") or agent_id)
                 title_source = {"chatgpt": "ChatGPT", "claude": "Claude", "explicit": "Session"}[source]
-                chat = app.create_chat(f"{title_source} · {label}", [agent_id], kind="task")
+                chat = app.create_chat(f"{title_source} · {short_title(instruction) or label}", [agent_id], kind="task")
                 if not mapping_key:
                     conversation = uuid.uuid4().hex
                     mapping_key = sha256(f"explicit|{conversation}|{agent_id}".encode()).hexdigest()
@@ -315,9 +316,9 @@ class AgentSlackMCP:
         if skill_name:
             skill = resolve_project_skill(app.project_root, skill_name)
             instruction_text = (f"Use the project skill {skill['skill_name']} from {skill['path']}. Read its complete SKILL.md before acting.\n\nUser request:\n{instruction}")
-        task = app.create_task(agent_id, instruction_text, source=source, chat_id=chat["chat_id"])
-        task = app.storage.update_task(task["task_id"], session_id=token,
-                                       session_reused=reused, **({"skill_name": skill_name} if skill_name else {}))
+        task = app.create_task(agent_id, instruction_text, source=source, chat_id=chat["chat_id"],
+                               extra={"session_id": token, "session_reused": reused,
+                                      **({"skill_name": skill_name} if skill_name else {})})
         return {**task, "session_id": token, "chat_id": chat["chat_id"], "session_reused": reused}
 
     def cancel_task(self, workspace_key: str, task_id: str) -> dict[str, Any]:

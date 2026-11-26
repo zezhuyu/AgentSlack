@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import json
+import base64
 import re
 import signal
 import shutil
@@ -9,6 +10,7 @@ import subprocess
 import urllib.request
 import urllib.error
 import threading
+import time
 from html import unescape
 from collections.abc import Iterator
 from pathlib import Path
@@ -44,9 +46,12 @@ class CliOrchestrator:
         project_root: Path,
         backend_preference: str = "auto",
         model: str | None = None,
+        ignore_env_override: bool = False,
+        uploads_root: Path | None = None,
     ):
         self.workspace_name = workspace_name
         self.project_root = project_root
+        self.uploads_root = Path(uploads_root or (project_root / "uploads")).resolve()
         self.model = str(model or "").strip() or None
         # Long-running project operations (renders, media generation, model
         # exports) routinely need more than the old three-minute ceiling.
@@ -54,9 +59,8 @@ class CliOrchestrator:
         self.retry_count = max(0, int(os.environ.get("AGENT_SLACK_CLI_RETRIES", "2")))
         self._run_lock = threading.RLock()
         self._active_runs: dict[str, dict[str, Any]] = {}
-        self.backend, self.executable = self._resolve_backend(
-            os.environ.get("AGENT_SLACK_CLI", backend_preference).strip().lower()
-        )
+        configured_backend = backend_preference if ignore_env_override else os.environ.get("AGENT_SLACK_CLI", backend_preference)
+        self.backend, self.executable = self._resolve_backend(configured_backend.strip().lower())
 
     @property
     def available(self) -> bool:
@@ -138,7 +142,7 @@ class CliOrchestrator:
                 ).format(attempt=attempt + 1, attempts=attempts)
             try:
                 result = subprocess.run(
-                    self._command(),
+                    self._command(transcript),
                     input=prompt,
                     text=True,
                     capture_output=True,
@@ -202,7 +206,7 @@ class CliOrchestrator:
         prompt = self._compose_native_prompt(agent, chat, transcript, objective)
         initial_frame = json.dumps({
             "type": "user",
-            "message": {"role": "user", "content": prompt},
+            "message": self._claude_user_message(transcript, prompt),
             "parent_tool_use_id": None,
             "session_id": "",
         }) + "\n"
@@ -249,6 +253,8 @@ class CliOrchestrator:
         native_task_tools: dict[str, str] = {}
         output_tools: dict[str, str] = {}
         completed: set[str] = set()
+        progress_steps: dict[str, dict[str, Any]] = {}
+        progress_last_at: float | None = None
         lead_started = False
         lead_text = ""
         final_result = ""
@@ -263,6 +269,58 @@ class CliOrchestrator:
             "is_lead": True,
         }
         active_run["tasks"][lead_task_id] = lead_task
+
+        def progress_label(kind: str, name: str = "", value: Any = None) -> str:
+            if kind == "thinking":
+                return "Thinking…"
+            tool = name or "tool"
+            args = value if isinstance(value, dict) else {}
+            if tool in {"Read", "Edit", "Write"}:
+                path = str(args.get("file_path") or args.get("path") or "file")
+                action = {"Read": "Reading", "Edit": "Editing", "Write": "Writing"}[tool]
+                return f"{action} {Path(path).name}"
+            if tool == "Bash":
+                command_text = " ".join(str(args.get("command") or "").split())[:60]
+                return f"Running: {command_text}" if command_text else "Running command"
+            if tool in {"Grep", "Glob"}:
+                pattern = " ".join(str(args.get("pattern") or args.get("glob") or "").split())[:50]
+                return f"Searching: {pattern}" if pattern else "Searching files"
+            if tool in {"WebFetch", "WebSearch"}:
+                return "Searching the web"
+            if tool in {"Task", "Agent"}:
+                description = " ".join(str(args.get("description") or args.get("prompt") or "").split())[:70]
+                return f"Subagent: {description}" if description else "Starting subagent"
+            if tool.startswith("mcp__"):
+                parts = tool.split("__")
+                return f"Using {parts[-1]}"
+            return f"Using {tool[:90]}"
+
+        def progress_event(
+            step_id: str, kind: str, label: str, state: str, task_id: str,
+        ) -> dict[str, Any] | None:
+            nonlocal progress_last_at
+            if step_id not in progress_steps and len(progress_steps) >= 200:
+                return None
+            now = time.monotonic()
+            progress_steps[step_id] = {"kind": kind, "label": label[:120], "state": state}
+            # Pace progress events instead of dropping fast consecutive steps.
+            if progress_last_at is not None and now - progress_last_at < 0.1:
+                time.sleep(0.1 - (now - progress_last_at))
+                now = time.monotonic()
+            progress_last_at = now
+            return {
+                "type": "agent_progress",
+                "run_id": run_id or "",
+                "agent_id": (tasks.get(task_id) or lead_task).get("agent_id", agent["agent_id"]),
+                "task_id": task_id,
+                "step_id": step_id,
+                "kind": kind,
+                "label": label[:120],
+                "state": state,
+                "at": int(time.time() * 1000),
+            }
+
+        progress_tool_tasks: dict[str, str] = {}
 
         def finish_task(source_tool_id: str, raw_result: str, is_error: bool = False) -> list[dict[str, Any]]:
             task = tasks.get(source_tool_id)
@@ -351,6 +409,46 @@ class CliOrchestrator:
                 for block in message.get("content") or []:
                     block_type = block.get("type")
                     block_name = block.get("name")
+                    progress_task_id = str(parent_id) if parent_id in tasks else lead_task_id
+                    if block_type == "thinking":
+                        if progress_task_id == lead_task_id and not lead_started:
+                            lead_started = True
+                            yield {
+                                "type": "agent_started", "agent_id": agent["agent_id"],
+                                "agent_label": agent["title"], "task_id": lead_task_id,
+                            }
+                        step_id = f"thinking-{event.get('uuid') or len(progress_steps)}"
+                        emitted = progress_event(step_id, "thinking", "Thinking…", "done", progress_task_id)
+                        if emitted:
+                            yield emitted
+                    elif block_type == "tool_use":
+                        step_id = str(block.get("id") or "")
+                        if step_id:
+                            if block_name in {"Task", "Agent"} and step_id not in tasks:
+                                task = self._task_identity(step_id, block.get("input") or {})
+                                tasks[step_id] = task
+                                active_run["tasks"][task["task_id"]] = task
+                                progress_task_id = task["task_id"]
+                                yield {
+                                    "type": "agent_started", "agent_id": task["agent_id"],
+                                    "agent_label": task["agent_label"], "task_id": task["task_id"],
+                                }
+                            elif block_name in {"Task", "Agent"} and step_id in tasks:
+                                progress_task_id = tasks[step_id]["task_id"]
+                            elif progress_task_id == lead_task_id and not lead_started:
+                                lead_started = True
+                                yield {
+                                    "type": "agent_started", "agent_id": agent["agent_id"],
+                                    "agent_label": agent["title"], "task_id": lead_task_id,
+                                }
+                            progress_tool_tasks[step_id] = progress_task_id
+                            emitted = progress_event(
+                                step_id, "subagent" if block_name in {"Task", "Agent"} else "tool",
+                                progress_label("tool", str(block_name or "tool"), block.get("input")),
+                                "running", progress_task_id,
+                            )
+                            if emitted:
+                                yield emitted
                     if block_type == "tool_use" and block_name in {"Task", "Agent"}:
                         task_id = str(block.get("id") or "")
                         if task_id and task_id not in tasks:
@@ -382,6 +480,16 @@ class CliOrchestrator:
                     yield emitted
                 blocks = message_content if isinstance(message_content, list) else []
                 for block in blocks:
+                    if block.get("type") == "tool_result":
+                        result_tool_id = str(block.get("tool_use_id") or "")
+                        progress_task_id = progress_tool_tasks.get(result_tool_id)
+                        step = progress_steps.get(result_tool_id)
+                        if progress_task_id and step:
+                            emitted = progress_event(
+                                result_tool_id, step["kind"], step["label"], "done", progress_task_id,
+                            )
+                            if emitted:
+                                yield emitted
                     if block.get("type") != "tool_result":
                         continue
                     result_tool_id = str(block.get("tool_use_id") or "")
@@ -589,7 +697,7 @@ class CliOrchestrator:
                 return backend, executable
         return None, None
 
-    def _command(self) -> list[str]:
+    def _command(self, transcript: list[dict[str, Any]] | None = None) -> list[str]:
         if self.backend == "codex":
             command = [
                 str(self.executable),
@@ -604,6 +712,9 @@ class CliOrchestrator:
             ]
             if self.model:
                 command.extend(["--model", self.model])
+            if transcript:
+                for path, _media_type in self._inline_images(transcript):
+                    command.append(f"--image={path}")
             command.append("-")
             return command
         command = [
@@ -641,6 +752,7 @@ class CliOrchestrator:
             "--dangerously-skip-permissions",
             "--no-session-persistence",
         ])
+        command.extend(["--add-dir", str(self.uploads_root)])
         return command
 
     def _start_claude_process(self, command: list[str]) -> subprocess.Popen[str]:
@@ -663,7 +775,15 @@ class CliOrchestrator:
         objective: str | None,
     ) -> str:
         recent = transcript[-18:]
-        transcript_text = "\n".join(self._format_transcript_item(item) for item in recent)
+        inline_paths = {str(path) for path, _ in self._inline_images(transcript)}
+        transcript_text = "\n".join(self._format_transcript_item(item, inline_paths) for item in recent)
+        has_attachments = any((item.get("metadata") or {}).get("attachments") for item in transcript if item.get("author_type") == "user")
+        attachment_instruction = (
+            "The user attached these files. Open and read them with your file tools before answering "
+            "(images are also attached directly; PDFs, spreadsheets and text files must be read from the path). "
+            "Do not claim you cannot see an attachment without trying.\n"
+            if has_attachments else ""
+        )
         direct_instruction = (
             "Handle this request directly in the project root using the project's own instructions and tools. "
             "No Agent Slack subagent roster is configured for this folder. "
@@ -681,6 +801,7 @@ class CliOrchestrator:
             f"Agent Slack conversation: {chat.get('title')}\n"
             f"Objective: {objective or 'Respond to the latest user message.'}\n\n"
             f"Recent transcript:\n{transcript_text}\n\n"
+            f"{attachment_instruction}"
             f"{direct_instruction}"
             f"{skill_contract}\n"
             f"{agent_contract}\n"
@@ -875,7 +996,8 @@ class CliOrchestrator:
         objective: str | None,
     ) -> str:
         recent = transcript[-18:]
-        transcript_text = "\n".join(self._format_transcript_item(item) for item in recent)
+        inline_paths = {str(path) for path, _ in self._inline_images(transcript)}
+        transcript_text = "\n".join(self._format_transcript_item(item, inline_paths) for item in recent)
         agent_contract = self._agent_definition_contract()
         return f"""You are replying as one coworker in a Slack-style agent workspace for: {self.workspace_name}.
 
@@ -900,6 +1022,8 @@ Current chat:
 Recent transcript:
 {transcript_text}
 
+{self._attachment_instruction(transcript)}
+
 Reply requirements:
 - Return only the message this coworker should post in the chat.
 - Write natural, Slack-ready Markdown. Do not return JSON, YAML, XML, a schema, or a serialized response envelope except for the agent question block described below.
@@ -921,23 +1045,88 @@ Interactive questions:
 - {self._interaction_prompt_contract()}
 """
 
+    def _inline_images(self, transcript: list[dict[str, Any]]) -> list[tuple[Path, str]]:
+        uploads_root = self.uploads_root.resolve()
+        messages = list(transcript)
+        last_agent = max((i for i, item in enumerate(messages) if item.get("author_type") == "agent"), default=-1)
+        pending = [item for item in messages[last_agent + 1:] if item.get("author_type") == "user" and (item.get("metadata") or {}).get("attachments")]
+        if not pending:
+            pending = [item for item in reversed(messages) if item.get("author_type") == "user" and (item.get("metadata") or {}).get("attachments")][:1]
+        out: list[tuple[Path, str]] = []
+        for item in pending:
+            for attachment in (item.get("metadata") or {}).get("attachments") or []:
+                media_type = str(attachment.get("content_type") or "").lower().split(";", 1)[0]
+                try:
+                    metadata_size = int(attachment.get("size") or 0)
+                except (TypeError, ValueError):
+                    continue
+                if media_type not in {"image/png", "image/jpeg", "image/gif", "image/webp"} or metadata_size > 5 * 1024 * 1024:
+                    continue
+                if len(out) >= 5:
+                    return out
+                try:
+                    path = Path(str(attachment.get("path") or ""))
+                    resolved = path.resolve(strict=True)
+                    if not resolved.is_relative_to(uploads_root) or not resolved.is_file() or resolved.stat().st_size > 5 * 1024 * 1024:
+                        continue
+                    with resolved.open("rb") as image_file:
+                        image_file.read(1)
+                    out.append((resolved, media_type))
+                except (OSError, ValueError, RuntimeError):
+                    continue
+        return out
+
+    def _claude_user_message(self, transcript: list[dict[str, Any]], prompt: str) -> dict[str, Any]:
+        content: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
+        for path, media_type in self._inline_images(transcript):
+            try:
+                content.append({"type": "image", "source": {"type": "base64", "media_type": media_type, "data": base64.b64encode(path.read_bytes()).decode("ascii")}})
+            except OSError:
+                continue
+        return {"role": "user", "content": content}
+
     @staticmethod
-    def _format_transcript_item(item: dict[str, Any]) -> str:
+    def _attachment_instruction(transcript: list[dict[str, Any]]) -> str:
+        if not any((item.get("metadata") or {}).get("attachments") for item in transcript if item.get("author_type") == "user"):
+            return ""
+        return (
+            "The user attached these files. Open and read them with your file tools before answering "
+            "(eligible images are also attached directly; other images, PDFs, spreadsheets and text files must be read from the path). "
+            "Do not claim you cannot see an attachment without trying."
+        )
+
+    def _format_transcript_item(self, item: dict[str, Any], inline_paths: set[str] | None = None) -> str:
         author = item.get("author_label", item.get("author_id", "unknown"))
-        rendered = f"[{author}] {item.get('body', '').strip()}"
         attachments = (item.get("metadata") or {}).get("attachments") or []
+        body = str(item.get("body") or "").strip()
+        rendered = f"[{author}] {body or ('User attached files without a message.' if attachments and item.get('author_type') == 'user' else '')}"
         if not attachments:
             return rendered
-        paths = "\n".join(
-            f"- {attachment.get('filename', 'attachment')}: {attachment.get('path')} "
-            f"({attachment.get('content_type', 'application/octet-stream')}, "
-            f"{attachment.get('size', 0)} bytes)"
-            for attachment in attachments
-        )
+        paths = "\n".join(self._format_attachment(attachment, inline_paths or set()) for attachment in attachments)
         return (
             f"{rendered}\n"
             "Attachments available to you at these absolute paths:\n"
             f"{paths}"
+        )
+
+    def _format_attachment(self, attachment: dict[str, Any], inline_paths: set[str]) -> str:
+        path_text = str(attachment.get("path") or "")
+        visible_path = path_text
+        status = "sent inline" if path_text in inline_paths else "read from path"
+        try:
+            path = Path(path_text).resolve(strict=True)
+            if not path.is_relative_to(self.uploads_root.resolve()) or not path.is_file():
+                status = "unavailable (outside uploads or missing)"
+                visible_path = "path unavailable"
+            else:
+                with path.open("rb") as file_obj:
+                    file_obj.read(1)
+        except (OSError, ValueError, RuntimeError):
+            status = "unavailable (could not read file)"
+        return (
+            f"- {attachment.get('filename', 'attachment')}: {visible_path} "
+            f"({attachment.get('content_type', 'application/octet-stream')}, "
+            f"{attachment.get('size', 0)} bytes, {status})"
         )
 
     @staticmethod

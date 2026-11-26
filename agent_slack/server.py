@@ -18,9 +18,13 @@ from .mcp_server import AgentSlackMCP, handle_jsonrpc
 from .auth import AuthStore
 from .servers import AgentServerManager
 from .host_sessions import (
-    get_host_session, host_session_resume_status, list_host_sessions, start_host_session_resume,
+    _final_fingerprint, _session_files, _summary, get_host_session, get_host_subagent, is_subagent_session, host_session_resume_status,
+    list_host_sessions, start_host_session_resume, cancel_host_session_resume,
 )
 from . import push as web_push
+from . import permissions
+from .host_sessions import HostSessionWatcher, claim_host_session_notification
+from .titles import TitleStore, clean_user_title
 
 
 API_VERSION = "1"
@@ -257,6 +261,14 @@ class _Handler(BaseHTTPRequestHandler):
             return self._json(result)
         if path.startswith("/api/") and not path.startswith("/api/auth/") and not self._request_authorized():
             return self._json({"error": "Authentication required", "code": "authentication_required"}, status=401)
+        if path == "/api/runners":
+            try:
+                return self._json(self._active_app().runner_options())
+            except KeyError:
+                from .runners import list_runners
+                return self._json(list_runners())
+        if path == "/api/permissions":
+            return self._json({"permissions": permissions.store.list()})
         if path == "/api/push/config":
             return self._json(web_push.config(self.manager.data_root))
         if path == "/mcp":
@@ -342,13 +354,23 @@ class _Handler(BaseHTTPRequestHandler):
         if not path.startswith("/api/"):
             return self._serve_static(path)
         if path == "/api/host-sessions":
-            return self._json({"sessions": list_host_sessions()})
+            return self._json({"sessions": TitleStore(self.manager.data_root).apply(list_host_sessions())})
+        match = re.fullmatch(r"/api/host-sessions/([^/]+)/subagents/([^/]+)", path)
+        if match:
+            session = get_host_subagent(match.group(1), match.group(2))
+            return self._json(session or {"error": "subagent not found"}, status=200 if session else 404)
         match = re.fullmatch(r"/api/host-sessions/([^/]+)/resume", path)
         if match:
-            return self._json(host_session_resume_status(match.group(1)))
+            try:
+                after = int((parse_qs(parsed.query).get("after") or ["-1"])[0])
+            except ValueError:
+                return self._json({"error": "after must be an integer"}, status=400)
+            return self._json(host_session_resume_status(match.group(1), after))
         match = re.fullmatch(r"/api/host-sessions/([^/]+)", path)
         if match:
             session = get_host_session(match.group(1))
+            if session:
+                TitleStore(self.manager.data_root).apply([session])
             return self._json(session or {"error": "host session not found"}, status=200 if session else 404)
         if path.startswith("/api/") and self.manager.active_server_id is None:
             if path == "/api/agents":
@@ -402,6 +424,54 @@ class _Handler(BaseHTTPRequestHandler):
         if parsed is None:
             return
         path = _versioned_path(path)
+        if path == "/api/hooks/permission":
+            if self.headers.get("Transfer-Encoding", "").lower() == "chunked":
+                return self._json({"error": "Content-Length required for hook ingress"}, status=411)
+            try:
+                length = int(self.headers.get("Content-Length", "0") or 0)
+            except ValueError:
+                return self._json({"error": "Invalid Content-Length"}, status=400)
+            if length < 0 or length > 65_536:
+                self.close_connection = True
+                return self._json({"error": "Hook request exceeds 64 KB"}, status=413)
+            token_path = self.manager.data_root / "hook-token"
+            token_path.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                fd = os.open(token_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            except FileExistsError:
+                fd = None
+            if fd is not None:
+                with os.fdopen(fd, "w") as token_file:
+                    token_file.write(secrets.token_urlsafe(32))
+            try:
+                expected = token_path.read_text(encoding="utf-8").strip()
+            except OSError:
+                return self._json({"error": "Hook token unavailable"}, status=500)
+            supplied = self.headers.get("X-Agent-Slack-Hook-Token", "")
+            if not expected or not supplied or not secrets.compare_digest(expected, supplied):
+                return self._json({"error": "Hook token required"}, status=401)
+            payload = self._read_json_body()
+            source = str(payload.pop("source", "")) if isinstance(payload, dict) else ""
+            if source not in {"claude", "codex"}:
+                return self._json({"error": "source must be claude or codex"}, status=400)
+            record = permissions.store.create(payload, source)
+            summary = f"{record['tool_name']}: Permission requested"
+            web_push.notify_run_finished(self.manager.data_root, title="Permission needed", body=summary, deep_link=f"#permission={record['request_id']}")
+            query = parse_qs(parsed.query)
+            try: wait = min(110.0, max(0.0, float((query.get("wait") or [100])[0])))
+            except ValueError: wait = 100.0
+            return self._json(permissions.store.wait(record["request_id"], wait))
+        match = re.fullmatch(r"/api/permissions/([^/]+)/decision", path)
+        if match:
+            # Approving a tool call is security-critical: require the normal login before anything else.
+            if not self._request_authorized():
+                return self._json({"error": "Authentication required", "code": "authentication_required"}, status=401)
+            payload = self._read_json_body()
+            decision = str(payload.get("decision") or "")
+            if decision not in {"allow", "deny"}:
+                return self._json({"error": "decision must be allow or deny"}, status=400)
+            status, result = permissions.store.decide(match.group(1), decision, str(payload.get("reason") or ""), payload.get("answers"))
+            return self._json(result, status=status)
         if path == "/api/auth/setup":
             payload = self._read_json_body()
             if not self._is_desktop_request():
@@ -500,22 +570,39 @@ class _Handler(BaseHTTPRequestHandler):
                 self.end_headers()
                 return
             return self._json(response)
+        match = re.fullmatch(r"/api/host-sessions/([^/]+)/resume/cancel", path)
+        if match:
+            try:
+                return self._json(cancel_host_session_resume(match.group(1)))
+            except LookupError as exc:
+                return self._json({"error": str(exc)}, status=404)
         match = re.fullmatch(r"/api/host-sessions/([^/]+)/resume", path)
         if match:
             payload = self._read_json_body()
             try:
                 session_id = match.group(1)
-                session = get_host_session(session_id) or {}
+                if is_subagent_session(session_id):
+                    return self._json({"error": "Sub-agent sessions are read-only"}, status=400)
                 def push_resume_finished(result):
                     from .push import notify_run_finished
                     failed = result.get("status") == "failed"
-                    notify_run_finished(
-                        self.manager.data_root,
-                        title=str(session.get("title") or session.get("backend") or "Host session"),
-                        body=(f"Run failed: {result.get('error') or 'Host session resume failed'}" if failed else str(result.get("reply") or "Host session resumed")),
-                        failed=failed,
-                    )
-                return self._json(start_host_session_resume(session_id, str(payload.get("body") or ""), push_resume_finished))
+                    fingerprint = ""
+                    session = {}
+                    for transcript, backend in _session_files():
+                        if (host := _summary(transcript, backend)) and host.get("session_id") == session_id:
+                            session = host
+                            fingerprint = _final_fingerprint(transcript, backend)
+                            break
+                    if not fingerprint or claim_host_session_notification(self.manager.data_root, session_id, fingerprint):
+                        notify_run_finished(
+                            self.manager.data_root,
+                            title=str(session.get("title") or session.get("backend") or "Host session"),
+                            body=(f"Run failed: {result.get('error') or 'Host session resume failed'}" if failed else str(result.get("reply") or "Host session resumed")),
+                            failed=failed,
+                            deep_link=f"#host={result.get('session_id') or session_id}",
+                        )
+                return self._json(start_host_session_resume(session_id, str(payload.get("body") or ""),
+                                                            push_resume_finished, str(payload.get("request_id") or "") or None))
             except KeyError as exc:
                 return self._json({"error": str(exc).strip("'")}, status=404)
             except ValueError as exc:
@@ -697,11 +784,15 @@ class _Handler(BaseHTTPRequestHandler):
             app.chat_engine.cancel(response_id)
             return self._json({"accepted": True, "response_id": response_id}, status=202)
         if path == "/api/chats":
-            chat = app.create_chat(
-                title=str(payload.get("title") or "Untitled chat"),
-                member_ids=list(payload.get("member_ids") or []),
-                kind=str(payload.get("kind") or "group"),
-            )
+            try:
+                chat = app.create_chat(
+                    title=str(payload.get("title") or "Untitled chat"),
+                    member_ids=list(payload.get("member_ids") or []),
+                    kind=str(payload.get("kind") or "group"),
+                    runner=payload.get("runner"), model=payload.get("model"),
+                )
+            except ValueError as exc:
+                return self._json({"error": str(exc)}, status=400)
             return self._json(chat, status=201)
         match = re.fullmatch(r"/api/chats/([^/]+)/messages", path)
         if match:
@@ -814,7 +905,45 @@ class _Handler(BaseHTTPRequestHandler):
         if parsed is None:
             return
         path = _versioned_path(path)
+        if path.startswith("/api/") and not path.startswith("/api/auth/") and not self._request_authorized():
+            return self._json({"error": "Authentication required", "code": "authentication_required"}, status=401)
         payload = self._read_json_body()
+        match = re.fullmatch(r"/api/host-sessions/([^/]+)/title", path)
+        if match:
+            session_id = match.group(1)
+            if not isinstance(payload, dict) or not re.fullmatch(r"[A-Za-z0-9_.:-]{1,80}", session_id) or get_host_session(session_id) is None:
+                return self._json({"error": "host session not found"}, status=404)
+            store = TitleStore(self.manager.data_root)
+            store.set(session_id, str(payload.get("title") or ""))  # empty clears the custom name
+            session = store.apply([get_host_session(session_id) or {}])[0]
+            return self._json({"session_id": session_id, "title": session.get("title"), "title_source": session.get("title_source")})
+        match = re.fullmatch(r"/api/chats/([^/]+)", path)
+        if match:
+            if self.manager.active_server_id is None:
+                return self._json(_no_server_payload(), status=409)
+            if not isinstance(payload, dict):
+                return self._json({"error": "Invalid request"}, status=400)
+            if "runner" in payload or "model" in payload:
+                try:
+                    chat = self._active_app().update_chat_settings(match.group(1), payload)
+                except KeyError as exc:
+                    return self._json({"error": str(exc)}, status=404)
+                except PermissionError as exc:
+                    return self._json({"error": str(exc), "code": "settings_locked"}, status=409)
+                except ValueError as exc:
+                    return self._json({"error": str(exc)}, status=400)
+                if "title" not in payload:
+                    return self._json(chat)
+            if "title" not in payload:
+                return self._json({"error": "A name is required"}, status=400)
+            title = clean_user_title(payload.get("title"))
+            if not title:
+                return self._json({"error": "A name is required"}, status=400)
+            try:
+                chat = self._active_app().rename_chat(match.group(1), title)
+            except KeyError as exc:
+                return self._json({"error": str(exc)}, status=404)
+            return self._json({"chat_id": chat["chat_id"], "title": chat["title"]})
         match = re.fullmatch(r"/api/servers/([^/]+)", path)
         if not match:
             return self._json({"error": "not found"}, status=404)
@@ -1090,6 +1219,8 @@ def run_server(
     _Handler.auth = AuthStore(manager.data_root)
     _Handler.desktop_secret = os.getenv("AGENT_SLACK_DESKTOP_SECRET") or None
     server = AgentSlackHTTPServer((host, port), _Handler)
+    watcher = HostSessionWatcher(manager.data_root)
+    watcher.start()
     print(f"Agent Slack running at http://{host}:{port}")
     if not _Handler.auth.status()["password_set"]:
         print("First-run password setup is available in the Agent Slack macOS app.")
@@ -1098,4 +1229,5 @@ def run_server(
     except KeyboardInterrupt:
         pass
     finally:
+        watcher.stop()
         server.server_close()

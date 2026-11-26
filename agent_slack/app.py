@@ -29,10 +29,12 @@ from .memory_search import ProjectMemorySearch
 from .project_skills import list_project_skills, resolve_project_skill
 from .shared_memory import ProjectSharedMemory
 from .orchestrator import CliOrchestrator
+from .runners import list_runners, validate_choice
 from .retrieval.manager import RetrievalManager
 from .retrieval.paths import is_shareable as is_shareable_path
 from .retrieval.paths import resolve_within as resolve_within_path
 from .storage import AgentSlackStorage, utc_now
+from .titles import short_title
 from .ui_actions import UIActionError, find_action_node, validate_form_args
 from .voice import LocalVoiceBackend
 
@@ -117,6 +119,8 @@ class AgentSlackApp:
         self._run_state_lock = RLock()
         self._chat_interaction_lock = RLock()
         self._active_run_states: dict[str, dict[str, Any]] = {}
+        self._chat_orchestrators: dict[tuple[str | None, str | None], CliOrchestrator] = {}
+        self._run_orchestrators: dict[str, CliOrchestrator] = {}
         self.voice = LocalVoiceBackend()
         self.reload_host_configuration()
         self.retrieval = RetrievalManager(self.project_root, self.data_root / "search" / "index.sqlite")
@@ -168,7 +172,8 @@ class AgentSlackApp:
         return self.storage.get_task(task_id)
 
     def create_task(self, agent_id: str, instruction: str, source: str = "chatgpt",
-                    chat_id: str | None = None, session_title: str | None = None) -> dict[str, Any]:
+                    chat_id: str | None = None, session_title: str | None = None,
+                    extra: dict[str, Any] | None = None) -> dict[str, Any]:
         agent = self.get_agent(agent_id)
         if agent is None:
             raise ValueError(f"Agent not found: {agent_id}")
@@ -183,9 +188,11 @@ class AgentSlackApp:
             "artifacts": [],
             "completed_at": None,
             "chat_id": chat_id,
+            # Set before the task is queued: a later update_task would race the worker's status writes.
+            **(extra or {}),
         })
         if chat_id is None:
-            chat = self.create_chat(session_title or f"Task {task['task_id']}", [agent_id], kind="task")
+            chat = self.create_chat(session_title or short_title(task["instruction"]) or f"Task {task['task_id']}", [agent_id], kind="task")
             chat_id = chat["chat_id"]
             task = self.storage.update_task(task["task_id"], chat_id=chat_id)
         with _project_task_executors_guard:
@@ -230,7 +237,7 @@ class AgentSlackApp:
         try:
             chat = self.storage.get_chat(str(task.get("chat_id") or ""))
             if chat is None:
-                chat = self.create_chat(f"Task {task_id}", [task["agent_id"]], kind="task")
+                chat = self.create_chat(short_title(task["instruction"]) or f"Task {task_id}", [task["agent_id"]], kind="task")
             self.storage.append_message(chat["chat_id"], {
                 "author_type": "user", "author_id": "external",
                 "author_label": {"chatgpt": "ChatGPT", "claude": "Claude"}.get(task.get("source"), task.get("source", "external")),
@@ -352,7 +359,7 @@ class AgentSlackApp:
 
     def reload_host_configuration(self) -> None:
         self.architecture = AgentSystemArchitecture.load(self.project_root)
-        if hasattr(self, "orchestrator") and self.orchestrator.has_active_runs:
+        if hasattr(self, "orchestrator") and (self.orchestrator.has_active_runs or any(item.has_active_runs for item in self._chat_orchestrators.values())):
             return
         discovered = self.discovery.discover()
         project_fallback = len(discovered) == 1 and discovered[0].kind == "project"
@@ -366,6 +373,7 @@ class AgentSlackApp:
             self.project_root,
             backend_preference=runner,
             model=self.model_override if project_fallback else None,
+            uploads_root=self.data_root / "uploads",
         )
         if hasattr(self, "chat_engine"):
             self.chat_provider = self._build_chat_provider()
@@ -466,22 +474,71 @@ class AgentSlackApp:
                 if message.get("author_type") != "system"
             ]
             last = messages[-1] if messages else None
+            title = chat["title"]
+            if re.fullmatch(r"Task [0-9a-f]{12}", str(title)):
+                # Chats created before names were generated: name them from the first real request.
+                first_user = next((m.get("body", "") for m in messages if m.get("author_type") == "user"), "")
+                title = short_title(first_user) or title
             summaries.append(
                 {
                     "chat_id": chat["chat_id"],
-                    "title": chat["title"],
+                    "title": title,
                     "kind": chat["kind"],
                     "member_ids": chat.get("member_ids", []),
                     "member_titles": [agents.get(member_id, {}).get("title", member_id) for member_id in chat.get("member_ids", [])],
                     "updated_at": chat.get("updated_at"),
                     "last_message_preview": (last or {}).get("body", "")[:120],
                     "message_count": len(messages),
+                    "runner": chat.get("runner"),
+                    "model": chat.get("model"),
+                    "settings_locked": self._chat_settings_locked(chat),
                 }
             )
         return summaries
 
     def get_chat(self, chat_id: str) -> dict[str, Any] | None:
-        return self.storage.get_chat(chat_id)
+        chat = self.storage.get_chat(chat_id)
+        if chat is not None:
+            chat["settings_locked"] = self._chat_settings_locked(chat)
+        return chat
+
+    def _chat_settings_locked(self, chat: dict[str, Any]) -> bool:
+        return any(m.get("author_type") == "agent" for m in chat.get("messages", [])) or self._chat_has_active_run(str(chat.get("chat_id") or ""))
+
+    def runner_options(self) -> dict[str, Any]:
+        options = list_runners()
+        options["default_runner"] = self.orchestrator.backend or next((r["id"] for r in options["runners"] if r["available"]), "codex")
+        return options
+
+    def _orchestrator_for_chat(self, chat: dict[str, Any]) -> CliOrchestrator:
+        runner, model = chat.get("runner"), chat.get("model")
+        if not runner and not model:
+            return self.orchestrator
+        effective_runner = runner or self.orchestrator.backend or "auto"
+        key = (effective_runner, model)
+        if key not in self._chat_orchestrators:
+            # Explicit per-chat choices intentionally bypass AGENT_SLACK_CLI, which only configures the default runner.
+            self._chat_orchestrators[key] = CliOrchestrator(self.workspace_name, self.project_root, backend_preference=effective_runner, model=model, ignore_env_override=True, uploads_root=self.data_root / "uploads")
+        return self._chat_orchestrators[key]
+
+    def update_chat_settings(self, chat_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        chat = self.storage.get_chat(chat_id)
+        if chat is None:
+            raise KeyError(f"Chat not found: {chat_id}")
+        if self._chat_settings_locked(chat):
+            raise PermissionError("Chat agent and model settings are locked after the first reply or while a run is active")
+        runner = payload.get("runner", chat.get("runner"))
+        model = payload.get("model", chat.get("model"))
+        if "runner" in payload and runner is None:
+            model = None if "model" not in payload else model
+        elif "runner" in payload and "model" not in payload:
+            model = None
+        effective_runner = runner or (self.orchestrator.backend if model else None)
+        checked_runner, model = validate_choice(effective_runner, model)
+        runner = runner if runner is None else checked_runner
+        chat["runner"], chat["model"] = runner, model
+        self.storage.save_chat(chat)
+        return self.get_chat(chat_id) or chat
 
     def list_active_runs(self, chat_id: str | None = None) -> list[dict[str, Any]]:
         """Return reconnect-safe UI state without exposing runner internals."""
@@ -553,6 +610,7 @@ class AgentSlackApp:
         finally:
             with self._run_state_lock:
                 self._active_run_states.pop(run_id, None)
+            self._run_orchestrators.pop(run_id, None)
 
     def _chat_has_active_run(self, chat_id: str) -> bool:
         with self._run_state_lock:
@@ -579,8 +637,19 @@ class AgentSlackApp:
                     pass
         return {"deleted": True, "chat_id": chat_id}
 
-    def create_chat(self, title: str, member_ids: list[str], kind: str = "group") -> dict[str, Any]:
-        chat = self.storage.create_chat(title=title, member_ids=member_ids, kind=kind)
+    def rename_chat(self, chat_id: str, title: str) -> dict[str, Any]:
+        chat = self.storage.get_chat(chat_id)
+        if chat is None:
+            raise KeyError(f"Chat not found: {chat_id}")
+        chat["title"] = title
+        self.storage.save_chat(chat)
+        return chat
+
+    def create_chat(self, title: str, member_ids: list[str], kind: str = "group", runner: Any = None, model: Any = None) -> dict[str, Any]:
+        effective_runner = runner or (self.orchestrator.backend if model else None)
+        checked_runner, model = validate_choice(effective_runner, model)
+        runner = runner if runner is None else checked_runner
+        chat = self.storage.create_chat(title=title, member_ids=member_ids, kind=kind, runner=runner, model=model)
         self._append_system_message(chat["chat_id"], f"Chat created for: {', '.join(member_ids)}")
         return self.storage.get_chat(chat["chat_id"]) or chat
 
@@ -754,6 +823,8 @@ class AgentSlackApp:
                 if any((message.get("metadata") or {}).get("idempotency_key") == key for message in chat.get("messages", [])):
                     return chat
             attachments = self.resolve_uploads(attachment_ids)
+            if not body.strip() and not attachments:
+                raise ValueError("A message needs text or at least one attachment")
             metadata = {"attachments": attachments} if attachments else {}
             if key:
                 metadata["idempotency_key"] = key
@@ -1080,7 +1151,8 @@ class AgentSlackApp:
         return self.storage.get_chat(chat_id) or chat
 
     def cancel_run(self, run_id: str) -> dict[str, Any]:
-        result = self.orchestrator.cancel_run(run_id)
+        orchestrator = self._run_orchestrators.get(run_id, self.orchestrator)
+        result = orchestrator.cancel_run(run_id)
         if result.get("accepted"):
             with self._run_state_lock:
                 run = self._active_run_states.get(run_id)
@@ -1092,7 +1164,8 @@ class AgentSlackApp:
         return result
 
     def cancel_task(self, run_id: str, task_id: str) -> dict[str, Any]:
-        result = self.orchestrator.cancel_task(run_id, task_id)
+        orchestrator = self._run_orchestrators.get(run_id, self.orchestrator)
+        result = orchestrator.cancel_task(run_id, task_id)
         if result.get("accepted"):
             with self._run_state_lock:
                 run = self._active_run_states.get(run_id)
@@ -1157,7 +1230,9 @@ class AgentSlackApp:
             path for path in self.project_root.rglob("*")
             if path.is_file() and ".git" not in path.parts
         }
-        self.orchestrator.prepare_run(run_id)
+        orchestrator = self._orchestrator_for_chat(chat)
+        orchestrator.prepare_run(run_id)
+        self._run_orchestrators[run_id] = orchestrator
         self._begin_run_state(run_id, run_chat_id, mode, run_agent_id)
         yield {
             "type": "run_started",
@@ -1178,7 +1253,7 @@ class AgentSlackApp:
         message_ids: dict[str, str] = {}
         ui_started_tasks: set[str] = set()
         ui_started_at: dict[str, float] = {}
-        native_events = self.orchestrator.stream_agent_reply(
+        native_events = orchestrator.stream_agent_reply(
             agent=run_agent,
             chat=chat,
             transcript=list(chat.get("messages", [])),
@@ -1489,6 +1564,8 @@ class AgentSlackApp:
             title=f"{lead['title']} Meeting: {title_objective}",
             member_ids=participants,
             kind="group",
+            runner=source_chat.get("runner"),
+            model=source_chat.get("model"),
         )
         if objective.strip():
             meeting_chat = self.add_user_message(meeting_chat["chat_id"], objective)

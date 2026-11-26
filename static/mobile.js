@@ -4,11 +4,17 @@
   if (root) root.AgentSlackMobile = api;
   if (root && root.document) root.document.addEventListener("DOMContentLoaded", () => api.init(root));
 }(typeof window !== "undefined" ? window : globalThis, function createMobileHelpers() {
+  const DRAWER_MAX = 639;
   const KEYBOARD_MIN_PX = 120;
   const TEXT_FIELD = "textarea, input:not([type=checkbox]):not([type=radio]):not([type=range]):not([type=button]):not([type=submit])";
 
   function isKeyboardOpen(layoutHeight, visibleHeight) {
     return layoutHeight - visibleHeight > KEYBOARD_MIN_PX;
+  }
+
+  function isDrawerViewport(widthOrWindow) {
+    const width = typeof widthOrWindow === "number" ? widthOrWindow : widthOrWindow?.innerWidth;
+    return Number(width) <= DRAWER_MAX;
   }
 
   function fitHeight(contentHeight, maxHeight) {
@@ -124,5 +130,5 @@
     setupActionsMenu(win);
   }
 
-  return { init, isKeyboardOpen, fitHeight, isNearBottom };
+  return { init, isKeyboardOpen, isDrawerViewport, fitHeight, isNearBottom };
 }));

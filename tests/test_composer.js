@@ -6,7 +6,8 @@ const composer = require("../static/composer.js");
 
 const staticRoot = path.join(__dirname, "..", "static");
 const html = fs.readFileSync(path.join(staticRoot, "index.html"), "utf8");
-const styles = fs.readFileSync(path.join(staticRoot, "styles.css"), "utf8");
+const themeStyles = fs.readFileSync(path.join(staticRoot, "theme.css"), "utf8");
+const styles = fs.readFileSync(path.join(staticRoot, "styles.css"), "utf8") + themeStyles;
 const appSource = fs.readFileSync(path.join(staticRoot, "app.js"), "utf8");
 
 test("Return sends while Shift+Return and IME composition keep editing", () => {
@@ -49,7 +50,7 @@ test("local playable media renders as previews instead of source bubbles", () =>
 test("mobile layout keeps People and Send available inside the viewport", () => {
   assert.match(html, /id="mobilePeopleBtn"/);
   assert.match(html, /id="mobileSidebarBackdrop"/);
-  assert.match(html, /src="\/composer\.js"/);
+  assert.match(html, /src="\.\/composer\.js"/);
   assert.match(styles, /100dvh/);
   assert.match(styles, /safe-area-inset-bottom/);
   assert.match(styles, /\.sidebar-primary\.mobile-open/);
@@ -62,7 +63,7 @@ test("mobile layout keeps People and Send available inside the viewport", () => 
 test("mobile keyboard: fields never trigger iOS zoom and the shell follows the visible viewport", () => {
   assert.match(styles, /@media \(pointer: coarse\), \(max-width: 900px\)\s*\{[^}]*textarea[^}]*font-size: 16px !important/);
   assert.match(styles, /\.shell\s*\{[^}]*top: var\(--vv-top, 0px\)[^}]*height: var\(--vvh, 100dvh\)/);
-  assert.match(html, /src="\/mobile\.js"/);
+  assert.match(html, /src="\.\/mobile\.js"/);
   assert.match(html, /interactive-widget=resizes-content/);
   assert.doesNotMatch(appSource, /visual-viewport-height/);
 });
@@ -85,10 +86,10 @@ test("navigation stays available while an agent run streams", () => {
   assert.match(appSource, /currentRunChatId/);
 });
 
-test("messages are left-aligned like Slack, with no right-hand bubbles", () => {
-  assert.doesNotMatch(styles, /\.message\.user\s*\{[\s\S]*?grid-template-columns:\s*minmax\(0,\s*1fr\)\s+44px/);
-  assert.doesNotMatch(styles, /justify-self:\s*end/);
-  assert.match(styles, /\.message\s*\{[^}]*grid-template-columns:\s*36px minmax\(0, 1fr\)/);
+test("agent messages read plainly and user messages use right-aligned bubbles", () => {
+  assert.match(themeStyles, /\.message\.user\s*\{\s*justify-content:\s*flex-end/);
+  assert.match(themeStyles, /\.message\.user \.message-content\s*\{[^}]*background:\s*var\(--user-bubble\)/);
+  assert.match(themeStyles, /\.message-avatar\s*\{\s*display:\s*none/);
 });
 
 test("server logos fit inside the workspace button without cropping", () => {
@@ -106,7 +107,8 @@ test("plain projects can choose a CLI provider and model without API keys", () =
 });
 
 test("composer uploads selected files before posting attachment ids", () => {
-  assert.doesNotMatch(html, /id="attachBtn"/);
+  assert.match(html, /id="attachBtn"[^>]*aria-label="Attach files"/);
+  assert.match(html, /id="attachInput" type="file" multiple hidden/);
   assert.match(html, /id="pendingAttachments"/);
   assert.match(appSource, /\/api\/v1\/uploads/);
   assert.match(appSource, /X-Agent-Slack-Filename/);
@@ -114,6 +116,15 @@ test("composer uploads selected files before posting attachment ids", () => {
   assert.match(appSource, /message\.metadata\?\.attachments/);
   assert.match(appSource, /dataTransfer\?\.files/);
   assert.match(appSource, /selectAttachments\(event\.dataTransfer\.files\)/);
+  assert.match(appSource, /attachInput[\s\S]*?selectAttachments\(event\.target\.files\)[\s\S]*?event\.target\.value = ""/);
+  assert.match(appSource, /function handleMessagePaste\(event\)[\s\S]*?clipboardData\?\.files/);
+  assert.match(appSource, /addEventListener\("paste",\s*\(event\)\s*=>\s*\{\s*handleMessagePaste\(event\)/);
+  assert.match(appSource, /pasted-image/);
+  assert.match(appSource, /URL\.createObjectURL/);
+  assert.match(appSource, /URL\.revokeObjectURL/);
+  assert.match(appSource, /uploadError/);
+  assert.match(styles, /\.host-session-open #attachBtn/);
+  assert.match(styles, /\.attach-button, \.pending-attachment button\s*\{[^}]*min-width: 40px[^}]*min-height: 40px/);
   assert.match(styles, /message-input-wrap\.drag-active/);
   assert.match(styles, /\.pending-attachments/);
   assert.match(styles, /\.message-attachments/);

@@ -20,8 +20,8 @@ test("index.html has a Chat/Agent mode switch and a Chat mode pane", () => {
 });
 
 test("index.html loads chatmode.js before app.js", () => {
-  const chatModeIndex = html.indexOf('src="/chatmode.js"');
-  const appIndex = html.indexOf('src="/app.js"');
+  const chatModeIndex = html.indexOf('src="./chatmode.js"');
+  const appIndex = html.indexOf('src="./app.js"');
   assert.ok(chatModeIndex > -1 && appIndex > -1 && chatModeIndex < appIndex);
 });
 

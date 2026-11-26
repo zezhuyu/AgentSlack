@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -41,7 +42,7 @@ class AgentSlackStorage:
         chats.sort(key=lambda item: str(item.get("updated_at") or ""), reverse=True)
         return chats
 
-    def create_chat(self, title: str, member_ids: list[str], kind: str = "group") -> dict[str, Any]:
+    def create_chat(self, title: str, member_ids: list[str], kind: str = "group", runner: str | None = None, model: str | None = None) -> dict[str, Any]:
         chat = {
             "chat_id": uuid.uuid4().hex[:12],
             "title": title,
@@ -51,6 +52,8 @@ class AgentSlackStorage:
             "meetings": [],
             "created_at": utc_now(),
             "updated_at": utc_now(),
+            "runner": runner,
+            "model": model,
         }
         self.save_chat(chat)
         return chat
@@ -129,7 +132,15 @@ class AgentSlackStorage:
         return tasks
 
     def _write_json(self, path: Path, payload: dict[str, Any]) -> None:
-        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        # Write-then-rename so a concurrent reader (another request, a running task) never sees a half-written
+        # file; a torn read used to look like "chat deleted" and made callers create a duplicate chat.
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+        try:
+            temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            os.replace(temporary, path)
+        finally:
+            temporary.unlink(missing_ok=True)
 
     def _read_json(self, path: Path, default: dict[str, Any]) -> dict[str, Any]:
         if not path.exists():

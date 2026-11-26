@@ -167,7 +167,7 @@ test("completed and pending actions have persistent, clear status labels", () =>
 });
 
 test("historical messages and streamed agent completions render persisted UI", () => {
-  assert.match(html, /src="\/generative-ui\.js"/);
+  assert.match(html, /src="\.\/generative-ui\.js"/);
   assert.match(appSource, /message\.metadata\?\.agent_ui\?\.content\?\.ui/);
   assert.match(appSource, /const finalUi = event\.ui \|\| stream\.uiSpec/);
   assert.match(appSource, /event\.type === "ui\.patch"/);

@@ -8,6 +8,13 @@ test("keyboard is detected only when the visible viewport shrinks substantially"
   assert.equal(mobile.isKeyboardOpen(844, 500), true);
 });
 
+test("the conversation drawer is limited to the single-pane phone breakpoint", () => {
+  assert.equal(mobile.isDrawerViewport(382), true);
+  assert.equal(mobile.isDrawerViewport(639), true);
+  assert.equal(mobile.isDrawerViewport(640), false);
+  assert.equal(mobile.isDrawerViewport({ innerWidth: 951 }), false);
+});
+
 test("textarea height grows with content but stops at its maximum", () => {
   assert.equal(mobile.fitHeight(44, 132), 44);
   assert.equal(mobile.fitHeight(300, 132), 132);

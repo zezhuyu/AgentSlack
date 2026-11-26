@@ -4,11 +4,18 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content" />
     <title>Agent Slack</title>
-    <meta name="theme-color" content="#3f0e40" />
+    <meta name="color-scheme" content="light dark" />
+    <meta name="theme-color" content="#faf9f5" media="(prefers-color-scheme: light)" />
+    <meta name="theme-color" content="#262624" media="(prefers-color-scheme: dark)" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-title" content="Agent Slack" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="default" />
     <link rel="manifest" href="./site.webmanifest" />
     <link rel="apple-touch-icon" sizes="180x180" href="./icons/apple-touch-icon.png" />
     <link rel="icon" type="image/png" href="./logo.png" />
     <link rel="stylesheet" href="./styles.css" />
+    <link rel="stylesheet" href="./theme.css" />
   </head>
   <body>
     <dialog id="authDialog" class="auth-dialog">
@@ -24,7 +31,7 @@
     <div class="shell">
       <aside class="workspace-rail">
         <div class="workspace-badge"><img src="./logo.png" alt="Agent Slack" /></div>
-        <button id="hostSessionsServerBtn" class="server-btn host-sessions-server-btn" type="button" title="Host sessions outside onboarded projects" aria-label="Host sessions outside onboarded projects">&#9673;</button>
+        <button id="hostSessionsServerBtn" class="server-btn host-sessions-server-btn" type="button" title="Host sessions outside onboarded projects" aria-label="Host sessions outside onboarded projects">&#9673;<span id="permissionCount" class="permission-rail-count" hidden>0</span></button>
         <div id="serverList" class="workspace-stack server-stack"></div>
         <button id="addServerBtn" class="rail-btn add-server-btn" title="Add agent system">+</button>
       </aside>
@@ -55,6 +62,10 @@
           </div>
           <div id="chatList" class="list"></div>
         </section>
+        <section id="projectHostSessionsSection" class="sidebar-section project-host-sessions" hidden>
+          <div class="section-heading"><h2>Sessions</h2><span id="projectHostSessionCount" class="section-meta">0</span></div>
+          <div id="projectHostSessionsList" class="list"></div>
+        </section>
         <section class="people-panel collapsed" id="peoplePanel">
           <button id="peopleToggleBtn" class="people-toggle" type="button" aria-expanded="false">
             <span class="people-toggle-left">
@@ -70,6 +81,7 @@
       </aside>
 
       <main class="main-pane">
+        <section id="permissionCards" class="permission-cards" aria-live="polite" aria-label="Permission requests"></section>
         <div class="mode-switch" role="tablist" aria-label="Agent Slack mode">
           <button id="chatModeTabBtn" class="mode-tab" role="tab" aria-selected="false" type="button">Chat</button>
           <button id="agentModeTabBtn" class="mode-tab is-active" role="tab" aria-selected="true" type="button">Agent</button>
@@ -81,7 +93,7 @@
               <svg aria-hidden="true" viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M4 7h16M4 12h16M4 17h16" /></svg>
             </button>
             <div class="chat-heading">
-              <h2 id="chatTitle">Select a chat</h2>
+              <div class="chat-title-row"><h2 id="chatTitle">Select a chat</h2><button id="chatRenameBtn" class="chat-rename-btn" type="button" title="Rename (or double-click the name)" aria-label="Rename conversation" hidden>✎</button></div>
               <p id="chatMembers" class="muted"></p>
             </div>
             <div class="chat-actions">
@@ -100,14 +112,19 @@
           </header>
           <section id="messages" class="messages"></section>
           <footer class="composer">
-            <div id="pendingAttachments" class="pending-attachments" aria-live="polite"></div>
+            <div id="uploadError" class="pending-attachment-error" role="status" hidden></div>
+            <div id="hostResumeHint" class="host-resume-hint" role="note" hidden></div>
+              <div id="pendingAttachments" class="pending-attachments" aria-live="polite"></div>
             <div class="composer-box">
               <input id="objectiveInput" class="objective-input" placeholder="Objective for the next run or meeting (optional)" hidden />
+              <div id="chatRunnerSettings" class="chat-runner-settings" hidden><label>Agent <select id="chatRunnerSelect"></select></label><label>Model <select id="chatModelSelect"></select></label></div>
               <div class="message-input-wrap">
                 <textarea id="messageInput" rows="1" placeholder="Message · @ mention · /path to attach"></textarea>
                 <div id="mentionMenu" class="mention-menu" role="listbox" hidden></div>
               </div>
               <div class="composer-toolbar">
+                <input id="attachInput" type="file" multiple hidden />
+                <button id="attachBtn" class="toolbar-btn attach-button" type="button" aria-label="Attach files" title="Attach files">📎</button>
                 <button id="voiceBtn" class="voice-button" type="button" title="Start voice input" aria-label="Start voice input">&#127908;</button>
                 <button id="objectiveToggleBtn" class="toolbar-btn" type="button" aria-controls="objectiveInput" aria-expanded="false" title="Set an objective for the next run or meeting">Objective</button>
                 <span id="voiceStatus" class="voice-status" aria-live="polite" hidden><span class="voice-status-dot"></span><span id="voiceStatusText"></span></span>
@@ -156,6 +173,7 @@
       <form method="dialog" id="chatForm">
         <h3>Create Chat</h3>
         <label>Title <input id="chatFormTitle" required /></label>
+        <div class="chat-runner-settings"><label>Agent <select id="newChatRunnerSelect"></select></label><label>Model <select id="newChatModelSelect"></select></label></div>
         <label>People</label>
         <div class="agent-picker" id="chatPeoplePicker">
           <div id="chatPeopleChips" class="agent-picker-chips"></div>

@@ -142,9 +142,87 @@ a:focus-visible,
 }
 
 .host-sessions-server-btn {
+  position: relative;
   color: #9fe3c3;
   font-size: 20px;
 }
+
+.permission-rail-count {
+  position: absolute;
+  top: -7px;
+  right: -8px;
+  min-width: 17px;
+  padding: 0 4px;
+  border-radius: 999px;
+  background: #d92d43;
+  color: #fff;
+  font: 700 10px/17px sans-serif;
+}
+
+.project-host-sessions { flex: 0 1 38%; max-height: 38%; }
+.project-host-sessions .list { min-height: 0; overflow-y: auto; }
+.permission-cards { position: relative; z-index: 2; display: grid; gap: 8px; padding: 8px 16px 0; }
+.permission-card { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px 16px; padding: 12px 16px; border: 1px solid #d99a36; border-radius: 10px; background: #fff8e8; box-shadow: 0 3px 12px #00000012; }
+.permission-card.is-focused { outline: 3px solid #f1bd59; }
+.permission-card header { grid-column: 1 / -1; display: flex; justify-content: space-between; gap: 12px; font-weight: 800; }
+.permission-card-summary { white-space: pre-wrap; overflow-wrap: anywhere; }
+.permission-card-actions { display: flex; gap: 8px; align-items: center; }
+.permission-card-actions button { padding: 6px 12px; border-radius: 6px; cursor: pointer; }
+.permission-approve { color: #fff; background: #007a5a; border: 1px solid #007a5a; }
+.permission-deny { color: #9b1c2a; background: #fff; border: 1px solid #d99a36; }
+.permission-expiry { color: #6f5b3d; font-size: 12px; }
+.permission-card.resolved { border-color: #b8d9c9; background: #effaf4; }
+/* Agent progress (shared by host sessions and managed runs) ------------------ */
+.host-progress {
+  margin: 6px 0 4px;
+  padding: 10px 14px 10px;
+  max-width: none;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--hover-bg, #f8f8f8);
+  font-size: 13.5px;
+  line-height: 1.4;
+}
+.host-progress summary { list-style: none; cursor: default; }
+.host-progress summary::-webkit-details-marker { display: none; }
+.managed-progress-header { display: flex; align-items: center; gap: 8px; font-weight: 700; color: var(--main-ink); }
+.progress-title { flex: 1; }
+.managed-progress-elapsed { color: var(--muted); font-size: 12px; font-weight: 500; font-variant-numeric: tabular-nums; }
+.progress-spinner {
+  flex: 0 0 auto; width: 14px; height: 14px; border-radius: 50%;
+  border: 2px solid var(--line); border-top-color: var(--link, #1264a3);
+  animation: progress-spin 0.9s linear infinite;
+}
+.progress-steps { list-style: none; margin: 8px 0 0; padding: 0 0 0 6px; display: flex; flex-direction: column; gap: 3px; }
+.progress-step {
+  display: flex; align-items: center; gap: 9px; min-width: 0;
+  color: var(--muted); animation: progress-enter 160ms ease-out both;
+}
+.progress-dot { flex: 0 0 auto; width: 8px; height: 8px; border-radius: 50%; background: #b9bcc0; }
+.progress-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.progress-step.kind-tool .progress-label,
+.progress-step.kind-subagent .progress-label { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12.5px; }
+.progress-step.step-running { color: var(--main-ink); }
+.progress-step.step-running .progress-dot { background: var(--link, #1264a3); box-shadow: 0 0 0 3px rgba(18, 100, 163, 0.18); animation: progress-pulse 1.4s ease-in-out infinite; }
+.progress-step.step-done .progress-dot { background: var(--slack-green, #2eb67d); }
+.progress-more {
+  margin: 8px 0 0 6px; padding: 0; border: 0; background: none;
+  color: var(--link, #1264a3); font: inherit; font-size: 12.5px; cursor: pointer;
+}
+.progress-more:hover { text-decoration: underline; }
+/* Streaming row: the progress card replaces the old typing dots and "working now" timestamp. */
+.message.streaming > .message-body > header time { display: none; }
+.message-content:empty { display: none; }
+@keyframes progress-spin { to { transform: rotate(360deg); } }
+@keyframes progress-pulse { 50% { box-shadow: 0 0 0 5px rgba(18, 100, 163, 0.06); } }
+@keyframes progress-enter { from { opacity: 0; transform: translateY(3px); } to { opacity: 1; transform: translateY(0); } }
+@media (prefers-reduced-motion: reduce) { .progress-spinner, .progress-step, .progress-step.step-running .progress-dot { animation: none; } }
+@media (max-width: 600px) { .host-progress { padding: 8px 10px; max-width: none; } }
+/* Host sessions are read/resume views: the project-chat toolbar does not apply. */
+.host-session-open #chatActionsMenu,
+.host-session-open #chatMoreBtn { display: none; }
+.host-session-open #attachBtn,
+.host-session-open #attachInput { display: none; }
 
 .server-btn:disabled {
   cursor: not-allowed;
@@ -372,6 +450,18 @@ a:focus-visible,
   animation: host-session-pulse 1.5s ease-in-out infinite;
 }
 .chat-row.unavailable { opacity: .55; }
+.subagent-chip { display: inline-flex; align-items: center; border: 1px solid var(--border, #555); border-radius: 999px; padding: 1px 7px; font-size: 11px; white-space: nowrap; }
+.subagent-chip.is-running { color: #7ee6ad; }
+.subagent-chip.is-running::before { content: ""; width: 6px; height: 6px; margin-right: 5px; border-radius: 50%; background: currentColor; animation: host-session-pulse 1.5s ease-in-out infinite; }
+.host-subagents { margin: 8px 0 14px; padding: 10px; border: 1px solid var(--border, #555); border-radius: 10px; }
+.host-subagents > summary { cursor: pointer; font-weight: 700; }
+.subagent-card { display: grid; grid-template-columns: 1fr auto; gap: 4px 10px; width: 100%; margin-top: 8px; padding: 10px; color: inherit; text-align: left; background: var(--surface, rgba(127,127,127,.08)); border: 1px solid var(--border, #555); border-radius: 8px; cursor: pointer; }
+.subagent-card > span:last-of-type, .subagent-card small { grid-column: 1 / -1; color: var(--sidebar-muted); overflow-wrap: anywhere; }
+.subagent-status { white-space: nowrap; }
+.subagent-status.running { color: #7ee6ad; animation: host-session-pulse 1.5s ease-in-out infinite; }
+.subagent-status.done { color: #7ee6ad; }
+.subagent-status.failed, .subagent-status.stalled { color: #ffb4ab; }
+@media (max-width: 600px) { .subagent-card { grid-template-columns: 1fr; } .subagent-status { grid-row: 2; } }
 .host-session-error { color: #ffb4ab; }
 @keyframes host-session-pulse {
   50% { opacity: .35; }
@@ -797,9 +887,12 @@ dialog .text-button:hover { text-decoration: underline; }
 .message {
   display: grid;
   grid-template-columns: 36px minmax(0, 1fr);
-  gap: 8px;
-  padding: 8px 20px;
+  gap: 12px;
+  padding: 10px 24px;
 }
+.message-body { max-width: min(100%, 1200px); }
+.message.user { background: transparent; }
+.message.user .message-content { background: #f1f6fb; border: 1px solid #dfeaf4; border-radius: 10px; padding: 8px 12px; display: inline-block; max-width: 100%; }
 
 .message:hover {
   background: var(--hover-bg);
@@ -851,7 +944,7 @@ dialog .text-button:hover { text-decoration: underline; }
   word-break: break-word;
   font-family: inherit;
   font-size: 15px;
-  line-height: 1.46668;
+  line-height: 1.5;
   color: var(--main-ink);
 }
 
@@ -931,6 +1024,7 @@ dialog .text-button:hover { text-decoration: underline; }
 }
 
 .composer-toolbar .toolbar-btn:hover { background: #f4f4f4; }
+.attach-button { min-width: 36px; font-size: 18px !important; }
 .composer-toolbar .toolbar-btn.is-on { color: var(--link); }
 
 .composer-toolbar .danger-button { color: var(--danger); }
@@ -1334,23 +1428,6 @@ dialog select:focus {
 
 .message.cancelled .message-content {
   color: var(--muted);
-}
-
-.message-content {
-  margin: 0;
-  word-break: break-word;
-  font-family: inherit;
-  font-size: 15px;
-  line-height: 1.45;
-  color: var(--main-ink);
-}
-
-.message-content > :first-child {
-  margin-top: 0;
-}
-
-.message-content > :last-child {
-  margin-bottom: 0;
 }
 
 /* ---- choice cards + markdown ---- */
@@ -1866,6 +1943,14 @@ dialog select:focus {
   line-height: 1;
   cursor: pointer;
 }
+.pending-attachment { border-radius: 12px; }
+.pending-attachment img { width: 36px; height: 36px; object-fit: cover; border-radius: 6px; }
+.pending-attachment button { min-width: 32px; min-height: 32px; }
+.pending-attachment-error { color: var(--danger); font-size: 13px; margin: 0 0 8px; }
+@media (max-width: 640px) {
+  .attach-button, .pending-attachment button { min-width: 40px; min-height: 40px; }
+  .pending-attachment img { width: 40px; height: 40px; }
+}
 
 .message-attachments {
   margin-top: 9px;
@@ -2377,3 +2462,125 @@ menu {
   .sidebar-primary.mobile-open,
   .shell:has(.sidebar-primary.mobile-open) .workspace-rail { animation: none; }
 }
+
+/* Messages queued in the terminal while the agent is busy ------------------- */
+.host-queue { margin: 6px 24px 10px 72px; max-width: none; display: flex; flex-direction: column; gap: 6px; }
+.chat-runner-settings { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-right: auto; }
+.chat-runner-settings label { display: flex; align-items: center; gap: 5px; color: var(--muted); font-size: 12px; }
+.chat-runner-settings select { max-width: min(42vw, 230px); min-height: 32px; border: 1px solid var(--border); border-radius: 7px; padding: 4px 8px; background: var(--surface); color: var(--text); }
+.host-queue-heading { font-size: 12px; font-weight: 700; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; }
+.host-queue-item {
+  display: flex; align-items: flex-start; gap: 10px; padding: 8px 12px;
+  border: 1px dashed #b9c6d3; border-radius: 10px; background: #f6f9fc; opacity: 0.85;
+}
+.host-queue-pill {
+  flex: 0 0 auto; padding: 1px 8px; border-radius: 999px; background: #e3edf6;
+  color: #1264a3; font-size: 11px; font-weight: 700; line-height: 18px;
+}
+.host-queue-text { min-width: 0; white-space: pre-wrap; word-break: break-word; font-size: 14px; line-height: 1.45; }
+.queued-chip { padding: 0 6px; border-radius: 999px; background: #e3edf6; color: #1264a3; font-weight: 700; }
+@media (max-width: 600px) { .host-queue { margin: 6px 12px 10px 12px; max-width: none; } }
+
+/* Chat layout v2: one gutter shared by messages, progress, queue and composer --- */
+:root {
+  --chat-gutter: 24px;
+  --avatar-col: 36px;
+  --avatar-gap: 12px;
+  --chat-indent: calc(var(--chat-gutter) + var(--avatar-col) + var(--avatar-gap));
+}
+@media (max-width: 640px) { :root { --chat-gutter: 12px; --avatar-gap: 10px; } }
+.message {
+  grid-template-columns: var(--avatar-col) minmax(0, 1fr);
+  gap: var(--avatar-gap);
+  padding-left: var(--chat-gutter);
+  padding-right: var(--chat-gutter);
+}
+.composer { padding-left: var(--chat-gutter); padding-right: var(--chat-gutter); }
+.message-body header { margin-bottom: 3px; }
+
+/* Progress and queue sit in the message column (under the avatar gutter), not flush to the window edge. */
+#messages > .host-progress,
+#messages > .host-queue { margin-left: var(--chat-indent); margin-right: var(--chat-gutter); max-width: none; }
+.host-progress { background: #fafbfc; border-color: #e6e8eb; padding: 10px 14px; }
+.managed-progress-header { font-weight: 600; font-size: 13.5px; }
+.progress-steps { gap: 4px; padding-left: 2px; }
+.progress-step { color: #565b63; }
+.progress-step.step-running { color: var(--main-ink); }
+.progress-dot { width: 7px; height: 7px; background: #c7cacf; }
+.progress-step.step-done .progress-dot { background: #3fa376; }
+.progress-step.kind-tool .progress-label,
+.progress-step.kind-subagent .progress-label { font-size: 12px; letter-spacing: -0.005em; }
+.progress-more { margin-left: 2px; }
+
+/* A host session has no objective: hide the project-chat only controls. */
+.host-session-open #objectiveToggleBtn,
+.host-session-open #objectiveInput { display: none; }
+
+/* Conversation name + inline rename --------------------------------------------- */
+.chat-title-row { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.chat-title-row h2 { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; cursor: text; }
+.chat-rename-btn {
+  flex: 0 0 auto; padding: 2px 6px; border: 0; border-radius: 6px; background: transparent;
+  color: var(--muted); font-size: 14px; cursor: pointer; opacity: 0; transition: opacity 120ms ease;
+}
+.chat-title-row:hover .chat-rename-btn, .chat-rename-btn:focus-visible { opacity: 1; }
+.chat-rename-btn:hover { background: var(--hover-bg); color: var(--main-ink); }
+@media (pointer: coarse) { .chat-rename-btn { opacity: 1; } }
+.chat-title-input {
+  width: min(440px, 60vw); padding: 2px 8px; border: 1px solid var(--line-strong, #868686); border-radius: 6px;
+  font: inherit; color: var(--main-ink); background: #fff;
+}
+
+/* Use the whole screen: no fixed content widths; respect the notch/home-indicator insets on phones. */
+.shell, .main-pane { width: 100%; }
+@supports (padding: max(0px)) {
+  .message { padding-left: max(var(--chat-gutter), env(safe-area-inset-left, 0px)); padding-right: max(var(--chat-gutter), env(safe-area-inset-right, 0px)); }
+  .composer { padding-left: max(var(--chat-gutter), env(safe-area-inset-left, 0px)); padding-right: max(var(--chat-gutter), env(safe-area-inset-right, 0px)); }
+  #messages > .host-progress, #messages > .host-queue, #messages > .host-awaiting {
+    margin-left: calc(var(--chat-indent) + max(0px, env(safe-area-inset-left, 0px) - var(--chat-gutter)));
+    margin-right: max(var(--chat-gutter), env(safe-area-inset-right, 0px));
+  }
+}
+
+/* Agent is blocked on you ------------------------------------------------------- */
+.host-awaiting {
+  margin: 8px var(--chat-gutter) 12px var(--chat-indent); padding: 12px 14px;
+  border: 1px solid #e8c36a; border-left: 4px solid #e2a21b; border-radius: 10px; background: #fff9e9;
+}
+.host-awaiting-heading { font-size: 12px; font-weight: 800; letter-spacing: 0.04em; text-transform: uppercase; color: #8a5a00; }
+.host-awaiting-text { margin-top: 6px; font-size: 15px; line-height: 1.5; white-space: pre-wrap; word-break: break-word; }
+.host-awaiting-options { display: flex; flex-wrap: wrap; gap: 6px; margin: 10px 0 0; padding: 0; list-style: none; }
+.host-awaiting-options li { padding: 4px 10px; border: 1px solid #e3cf9b; border-radius: 999px; background: #fffdf5; font-size: 13px; }
+.host-awaiting-note { margin-top: 10px; font-size: 12.5px; color: #7a6a45; }
+.host-session-status.is-awaiting { color: #b26a00; font-weight: 700; }
+.host-session-status.is-awaiting .host-session-dot { background: #e2a21b; }
+
+/* A message that was just sent and is not stored yet */
+.message.pending .message-content { opacity: 0.7; }
+.message.pending time { font-style: italic; }
+.message.pending.failed { border-left: 3px solid var(--danger); }
+.pending-assistant { margin: 8px 0 0 36px; white-space: pre-wrap; opacity: 0.9; }
+.pending-note { margin-top: 4px; font-size: 12.5px; color: var(--muted); }
+
+/* Agent / model pickers: tidy on desktop, own row on phones (Send must never be pushed off screen) */
+.composer-toolbar { flex-wrap: wrap; row-gap: 4px; }
+.chat-runner-settings { gap: 6px 12px; }
+.chat-runner-settings label { font-size: 12px; font-weight: 600; color: var(--muted); }
+.chat-runner-settings select {
+  font: inherit; font-size: 13px; font-weight: 500; color: var(--main-ink);
+  border: 1px solid var(--line-strong, #c9c9c9); border-radius: 7px; background-color: #fff; padding: 3px 8px;
+}
+.chat-runner-settings select:disabled { opacity: 0.6; }
+@media (max-width: 640px) {
+  .chat-runner-settings { flex: 1 1 100%; order: -1; flex-wrap: nowrap; gap: 8px; margin: 0 0 2px; }
+  .chat-runner-settings label { flex: 1 1 0; min-width: 0; flex-direction: column; align-items: stretch; gap: 2px; }
+  .chat-runner-settings select { width: 100%; min-width: 0; max-width: none; min-height: 40px; font-size: 16px; } /* 16px: no iOS focus zoom */
+  .composer-toolbar .send-button { margin-left: auto; }
+}
+
+.permission-question-form { grid-column: 1 / -1; display: grid; gap: 10px; }
+.permission-question { border: 1px solid var(--border, #d0d0d0); border-radius: 8px; padding: 8px 10px; display: grid; gap: 6px; margin: 0; }
+.permission-question legend { font-weight: 600; padding: 0 4px; }
+.permission-option { display: flex; gap: 8px; align-items: flex-start; cursor: pointer; }
+.permission-option small { display: block; opacity: 0.7; }
+.permission-other { width: 100%; box-sizing: border-box; padding: 6px 8px; border-radius: 6px; border: 1px solid var(--border, #c0c0c0); font: inherit; }

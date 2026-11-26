@@ -4,6 +4,7 @@ import subprocess
 import io
 import json
 import signal
+import sys
 from pathlib import Path
 
 from agent_slack.orchestrator import CliOrchestrator
@@ -86,8 +87,11 @@ def test_reports_missing_local_cli(tmp_path: Path, monkeypatch) -> None:
 
 def test_native_prompt_includes_trusted_attachment_paths(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv("AGENT_SLACK_CLI", "offline")
+    uploads = tmp_path / "uploads"
+    uploads.mkdir()
+    (uploads / "diagram.png").write_bytes(b"png")
     orchestrator = CliOrchestrator("SampleProject", tmp_path)
-    attachment_path = str((tmp_path / "uploads" / "diagram.png").resolve())
+    attachment_path = str((uploads / "diagram.png").resolve())
     prompt = orchestrator._compose_native_prompt(
         {
             "agent_id": "project_claude",
@@ -117,6 +121,98 @@ def test_native_prompt_includes_trusted_attachment_paths(tmp_path: Path, monkeyp
 
     assert "Inspect this diagram" in prompt
     assert f"diagram.png: {attachment_path}" in prompt
+    assert "Open and read them with your file tools" in prompt
+    assert "sent inline" in prompt
+
+
+def test_inline_images_are_limited_to_upload_root_turn_images_and_size(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("AGENT_SLACK_CLI", "codex")
+    monkeypatch.setattr("agent_slack.orchestrator.shutil.which", lambda name: f"/bin/{name}")
+    uploads = tmp_path / "uploads"
+    uploads.mkdir()
+    valid = uploads / "ok.png"
+    valid.write_bytes(b"png")
+    outside = tmp_path / "outside.png"
+    outside.write_bytes(b"png")
+    escape = uploads / "escape.png"
+    escape.symlink_to(outside)
+    large = uploads / "large.png"
+    large.write_bytes(b"x" * (5 * 1024 * 1024 + 1))
+    attachments = [
+        {"filename": path.name, "path": str(path), "content_type": "image/png", "size": path.stat().st_size}
+        for path in (valid, escape, large, outside)
+    ]
+    transcript = [{"author_type": "user", "body": "", "metadata": {"attachments": attachments}}]
+    orchestrator = CliOrchestrator("SampleProject", tmp_path, uploads_root=uploads)
+    assert orchestrator._inline_images(transcript) == [(valid.resolve(), "image/png")]
+    many = [{"author_type": "user", "metadata": {"attachments": [
+        {"path": str(valid), "content_type": "image/png", "size": 3} for _ in range(7)
+    ]}}]
+    assert len(orchestrator._inline_images(many)) == 5
+    command = orchestrator._command(transcript)
+    assert f"--image={valid.resolve()}" in command
+    assert command[-1] == "-"
+
+
+def test_pending_turn_selects_latest_attachments_only_and_claude_emits_image_blocks(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("AGENT_SLACK_CLI", "claude")
+    monkeypatch.setattr("agent_slack.orchestrator.shutil.which", lambda name: f"/bin/{name}")
+    uploads = tmp_path / "uploads"
+    uploads.mkdir()
+    image = uploads / "one.png"
+    image.write_bytes(b"image-bytes")
+    transcript = [
+        {"author_type": "user", "body": "old", "metadata": {"attachments": [{"path": str(image), "content_type": "image/png", "size": 11}]}},
+        {"author_type": "agent", "body": "reply"},
+        {"author_type": "user", "body": "new", "metadata": {"attachments": [{"path": str(image), "content_type": "image/png", "size": 11}] }},
+    ]
+    orchestrator = CliOrchestrator("SampleProject", tmp_path, uploads_root=uploads)
+    message = orchestrator._claude_user_message(transcript, "prompt")
+    assert message["content"][0] == {"type": "text", "text": "prompt"}
+    assert message["content"][1] == {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "aW1hZ2UtYnl0ZXM="}}
+
+
+def test_offline_stub_clis_receive_image_and_keep_stdin_prompt_mode(tmp_path: Path, monkeypatch) -> None:
+    uploads = tmp_path / "uploads"
+    uploads.mkdir()
+    image = uploads / "red.png"
+    image.write_bytes(b"red image")
+    transcript = [{"author_type": "user", "author_label": "You", "body": "What colour?", "metadata": {"attachments": [
+        {"filename": "red.png", "path": str(image), "content_type": "image/png", "size": image.stat().st_size}
+    ]}}]
+    agent = {"agent_id": "project", "title": "Project", "kind": "project"}
+    chat = {"title": "Image check", "kind": "direct", "member_ids": ["project"]}
+
+    codex_capture = tmp_path / "codex.json"
+    codex_stub = tmp_path / "codex"
+    codex_stub.write_text(
+        f"#!{sys.executable}\nimport json,sys,pathlib\npathlib.Path({str(codex_capture)!r}).write_text(json.dumps({{'argv':sys.argv[1:],'stdin':sys.stdin.read()}}))\nprint('Red')\n",
+        encoding="utf-8",
+    )
+    codex_stub.chmod(0o755)
+    monkeypatch.setenv("AGENT_SLACK_CLI", "codex")
+    monkeypatch.setattr("agent_slack.orchestrator.shutil.which", lambda name: str(codex_stub) if name == "codex" else None)
+    codex = CliOrchestrator("Project", tmp_path, uploads_root=uploads)
+    assert codex.generate_agent_reply(agent, chat, transcript, {}) == "Red"
+    captured = json.loads(codex_capture.read_text())
+    assert f"--image={image.resolve()}" in captured["argv"]
+    assert captured["argv"][-1] == "-"
+    assert "What colour?" in captured["stdin"]
+
+    claude_capture = tmp_path / "claude.json"
+    claude_stub = tmp_path / "claude"
+    claude_stub.write_text(
+        f"#!{sys.executable}\nimport json,sys,pathlib\npayload=json.loads(sys.stdin.readline())\npathlib.Path({str(claude_capture)!r}).write_text(json.dumps(payload))\nprint(json.dumps({{'type':'result','result':'Red'}}),flush=True)\n",
+        encoding="utf-8",
+    )
+    claude_stub.chmod(0o755)
+    monkeypatch.setenv("AGENT_SLACK_CLI", "claude")
+    monkeypatch.setattr("agent_slack.orchestrator.shutil.which", lambda name: str(claude_stub) if name == "claude" else None)
+    claude = CliOrchestrator("Project", tmp_path, uploads_root=uploads)
+    events = list(claude.stream_agent_reply(agent, chat, transcript, {}))
+    captured_frame = json.loads(claude_capture.read_text())
+    assert captured_frame["message"]["content"][1]["type"] == "image"
+    assert events[-1]["type"] == "agent_completed"
 
 
 def test_reports_cli_failure_without_offline_api_message(tmp_path: Path, monkeypatch) -> None:
@@ -336,7 +432,8 @@ def test_claude_stream_relays_native_task_results_and_final_answer(tmp_path: Pat
     assert "--output-format" in commands[0]
     assert commands[0][commands[0].index("--input-format") + 1] == "stream-json"
     assert "--replay-user-messages" in commands[0]
-    assert [(event["type"], event["agent_id"]) for event in events] == [
+    visible_events = [event for event in events if event["type"] != "agent_progress"]
+    assert [(event["type"], event["agent_id"]) for event in visible_events] == [
         ("agent_started", "reviewer"),
         ("delta", "reviewer"),
         ("agent_completed", "reviewer"),
@@ -344,8 +441,8 @@ def test_claude_stream_relays_native_task_results_and_final_answer(tmp_path: Pat
         ("delta", "coordinator"),
         ("agent_completed", "coordinator"),
     ]
-    assert events[1]["text"] == "Review passed."
-    assert events[4]["text"] == "Final synthesis."
+    assert visible_events[1]["text"] == "Review passed."
+    assert visible_events[4]["text"] == "Final synthesis."
 
 
 def test_claude_background_launch_receipt_stays_internal_until_task_output(
@@ -437,15 +534,14 @@ def test_claude_background_launch_receipt_stays_internal_until_task_output(
         memory={},
     ))
 
-    assert [(event["type"], event["agent_id"]) for event in events] == [
-        ("agent_started", "stock_research"),
-        ("delta", "stock_research"),
-        ("agent_completed", "stock_research"),
-        ("agent_started", "coordinator"),
-        ("delta", "coordinator"),
-        ("agent_completed", "coordinator"),
-    ]
-    assert events[1]["text"] == "## Stock research result\n\nThe evidence is complete."
+    visible_events = [event for event in events if event["type"] != "agent_progress"]
+    lifecycle = [(event["type"], event["agent_id"]) for event in visible_events]
+    assert lifecycle.count(("agent_started", "coordinator")) == 1
+    assert lifecycle.index(("agent_started", "stock_research")) < lifecycle.index(("delta", "stock_research"))
+    assert lifecycle.index(("delta", "stock_research")) < lifecycle.index(("agent_completed", "stock_research"))
+    assert lifecycle.index(("agent_started", "coordinator")) < lifecycle.index(("delta", "coordinator"))
+    assert lifecycle.index(("delta", "coordinator")) < lifecycle.index(("agent_completed", "coordinator"))
+    assert next(event["text"] for event in visible_events if event["type"] == "delta" and event["agent_id"] == "stock_research") == "## Stock research result\n\nThe evidence is complete."
     assert all("internal-123" not in str(event) for event in events)
     assert all("output_file" not in str(event) for event in events)
 
@@ -533,7 +629,8 @@ def test_claude_background_task_notification_completes_visible_subagent(
         memory={},
     ))
 
-    assert [(event["type"], event["agent_id"]) for event in events] == [
+    visible_events = [event for event in events if event["type"] != "agent_progress"]
+    assert [(event["type"], event["agent_id"]) for event in visible_events] == [
         ("agent_started", "stock_research"),
         ("delta", "stock_research"),
         ("agent_completed", "stock_research"),
@@ -541,7 +638,7 @@ def test_claude_background_task_notification_completes_visible_subagent(
         ("delta", "coordinator"),
         ("agent_completed", "coordinator"),
     ]
-    assert events[1]["text"] == "## Specialist result\n\nEvidence & verdict are complete."
+    assert next(event["text"] for event in visible_events if event["type"] == "delta" and event["agent_id"] == "stock_research") == "## Specialist result\n\nEvidence & verdict are complete."
     assert all("native-agent-123" not in str(event) for event in events)
     assert all("subagent_tokens" not in str(event) for event in events)
 
@@ -600,7 +697,8 @@ def test_claude_system_task_notification_closes_subagent_without_false_failure(
         memory={},
     ))
 
-    assert [(event["type"], event["agent_id"]) for event in events] == [
+    visible_events = [event for event in events if event["type"] != "agent_progress"]
+    assert [(event["type"], event["agent_id"]) for event in visible_events] == [
         ("agent_started", "reviewer"),
         ("delta", "reviewer"),
         ("agent_completed", "reviewer"),
@@ -608,7 +706,7 @@ def test_claude_system_task_notification_closes_subagent_without_false_failure(
         ("delta", "coordinator"),
         ("agent_completed", "coordinator"),
     ]
-    assert events[1]["text"] == "Reviewer completed its task."
+    assert next(event["text"] for event in visible_events if event["type"] == "delta" and event["agent_id"] == "reviewer") == "Reviewer completed its task."
 
 
 def test_claude_result_outranks_session_end_hook_failure(tmp_path: Path, monkeypatch) -> None:
@@ -678,6 +776,112 @@ def test_claude_structured_error_outranks_session_end_hook_failure(tmp_path: Pat
     assert events[0]["type"] == "agent_failed"
     assert "session limit" in events[0]["message"]
     assert "SessionEnd hook" not in events[0]["message"]
+
+
+def test_claude_stream_emits_bounded_safe_progress_without_tool_output(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("AGENT_SLACK_CLI", "claude")
+    monkeypatch.setattr("agent_slack.orchestrator.shutil.which", lambda _name: "/bin/claude")
+    ticks = iter(index / 5 for index in range(20))
+    monkeypatch.setattr("agent_slack.orchestrator.time.monotonic", lambda: next(ticks))
+    lines = [
+        {"type": "assistant", "uuid": "m1", "message": {"content": [
+            {"type": "thinking", "thinking": "private chain of thought"},
+            {"type": "tool_use", "id": "tool-1", "name": "Read", "input": {
+                "file_path": "/tmp/report.md", "secret": "must never escape",
+            }},
+        ]}},
+        {"type": "user", "message": {"content": [
+            {"type": "tool_result", "tool_use_id": "tool-1", "content": "raw output must never escape"},
+        ]}},
+        {"type": "stream_event", "event": {"delta": {"type": "text_delta", "text": "Final answer."}}},
+        {"type": "result", "is_error": False, "result": "Final answer."},
+    ]
+
+    class FakeProcess:
+        stdin = io.StringIO()
+        stdout = io.StringIO("".join(json.dumps(line) + "\n" for line in lines))
+        stderr = None
+
+        @staticmethod
+        def wait():
+            return 0
+
+    monkeypatch.setattr("agent_slack.orchestrator.subprocess.Popen", lambda *_args, **_kwargs: FakeProcess())
+    orchestrator = CliOrchestrator("Host", tmp_path, backend_preference="claude")
+    events = list(orchestrator.stream_agent_reply(
+        agent={"agent_id": "coordinator", "name": "coordinator", "title": "Coordinator"},
+        chat={"title": "Chat"}, transcript=[], memory={}, run_id="run-1",
+    ))
+
+    progress = [event for event in events if event["type"] == "agent_progress"]
+    assert [event["state"] for event in progress] == ["done", "running", "done"]
+    assert [event["label"] for event in progress] == ["Thinking…", "Reading report.md", "Reading report.md"]
+    assert all(event["run_id"] == "run-1" and len(event["label"]) <= 120 for event in progress)
+    assert "private chain of thought" not in json.dumps(events)
+    assert "raw output must never escape" not in json.dumps(events)
+    assert "must never escape" not in json.dumps(events)
+    assert [event["type"] for event in events if event["type"] != "agent_progress"] == [
+        "agent_started", "delta", "agent_completed",
+    ]
+
+
+def _many_tool_progress_events(tmp_path: Path, monkeypatch, clock_step: float) -> tuple[list[dict], list[float]]:
+    monkeypatch.setenv("AGENT_SLACK_CLI", "claude")
+    monkeypatch.setattr("agent_slack.orchestrator.shutil.which", lambda _name: "/bin/claude")
+    clock = {"now": 0.1}
+    sleeps: list[float] = []
+
+    def monotonic() -> float:
+        value = clock["now"]
+        clock["now"] += clock_step
+        return value
+
+    def sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+        clock["now"] += seconds
+
+    monkeypatch.setattr("agent_slack.orchestrator.time.monotonic", monotonic)
+    monkeypatch.setattr("agent_slack.orchestrator.time.sleep", sleep)
+    frame = {"type": "assistant", "message": {"content": [
+        {"type": "tool_use", "id": f"tool-{index}", "name": "Grep", "input": {
+            "pattern": "x" * 80 + "PRIVATE_INPUT_MARKER",
+        }}
+        for index in range(205)
+    ]}}
+
+    class FakeProcess:
+        stdin = io.StringIO()
+        stdout = io.StringIO(json.dumps(frame) + "\n" + json.dumps({"type": "result", "result": "Done"}) + "\n")
+
+        @staticmethod
+        def wait():
+            return 0
+
+    monkeypatch.setattr("agent_slack.orchestrator.subprocess.Popen", lambda *_args, **_kwargs: FakeProcess())
+    orchestrator = CliOrchestrator("Host", tmp_path, backend_preference="claude")
+    events = list(orchestrator.stream_agent_reply(
+        agent={"agent_id": "coordinator", "name": "coordinator", "title": "Coordinator"},
+        chat={"title": "Chat"}, transcript=[], memory={}, run_id="run-cap",
+    ))
+    return events, sleeps
+
+
+def test_claude_progress_is_capped_at_200_steps(tmp_path: Path, monkeypatch) -> None:
+    events, _sleeps = _many_tool_progress_events(tmp_path, monkeypatch, clock_step=0.11)
+    progress = [event for event in events if event["type"] == "agent_progress"]
+
+    assert len(progress) == 200
+    assert len({event["step_id"] for event in progress}) == 200
+    assert all(event["label"].startswith("Searching: ") and len(event["label"]) <= 120 for event in progress)
+    assert all("PRIVATE_INPUT_MARKER" not in event["label"] for event in progress)
+
+
+def test_claude_progress_events_are_throttled_to_about_ten_per_second(tmp_path: Path, monkeypatch) -> None:
+    events, sleeps = _many_tool_progress_events(tmp_path, monkeypatch, clock_step=0.01)
+    progress = [event for event in events if event["type"] == "agent_progress"]
+
+    assert len(progress) == 200
+    assert len(sleeps) == 199
 
 
 def test_cancel_task_sends_native_task_stop_without_touching_siblings(
@@ -846,7 +1050,7 @@ def test_successful_task_result_wins_cancel_race(tmp_path: Path, monkeypatch) ->
 
     assert next(stream)["type"] == "agent_started"
     orchestrator.cancel_task("run-1", "task-1")
-    remaining = list(stream)
+    remaining = [event for event in stream if event["type"] != "agent_progress"]
 
     assert [event["type"] for event in remaining[:2]] == ["delta", "agent_completed"]
     assert remaining[0]["text"] == "Completed before the stop took effect."

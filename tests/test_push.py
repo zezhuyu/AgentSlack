@@ -196,6 +196,25 @@ def test_run_notification_decrypts_and_vapid_signature_verifies(http_env):
     fake.server_close()
 
 
+def test_run_notification_accepts_deep_link_without_changing_chat_link(tmp_path, monkeypatch):
+    data_root = tmp_path / "data"
+    data_root.mkdir()
+    (data_root / "push.json").write_text(json.dumps({"subscriptions": [{"endpoint": "unused"}]}))
+    sent = []
+    ready = threading.Event()
+    def capture(_root, payload):
+        sent.append(payload)
+        ready.set()
+    monkeypatch.setattr(push, "send", capture)
+    push.notify_run_finished(data_root, title="Host", body="Done", deep_link="#host=session")
+    assert ready.wait(1)
+    assert sent[-1]["notification"]["navigate"] == "#host=session"
+    ready.clear()
+    push.notify_run_finished(data_root, title="Chat", body="Done", base_url="https://example.test/agent_slack", chat_id="chat-1")
+    assert ready.wait(1)
+    assert sent[-1]["notification"]["navigate"] == "https://example.test/agent_slack/#chat=chat-1"
+
+
 def test_410_removes_subscription_and_cancelled_or_missing_crypto_is_noop(http_env, monkeypatch):
     data_root, api_port = http_env
     FakePushHandler.body = b""
@@ -286,3 +305,26 @@ def test_per_server_app_notifies_against_the_install_wide_push_store(tmp_path, m
     app.orchestrator.stream_agent_reply = completed
     list(app.stream_run(chat["chat_id"], mode="respond"))
     assert calls == [install_root]
+
+
+def test_relative_deep_links_become_absolute_navigate_urls(tmp_path, monkeypatch):
+    """iOS drops declarative pushes whose navigate is not an absolute URL (e.g. a bare #host=<id>)."""
+    private, keys = create_client_keys()
+    push.subscribe(tmp_path, {"endpoint": "https://push.example.test/send/rel", "keys": keys},
+                   "https://studio.example.ts.net/agent_slack/", "https://studio.example.ts.net")
+    sent = []
+    monkeypatch.setattr(push, "_send_one", lambda state, sub, payload, timeout=3.0: sent.append(payload["notification"]))
+    for payload in (
+        {"web_push": 8030, "notification": {"title": "T", "body": "B", "navigate": "#host=abc", "chat_id": ""}},
+        {"web_push": 8030, "notification": {"title": "T", "body": "B", "navigate": "#permission=r1"}},
+        {"web_push": 8030, "notification": {"title": "T", "body": "B", "navigate": None, "chat_id": "c1"}},
+        {"web_push": 8030, "notification": {"title": "T", "body": "B", "navigate": "https://studio.example.ts.net/agent_slack/#x"}},
+    ):
+        push.send(tmp_path, payload)
+    assert [n["navigate"] for n in sent] == [
+        "https://studio.example.ts.net/agent_slack/#host=abc",
+        "https://studio.example.ts.net/agent_slack/#permission=r1",
+        "https://studio.example.ts.net/agent_slack/#chat=c1",
+        "https://studio.example.ts.net/agent_slack/#x",
+    ]
+    assert all("chat_id" not in n for n in sent)

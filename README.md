@@ -4,6 +4,10 @@
 
 It does not modify the host project's codepath. It discovers agent definitions, builds profiles, stores per-agent memory, persists chat history, and relays one native CLI session. A host lead coordinates its own subagents; Agent Slack displays each native result and the final synthesis.
 
+### Choosing the agent and model for a chat
+
+New chats and chats with no agent reply yet can choose Codex or Claude Code and select a model from the available list. The choice is saved with the chat and applies to its runs. After the first agent reply, or while a run is active, the controls lock and the selected agent and model remain visible in the chat header.
+
 ## What it does
 
 - discovers agent definitions from:
@@ -233,7 +237,9 @@ client requires iOS 17 or later and has no third-party dependencies. See
 - Messages render safe ChatGPT-style Markdown, including headings, lists, links, code blocks, blockquotes, and tables
 - Open chats and the sidebar synchronize every two seconds across desktop, web, and the native iOS client; focus changes trigger an immediate refresh
 - In the message composer, `Return` sends and `Shift+Return` inserts a newline; IME composition is never submitted prematurely
-- Files and images upload to the selected server before the message is posted; messages retain attachment metadata and agents receive only backend-validated absolute paths
+- Attach files with the paperclip button, paste screenshots, or drag files into the composer. On iPhone and iPad, the picker offers the system photo and file sources; attachments can be sent without accompanying text.
+- Images up to 5 MB each (five per turn) are passed directly to Claude Code and Codex; other file types remain available by validated path. The agent is instructed to open and read each attachment before answering.
+- Files and images upload to the selected server before the message is posted; messages retain attachment metadata and render previews or download cards after reload
 - On mobile, Send stays above the device safe area and People opens the same dynamically discovered agent list in a drawer
 
 ## Outside access
@@ -317,6 +323,50 @@ path from the request itself.
 
 The stable mobile-client contract, endpoint list, server-selection header, and
 NDJSON streaming examples are documented in [MOBILE-API.md](./MOBILE-API.md).
+
+## Permission requests & session notifications
+
+Agent Slack can receive native Claude Code and Codex `PermissionRequest` hooks.
+Install the scripts and preview the config snippets with:
+
+```sh
+python3 scripts/hooks/install-hooks.py
+```
+
+The installer prints mergeable entries for `~/.claude/settings.json` and
+`~/.codex/hooks.json`; it does not edit them unless you explicitly pass
+`--apply`. Applying first creates timestamped `.bak-*` copies and merges the
+entries without removing existing hooks. The scripts use Node's built-in
+`fetch` and have no package dependencies. They read the hook token from
+`AGENT_SLACK_HOOK_TOKEN` or `<AGENT_SLACK_DATA_ROOT>/hook-token` (the desktop
+default is `~/Library/Application Support/agent-slack-desktop/data/hook-token`)
+and send requests to `AGENT_SLACK_URL` (default `http://127.0.0.1:8899`).
+
+Permission cards show the source, tool, project, a short summary and expiry.
+Approve or deny in the authenticated Agent Slack UI. If the bridge is
+unavailable, the request expires, or the user takes no action, the hook prints
+nothing and Claude/Codex continue with their own permission prompt. Agent Slack
+never auto-approves on a failure path. Push notifications are alerts only; the
+hook's synchronous decision is the permission gate. Hook payloads can contain
+commands and file paths, so keep the token private and protect access to the
+Agent Slack account.
+
+Imported project sidebars list host sessions under their project root; the
+global Host Sessions view lists sessions outside imported roots. Session
+notifications link to the corresponding host conversation. Managed Agent Slack
+runs keep streamed text while work is active and show the final response when
+the run completes.
+
+Provider-native Claude and Codex sub-agents are grouped under their launching
+host session instead of appearing as separate sessions. Their status and
+progress are visible in the Agents panel; opening a card shows a read-only
+transcript and progress history.
+
+If your Codex config already routes `PermissionRequest` to the VibeBridge hook
+at `127.0.0.1:8875`, either replace that entry with the Agent Slack script or
+keep both hook handlers in the event list. Existing handlers remain in place
+when using the installer; inspect the merged config to avoid duplicate
+permission bridges.
 
 ## Data layout
 

@@ -2,13 +2,14 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
+const vm = require("node:vm");
 
 const root = path.join(__dirname, "..");
 const app = fs.readFileSync(path.join(root, "static", "app.js"), "utf8");
 const styles = fs.readFileSync(path.join(root, "static", "styles.css"), "utf8");
 
 test("host session list refreshes every five seconds while visible", () => {
-  assert.match(app, /state\.hostSessionsView && !document\.hidden\) loadAllSessions\(\);[\s\S]*?\}, 5000\)/);
+  assert.match(app, /!document\.hidden && \(state\.hostSessionsView \|\| state\.activeServerId\)\) loadAllSessions\(\);[\s\S]*?\}, 5000\)/);
 });
 
 test("unavailable host sessions remain readable and explain why they cannot resume", () => {
@@ -24,14 +25,14 @@ test("host resume state is tracked independently by session id", () => {
   assert.match(app, /hostResumes\.delete\(sessionId\)/);
   const sendBranch = app.match(/async function sendMessage\(\) \{([\s\S]*?)\n  if \(state\.runInProgress\)/)?.[1] || "";
   assert.doesNotMatch(sendBranch, /await waitForHostSessionResume\(sessionId\)/);
-  assert.match(app, /void resumeHostSessionInBackground\(sessionId, body\)/);
+  assert.match(app, /void resumeHostSessionInBackground\(sessionId, body, \{ requestId \}\)/);
 });
 
 test("resume status updates immediately in the list and open session header", () => {
   const sendBranch = app.match(/async function sendMessage\(\) \{([\s\S]*?)\n  if \(state\.runInProgress\)/)?.[1] || "";
   assert.match(sendBranch, /state\.hostResumes\.set\(sessionId, true\);\s*renderUnonboardedHostSessions\(\);\s*renderHostSessionDetails\(session\)/);
   assert.match(app, /const isResuming = session\.resuming \|\| state\.hostResumes\.has\(session\.session_id\);\s*const status = isResuming \? "Resuming…"/);
-  assert.match(app, /state\.hostResumes\.delete\(sessionId\);\s*if \(state\.hostSessionsView\) renderUnonboardedHostSessions\(\);\s*await loadAllSessions\(\)/);
+  assert.match(app, /state\.hostResumes\.delete\(sessionId\);[\s\S]*?if \(state\.hostSessionsView\) renderUnonboardedHostSessions\(\);[\s\S]*?await loadAllSessions\(\)/);
 });
 
 test("running sessions have an accessible pulsing dot with reduced motion support", () => {
@@ -47,22 +48,53 @@ test("host composer follows the open session availability and resume state", () 
   assert.match(app, /syncHostComposer\(session\)/);
 });
 
+test("resume progress renders its elapsed clock, loading stage, and Stop action", () => {
+  const elements = Object.fromEntries(["sendBtn", "messageInput", "stopRunBtn"].map((id) => [id, {}]));
+  const context = {
+    state: { hostSessionId: "session-1" },
+    $: (id) => elements[id],
+  };
+  const renderer = app.match(/function renderHostResumeProgress\(sessionId, status\) \{[\s\S]*?\n\}/)?.[0];
+  const clock = app.match(/function formatClock\(seconds\) \{[\s\S]*?\n\}/)?.[0];
+  assert.ok(renderer && clock, "resume progress renderer and clock exist");
+  vm.runInNewContext(`${clock}\n${renderer}\nglobalThis.render = renderHostResumeProgress;`, context);
+  context.render("session-1", { stage: "starting", elapsed: 42 });
+  assert.equal(elements.sendBtn.textContent, "Loading session… 0:42");
+  assert.equal(elements.messageInput.placeholder, "Loading the session…");
+  assert.equal(elements.stopRunBtn.hidden, false);
+  assert.equal(elements.stopRunBtn.textContent, "Stop");
+  context.render("session-1", { stage: "working", elapsed: 61 });
+  assert.equal(elements.sendBtn.textContent, "Working… 1:01");
+});
+
+test("resume details render safe raw error text, restore Retry text, and restore the composer", () => {
+  const resume = app.match(/async function resumeHostSessionInBackground\(sessionId, body, options\) \{[\s\S]*?\n\}/)?.[0] || "";
+  assert.match(resume, /summary\.textContent = "Details"/);
+  assert.match(resume, /raw\.textContent = error\.detail/);
+  assert.match(resume, /retry\.textContent = "Retry"/);
+  assert.match(resume, /\$\("messageInput"\)\.value = body/);
+  assert.match(resume, /if \(session\) syncHostComposer\(session\)/);
+  assert.match(resume, /state\.hostResumes\.delete\(sessionId\)/);
+  assert.match(app, /hostHint\.textContent = session\.resume_hint \|\| ""/);
+});
+
 test("host session polling reloads changed messages while preserving reading position", () => {
   assert.match(app, /state\.currentChatUpdatedAt !== \(activeSession\.updated_at \|\| null\)/);
-  assert.match(app, /statusChanged = \(state\.hostMessagesStatus \|\| "History"\) !== \(activeSession\.status \|\| "History"\)/);
+  assert.match(app, /activeSession\.size_bytes !== undefined && state\.currentChatSize !== activeSession\.size_bytes/);
+  assert.match(app, /const cached = state\.hostSessionDetails\.get\(sessionId\);\s*if \(cached\) renderHostSession\(cached/);
   assert.match(app, /openHostSession\(activeSession\.session_id, \{ preserveScroll: true \}\)/);
   assert.match(app, /messages\.scrollTop = preserveScroll && !followLatest \? previousScrollTop : messages\.scrollHeight/);
-  assert.match(app, /if \(requestId !== state\.hostSessionOpenRequest \|\| !state\.hostSessionsView\) return/);
+  assert.match(app, /if \(requestId !== state\.hostSessionOpenRequest \|\| \(!state\.hostSessionsView && !state\.activeServerId\)\) return/);
 });
 
 test("failed host session reloads are non-blocking and deduplicated until success", () => {
   assert.match(app, /hostSessionLastError: new Map\(\)/);
-  const openSession = app.match(/async function openHostSession\(sessionId, \{ preserveScroll = false \} = \{\}\) \{([\s\S]*?)\n\}\n\nfunction appendHostSessionPrompt/)?.[1] || "";
+  const openSession = app.match(/async function openHostSession\(sessionId, \{ preserveScroll = false \} = \{\}\) \{([\s\S]*?)\n\}\n\nfunction renderHostSession/)?.[1] || "";
   const catchBranch = openSession.match(/\} catch \(error\) \{([\s\S]*?)\n  \}/)?.[1] || "";
   assert.doesNotMatch(catchBranch, /alert\s*\(/);
   assert.match(catchBranch, /state\.hostSessionLastError\.get\(sessionId\) !== message/);
   assert.match(catchBranch, /state\.hostSessionLastError\.set\(sessionId, message\)/);
-  assert.match(openSession, /state\.hostSessionLastError\.delete\(sessionId\)/);
+  assert.match(app, /state\.hostSessionLastError\.delete\(sessionId\)/);
   assert.match(catchBranch, /row\.setAttribute\("role", "status"\)/);
   assert.match(catchBranch, /item\.dataset\.hostSessionError === sessionId/);
   assert.doesNotMatch(catchBranch, /messages\.innerHTML\s*=/);

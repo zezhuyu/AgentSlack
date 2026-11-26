@@ -65,7 +65,7 @@ test("single and multiple selections use backend-provided option ids", () => {
 });
 
 test("desktop chat renders and submits backend-driven question cards", () => {
-  assert.match(html, /src="\/interactions\.js"/);
+  assert.match(html, /src="\.\/interactions\.js"/);
   assert.match(appSource, /appendChoiceInteraction/);
   assert.match(appSource, /questions\/\$\{encodeURIComponent\(choice\.questionId\)\}\/answer/);
   assert.match(appSource, /option_ids:\s*optionIds/);

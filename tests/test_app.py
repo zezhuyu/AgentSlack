@@ -29,6 +29,52 @@ def _app(tmp_path: Path, monkeypatch) -> AgentSlackApp:
     return AgentSlackApp(project_root, app_root)
 
 
+def test_chat_runner_settings_lock_after_reply_or_during_run_and_title_remains_editable(tmp_path: Path, monkeypatch) -> None:
+    app = _app(tmp_path, monkeypatch)
+    monkeypatch.setattr("agent_slack.app.validate_choice", lambda runner, model: (runner, model))
+    chat = app.create_chat("Choice", ["coordinator"])
+    saved = app.update_chat_settings(chat["chat_id"], {"runner": "claude", "model": "sonnet"})
+    assert (saved["runner"], saved["model"], saved["settings_locked"]) == ("claude", "sonnet", False)
+    app.rename_chat(chat["chat_id"], "Still renameable")
+    app.storage.append_message(chat["chat_id"], {"author_type": "agent", "author_id": "coordinator", "body": "reply"})
+    assert app.get_chat(chat["chat_id"])["settings_locked"] is True
+    with pytest.raises(PermissionError):
+        app.update_chat_settings(chat["chat_id"], {"runner": "codex"})
+
+    pending = app.create_chat("Pending", ["coordinator"])
+    app._begin_run_state("run-active", pending["chat_id"], "respond", "coordinator")
+    assert app.get_chat(pending["chat_id"])["settings_locked"] is True
+    with pytest.raises(PermissionError):
+        app.update_chat_settings(pending["chat_id"], {"model": "x"})
+    app._active_run_states.pop("run-active")
+    reset = app.update_chat_settings(pending["chat_id"], {"runner": None})
+    assert reset["runner"] is None and reset["model"] is None
+
+
+def test_chat_orchestrators_select_per_chat_and_default_chat_keeps_server_runner(tmp_path: Path, monkeypatch) -> None:
+    app = _app(tmp_path, monkeypatch)
+    monkeypatch.setattr("agent_slack.orchestrator.shutil.which", lambda name: f"/mock/{name}")
+    default_chat = {"runner": None, "model": None}
+    codex_chat = {"runner": "codex", "model": "gpt-x"}
+    claude_chat = {"runner": "claude", "model": "sonnet"}
+    assert app._orchestrator_for_chat(default_chat) is app.orchestrator
+    codex = app._orchestrator_for_chat(codex_chat)
+    claude = app._orchestrator_for_chat(claude_chat)
+    assert codex is not app.orchestrator and codex.backend == "codex" and codex.model == "gpt-x"
+    assert claude is not codex and claude.backend == "claude" and claude.model == "sonnet"
+
+    class Owner:
+        def __init__(self): self.calls = []
+        def cancel_run(self, run_id): self.calls.append(("run", run_id)); return {"accepted": True}
+        def cancel_task(self, run_id, task_id): self.calls.append(("task", run_id, task_id)); return {"accepted": True}
+
+    owner = Owner()
+    app._run_orchestrators["per-chat-run"] = owner
+    app.cancel_run("per-chat-run")
+    app.cancel_task("per-chat-run", "task")
+    assert owner.calls == [("run", "per-chat-run"), ("task", "per-chat-run", "task")]
+
+
 def test_direct_response_runs_one_connected_agent_session(tmp_path: Path, monkeypatch) -> None:
     app = _app(tmp_path, monkeypatch)
     calls = []
@@ -50,6 +96,29 @@ def test_direct_response_runs_one_connected_agent_session(tmp_path: Path, monkey
     assert events[0]["lead_agent_id"] == "coordinator"
     assert events[0]["chat_id"] == chat["chat_id"]
     assert app.get_chat(chat["chat_id"])["messages"][-1]["body"] == "Final host answer."
+
+
+def test_agent_progress_is_forwarded_but_never_persisted(tmp_path: Path, monkeypatch) -> None:
+    app = _app(tmp_path, monkeypatch)
+
+    def stream(**_kwargs):
+        yield {"type": "agent_started", "agent_id": "coordinator", "agent_label": "System Coordinator"}
+        yield {
+            "type": "agent_progress", "agent_id": "coordinator", "task_id": "lead-coordinator",
+            "step_id": "tool-1", "kind": "tool", "label": "Reading report.md", "state": "running", "at": 123,
+        }
+        yield {"type": "delta", "agent_id": "coordinator", "text": "Final host answer."}
+        yield {"type": "agent_completed", "agent_id": "coordinator"}
+
+    app.orchestrator.stream_agent_reply = stream
+    chat = app.create_chat("Coordinator", ["coordinator"], kind="direct")
+    events = list(app.stream_run(chat["chat_id"], mode="respond"))
+    progress = next(event for event in events if event["type"] == "agent_progress")
+
+    assert progress["run_id"] == events[0]["run_id"]
+    assert progress["task_id"] == "lead-coordinator"
+    assert app.get_chat(chat["chat_id"])["messages"][-1]["body"] == "Final host answer."
+    assert all("agent_progress" not in str(message) for message in app.get_chat(chat["chat_id"])["messages"])
 
 
 def test_agent_ui_snapshot_is_streamed_and_restored_from_persisted_message(tmp_path: Path, monkeypatch) -> None:
@@ -119,6 +188,20 @@ def test_uploaded_files_are_stored_with_trusted_absolute_paths_and_attached_to_m
     assert Path(upload["path"]).read_bytes() == b"report-data"
     assert Path(upload["path"]).name == "Quarterly Report.pdf"
     assert updated["messages"][-1]["metadata"]["attachments"] == [upload]
+
+
+def test_message_can_contain_only_attachments_and_enforces_attachment_count(tmp_path: Path, monkeypatch) -> None:
+    app = _app(tmp_path, monkeypatch)
+    chat = app.create_chat("Coordinator", ["coordinator"], kind="direct")
+    upload = app.store_upload("image.png", "image/png", b"png")
+    saved = app.add_user_message(chat["chat_id"], "", attachment_ids=[upload["attachment_id"]])
+    assert saved["messages"][-1]["body"] == ""
+    assert saved["messages"][-1]["metadata"]["attachments"] == [upload]
+    with pytest.raises(ValueError, match="text or at least one attachment"):
+        app.add_user_message(chat["chat_id"], "")
+    extra_uploads = [app.store_upload(f"{index}.txt", "text/plain", b"x") for index in range(10)]
+    with pytest.raises(ValueError, match="10"):
+        app.add_user_message(chat["chat_id"], "", attachment_ids=[item["attachment_id"] for item in [upload, *extra_uploads]])
 
 
 def test_message_rejects_unknown_attachment_ids(tmp_path: Path, monkeypatch) -> None:
